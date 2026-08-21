@@ -1,0 +1,190 @@
+"""Command-line interface for the persistent Deep Context Agent."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from context_agent.config import SUPPORTED_PROVIDERS, AppConfig, ProviderConfig
+from context_agent.context_store import ContextStore
+from context_agent.errors import AgentError
+from context_agent.providers import create_chat_model
+from context_agent.runtime import AgentRuntime, message_text
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the complete CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="context-agent",
+        description="Persistent searchable Deep Agent with multiple LLM providers.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=SUPPORTED_PROVIDERS,
+        help="LLM provider; defaults to AGENT_PROVIDER or lmstudio.",
+    )
+    parser.add_argument(
+        "--thread",
+        default=os.getenv("AGENT_THREAD_ID", "default"),
+        help="Persistent conversation thread ID.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("chat", help="Start an interactive chat session.")
+
+    ask_parser = subparsers.add_parser("ask", help="Send one request.")
+    ask_parser.add_argument("query", help="User request.")
+
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Index a file or directory under AGENT_CONTEXT_ROOT.",
+    )
+    index_parser.add_argument("path", nargs="?", default=".")
+
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search persistent local context without invoking an LLM.",
+    )
+    search_parser.add_argument("query")
+    search_parser.add_argument("--limit", type=int, default=None)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Validate provider configuration without printing secrets.",
+    )
+    doctor_parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Also make one small model request.",
+    )
+    return parser
+
+
+def _load_environment(base_dir: Path) -> None:
+    load_dotenv(base_dir / ".env.local", override=False)
+    load_dotenv(base_dir / ".env", override=False)
+
+
+def _app_config(base_dir: Path) -> AppConfig:
+    config = AppConfig.from_env(base_dir)
+    config.prepare_directories()
+    return config
+
+
+def _run_index(args: argparse.Namespace, base_dir: Path) -> int:
+    config = _app_config(base_dir)
+    with ContextStore(
+        config.context_database,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
+        max_file_bytes=config.max_file_bytes,
+    ) as store:
+        report = store.index_path(args.path, config.context_root)
+    print(
+        f"indexed={report.files_indexed} unchanged={report.files_unchanged} "
+        f"skipped={report.files_skipped} chunks={report.chunks_written}"
+    )
+    for error in report.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    return 1 if report.errors else 0
+
+
+def _run_search(args: argparse.Namespace, base_dir: Path) -> int:
+    config = _app_config(base_dir)
+    limit = args.limit or config.context_top_k
+    with ContextStore(config.context_database) as store:
+        hits = store.search(args.query, limit=limit)
+    if not hits:
+        print("No matching context found.")
+        return 0
+    for index, hit in enumerate(hits, start=1):
+        print(f"[{index}] {hit.source} chunk={hit.chunk_index} score={hit.score:.4f}")
+        print(hit.content)
+    return 0
+
+
+def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
+    app_config = _app_config(base_dir)
+    provider = ProviderConfig.from_env(args.provider)
+    print(f"provider={provider.name}")
+    print(f"model={provider.model}")
+    print(f"base_url={provider.base_url}")
+    print("api_key=configured")
+    print(f"workspace={app_config.workspace}")
+    print(f"context_database={app_config.context_database}")
+    if args.live:
+        try:
+            response = create_chat_model(provider).invoke(
+                "Reply with exactly: OK",
+            )
+        except Exception as exc:
+            raise AgentError(
+                f"Live model check failed ({type(exc).__name__}): {exc}"
+            ) from exc
+        text = message_text(response).strip()
+        print(f"live_response={text}")
+    return 0
+
+
+def _runtime(args: argparse.Namespace, base_dir: Path) -> AgentRuntime:
+    return AgentRuntime(
+        _app_config(base_dir),
+        ProviderConfig.from_env(args.provider),
+    )
+
+
+def _run_ask(args: argparse.Namespace, base_dir: Path) -> int:
+    with _runtime(args, base_dir) as runtime:
+        print(runtime.ask(args.query, thread_id=args.thread))
+    return 0
+
+
+def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
+    print("Deep Context Agent. Enter /exit to stop.")
+    with _runtime(args, base_dir) as runtime:
+        while True:
+            try:
+                query = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if query.casefold() in {"/exit", "/quit", "exit", "quit"}:
+                break
+            if not query:
+                continue
+            try:
+                answer = runtime.ask(query, thread_id=args.thread)
+            except Exception as exc:
+                print(f"request failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                continue
+            print(f"agent> {answer}")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI and convert expected failures to concise exit messages."""
+    base_dir = Path.cwd().resolve()
+    _load_environment(base_dir)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    commands = {
+        "ask": _run_ask,
+        "chat": _run_chat,
+        "doctor": _run_doctor,
+        "index": _run_index,
+        "search": _run_search,
+    }
+    try:
+        return commands[args.command](args, base_dir)
+    except (AgentError, OSError, RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

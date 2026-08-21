@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deep-context-agent"
+version = "0.1.0"
+description = "A persistent, searchable Deep Agents CLI with multiple LLM providers."
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+license = { text = "MIT" }
+authors = [{ name = "Deep Context Agent contributors" }]
+dependencies = [
+  "ddgs>=9.5,<10",
+  "deepagents>=0.7,<0.8",
+  "langchain-openai>=1.0,<2",
+  "langgraph-checkpoint-sqlite>=3.0,<4",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<10",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+context-agent = "context_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/context_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers -p no:cacheprovider"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+exclude = [
+  ".agent_data",
+  ".pytest_cache",
+  ".pytest-tmp",
+  ".venv",
+  "agent_workspace",
+  "langchain-master-v0",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

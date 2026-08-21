@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
+.coverage
+htmlcov/
+.agent_data/
+agent_workspace/
+langchain-master-v0/
+dist/
+build/
+*.egg-info/
