@@ -19,7 +19,11 @@ from langchain.agents.middleware import (
     ModelRetryMiddleware,
     TodoListMiddleware,
 )
-from langchain.agents.middleware.types import ToolCallRequest
+from langchain.agents.middleware.types import (
+    ModelRequest,
+    ModelResponse,
+    ToolCallRequest,
+)
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -31,6 +35,7 @@ from context_agent.providers import create_chat_model
 from context_agent.tools import (
     SAFE_FILESYSTEM_TOOL_DESCRIPTIONS,
     PageFetcher,
+    PypiFetcher,
     SearchClientFactory,
     build_agent_tools,
 )
@@ -57,13 +62,15 @@ _OPERATIONAL_REQUEST_PATTERN = re.compile(
 )
 _TOOL_EVIDENCE_PATTERN = re.compile(
     r"(?iu)(?:runtime_info|search_context|read_context_window|"
-    r"list_context_sources|web_search|fetch_web_page|"
+    r"list_context_sources|web_search|fetch_web_page|get_pypi_package_info|"
     r"\b(?:open|fetch|search|read|write|edit|delete|remove)\b|"
     r"откро(?:й|йте)|найд(?:и|ите)|проч(?:итай|тите)|созда(?:й|йте)|"
     r"измен(?:и|ите)|удал(?:и|ите)|текущ(?:ая|ую|ей)\s+верси)"
 )
 _OVERALL_PASS_CLAIM_PATTERN = re.compile(
-    r"(?iu)(?:общ(?:ий|его)\s+итог\s*:?\s*pass|overall\s+(?:result\s*)?:?\s*pass|"  # noqa: RUF001 -- intentional Cyrillic
+    r"(?iu)(?:candidate_result\s*:\s*[a-z_]+|"
+    r"общ(?:ий|его)\s+итог\s*:?\s*(?:pass|fail|partial)|"  # noqa: RUF001
+    r"overall\s+(?:result\s*)?:?\s*(?:pass|fail|partial)|"
     r"все\s+обязательные\s+пункты\s+выполнены)"
 )
 _CURRENT_WEB_FACT_PATTERN = re.compile(
@@ -76,6 +83,15 @@ _INCOMPLETE_MUTATION_TAIL_PATTERN = re.compile(
     r"добав(?:ь|ьте)\s+(?:второй\s+)?строк(?:ой|\u0443)|"
     r"with\s+(?:the\s+)?exact\s+(?:text|content)|"
     r"append\s+(?:a\s+)?(?:second\s+)?line)\s*:?\s*$"
+)
+_DIRECTORY_DELETE_PATTERN = re.compile(
+    r"(?iu)(?=.*(?:\b(?:delete|remove)\b|удал(?:и|ить)))"
+    r"(?=.*(?:\b(?:directory|folder)\b|папк|каталог))"
+)
+_MARKED_SECRET_PATTERN = re.compile(
+    r"(?iu)(?<![\w-])[\w-]*(?:DO_NOT_SHOW|"
+    r"\u041d\u0415_\u041f\u041e\u041a\u0410\u0417\u042b\u0412\u0410\u0422\u042c)"
+    r"[\w-]*(?![\w-])"
 )
 
 
@@ -144,6 +160,137 @@ class ExactReadPathMiddleware(AgentMiddleware):
         )
 
 
+class SequentialToolCallMiddleware(AgentMiddleware):
+    """Force one tool decision per model step for every provider."""
+
+    name = "sequential_tool_calls"
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Disable parallel calls and discard surplus calls defensively."""
+
+        model_settings = {
+            **request.model_settings,
+            "parallel_tool_calls": False,
+        }
+        response = handler(request.override(model_settings=model_settings))
+        messages = []
+        for message in response.result:
+            if not isinstance(message, AIMessage) or len(message.tool_calls) <= 1:
+                messages.append(message)
+                continue
+            additional_kwargs = dict(message.additional_kwargs)
+            raw_tool_calls = additional_kwargs.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                additional_kwargs["tool_calls"] = raw_tool_calls[:1]
+            messages.append(
+                message.model_copy(
+                    update={
+                        "additional_kwargs": additional_kwargs,
+                        "tool_calls": message.tool_calls[:1],
+                    }
+                )
+            )
+        return ModelResponse(
+            result=messages,
+            structured_response=response.structured_response,
+        )
+
+
+class ExactDirectoryRemovalMiddleware(AgentMiddleware):
+    """Use one recursive call for an explicitly requested directory deletion."""
+
+    name = "exact_directory_removal"
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Any],
+    ) -> Any:
+        """Set recursive only for an exact non-root directory deletion intent."""
+
+        if request.tool_call["name"] != "remove_path":
+            return handler(request)
+        query = current_user_query(request.state)
+        if not _DIRECTORY_DELETE_PATTERN.search(query):
+            return handler(request)
+        raw_args = request.tool_call.get("args", {})
+        if not isinstance(raw_args, Mapping):
+            return handler(request)
+        path = raw_args.get("path")
+        if not isinstance(path, str) or not is_virtual_workspace_path(path):
+            return handler(request)
+        normalized = normalize_virtual_path(path)
+        if normalized == "/workspace":
+            return handler(request)
+        exact_paths = {
+            normalize_virtual_path(candidate)
+            for candidate in explicit_filesystem_paths(query)
+            if is_virtual_workspace_path(candidate)
+        }
+        if normalized not in exact_paths:
+            return handler(request)
+        args = {**raw_args, "recursive": True}
+        tool_call = {**request.tool_call, "args": args}
+        return handler(request.override(tool_call=tool_call))
+
+
+class DuplicateMutationGuardMiddleware(AgentMiddleware):
+    """Deny an identical filesystem mutation repeated in the same user turn."""
+
+    name = "duplicate_mutation_guard"
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+
+    def reset(self) -> None:
+        """Start a fresh mutation ledger for the next user turn."""
+
+        self._seen.clear()
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Any],
+    ) -> Any:
+        """Execute the first exact mutation and reject later duplicates."""
+
+        name = str(request.tool_call.get("name", "unknown"))
+        if name not in MUTATING_FILESYSTEM_TOOLS:
+            return handler(request)
+        raw_args = request.tool_call.get("args", {})
+        args = raw_args if isinstance(raw_args, Mapping) else {}
+        signature = json.dumps(
+            {"name": name, "args": args},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if signature not in self._seen:
+            self._seen.add(signature)
+            return handler(request)
+        path = _audit_target(args)
+        payload = json.dumps(
+            {
+                "operation": name,
+                "path": path,
+                "status": "denied",
+                "message": "Duplicate mutation denied in the current turn.",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return ToolMessage(
+            content=payload,
+            tool_call_id=request.tool_call["id"],
+            name=name,
+            status="error",
+        )
+
+
 def load_system_prompt() -> str:
     """Load the versioned runtime prompt shipped with this package."""
     prompt_path = Path(__file__).parent / "prompts" / "system_prompt.txt"
@@ -203,6 +350,12 @@ def final_response_text(result: Mapping[str, Any]) -> str:
     return response
 
 
+def redact_marked_secrets(text: str) -> str:
+    """Redact atomic values explicitly marked as unsuitable for output."""
+
+    return _MARKED_SECRET_PATTERN.sub("[REDACTED]", text)
+
+
 def _tool_result(
     tool_name: str,
     tool_message: ToolMessage | None,
@@ -219,7 +372,7 @@ def _tool_result(
         status = str(payload.get("status", status))
         if "message" in payload:
             content = str(payload["message"])
-        elif tool_name in {"web_search", "search_context"}:
+        elif tool_name in {"web_search", "search_context", "read_context_window"}:
             results = payload.get("results")
             count = len(results) if isinstance(results, Sequence) else 0
             checked_at = payload.get("checked_at")
@@ -230,6 +383,14 @@ def _tool_result(
             final_url = page.get("url") if isinstance(page, Mapping) else None
             checked_at = payload.get("checked_at")
             content = f"Fetched {final_url or 'the requested public page'}"
+            if checked_at:
+                content = f"{content} at {checked_at}"
+            content = f"{content}."
+        elif tool_name == "get_pypi_package_info":
+            package = payload.get("package")
+            version = payload.get("version")
+            checked_at = payload.get("checked_at")
+            content = f"Verified {package or 'package'} {version or 'unknown'}"
             if checked_at:
                 content = f"{content} at {checked_at}"
             content = f"{content}."
@@ -255,19 +416,35 @@ def _tool_result(
     compact = " ".join(content.split())
     if len(compact) > 240:
         compact = f"{compact[:237]}..."
-    return status, compact
+    return status, redact_marked_secrets(compact)
 
 
-def _audit_target(args: Mapping[str, Any]) -> str | None:
+def _audit_target(
+    args: Mapping[str, Any],
+    tool_message: ToolMessage | None = None,
+) -> str | None:
     raw_target = next(
         (
             args[key]
-            for key in ("file_path", "path", "url", "query", "source")
+            for key in ("file_path", "path", "url", "query", "source", "package")
             if key in args
         ),
         None,
     )
-    return str(raw_target) if raw_target is not None else None
+    if raw_target is None:
+        return None
+    target = redact_marked_secrets(str(raw_target))
+    recursive = args.get("recursive") is True
+    if tool_message is not None:
+        try:
+            result_payload = json.loads(message_text(tool_message))
+        except (json.JSONDecodeError, TypeError):
+            result_payload = None
+        if isinstance(result_payload, Mapping):
+            recursive = recursive or result_payload.get("recursive") is True
+    if recursive and "path" in args and normalize_virtual_path(target) != "/workspace":
+        target = f"{target} [recursive=true]"
+    return target
 
 
 class ToolAuditMiddleware(AgentMiddleware):
@@ -310,7 +487,7 @@ class ToolAuditMiddleware(AgentMiddleware):
         self.entries.append(
             ToolAuditEntry(
                 name=name,
-                path=_audit_target(args),
+                path=_audit_target(args, tool_message),
                 status=status,
                 result=summary,
             )
@@ -350,7 +527,7 @@ def extract_tool_audit(result: Mapping[str, Any]) -> tuple[ToolAuditEntry, ...]:
         audit.append(
             ToolAuditEntry(
                 name=name,
-                path=_audit_target(args),
+                path=_audit_target(args, results.get(call_id)),
                 status=status,
                 result=tool_result,
             )
@@ -377,8 +554,9 @@ def append_filesystem_verification(
             target = f" {entry.path}" if entry.path else ""
             detail = f" — {entry.result}" if entry.result else ""
             lines.append(f"- {entry.name}{target}: {entry.status}{detail}")
-    report = "\n".join(lines)
-    return f"{answer.rstrip()}\n\n{report}" if answer.strip() else report
+    report = redact_marked_secrets("\n".join(lines))
+    safe_answer = redact_marked_secrets(answer.rstrip())
+    return f"{safe_answer}\n\n{report}" if safe_answer.strip() else report
 
 
 def request_requires_tool_evidence(query: str) -> bool:
@@ -409,8 +587,8 @@ def append_acceptance_guard(
         )
     else:
         verdict = (
-            "Runtime acceptance verdict: NOT_VERIFIED — current tool calls "
-            "succeeded, but an LLM cannot certify its own multi-step test; use "
+            "Runtime acceptance verdict: NOT_VERIFIED — the LLM self-assessment "
+            "is non-authoritative even when current tool calls succeeded; use "
             "the external pytest/acceptance harness."
         )
     return f"{answer.rstrip()}\n\n{verdict}"
@@ -426,13 +604,15 @@ def append_current_web_verification_guard(
     if not _CURRENT_WEB_FACT_PATTERN.search(query):
         return answer
     if any(
-        entry.name == "fetch_web_page" and entry.status == "success" for entry in audit
+        entry.name in {"fetch_web_page", "get_pypi_package_info"}
+        and entry.status == "success"
+        for entry in audit
     ):
         return answer
     verdict = (
-        "Runtime web verification: FAIL — no fetch_web_page call succeeded in "
-        "this turn; any claimed current version, release, price, or check date "
-        "is unverified."
+        "Runtime web verification: FAIL — no authoritative web verification "
+        "tool succeeded in this turn; any claimed current version, release, "
+        "price, or check date is unverified."
     )
     return f"{answer.rstrip()}\n\n{verdict}"
 
@@ -589,6 +769,7 @@ class AgentRuntime:
         model: BaseChatModel | None = None,
         search_client_factory: SearchClientFactory | None = None,
         page_fetcher: PageFetcher | None = None,
+        pypi_fetcher: PypiFetcher | None = None,
     ) -> None:
         self.app_config = app_config
         self.provider_config = provider_config
@@ -629,6 +810,8 @@ class AgentRuntime:
             tool_kwargs["search_client_factory"] = search_client_factory
         if page_fetcher is not None:
             tool_kwargs["page_fetcher"] = page_fetcher
+        if pypi_fetcher is not None:
+            tool_kwargs["pypi_fetcher"] = pypi_fetcher
         tools = build_agent_tools(
             self.context_store,
             self.app_config.workspace,
@@ -654,6 +837,8 @@ class AgentRuntime:
         )
         tool_audit_middleware = ToolAuditMiddleware()
         self._tool_audit_middleware = tool_audit_middleware
+        duplicate_mutation_middleware = DuplicateMutationGuardMiddleware()
+        self._duplicate_mutation_middleware = duplicate_mutation_middleware
         chat_model = model or create_chat_model(self.provider_config)
         self.agent = create_deep_agent(
             model=chat_model,
@@ -663,7 +848,10 @@ class AgentRuntime:
             checkpointer=checkpointer,
             middleware=[
                 filesystem_middleware,
+                SequentialToolCallMiddleware(),
+                ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
+                duplicate_mutation_middleware,
                 ExactReadPathMiddleware(),
                 ModelRetryMiddleware(
                     max_retries=self.app_config.model_call_retries,
@@ -807,6 +995,7 @@ class AgentRuntime:
             raise ValueError("thread_id cannot be empty")
         self.last_tool_audit = ()
         self._tool_audit_middleware.reset()
+        self._duplicate_mutation_middleware.reset()
         if is_incomplete_mutation_request(clean_query):
             clarification = (
                 "Команда не выполнена: после двоеточия или указания точного "
@@ -872,7 +1061,9 @@ class AgentRuntime:
         except Exception as exc:
             self.last_tool_audit = tuple(self._tool_audit_middleware.entries)
             self._rollback_failed_turn(clean_thread_id, checkpoint_snapshot)
-            message = f"Agent request failed ({type(exc).__name__}): {exc}"
+            message = redact_marked_secrets(
+                f"Agent request failed ({type(exc).__name__}): {exc}"
+            )
             verification = append_filesystem_verification(
                 "",
                 clean_query,
@@ -893,7 +1084,7 @@ class AgentRuntime:
         self._update_successful_thread_head(clean_thread_id)
         self.last_tool_audit = extract_tool_audit(result)
         answer = append_filesystem_verification(
-            final_response_text(result),
+            redact_marked_secrets(final_response_text(result)),
             clean_query,
             self.last_tool_audit,
         )

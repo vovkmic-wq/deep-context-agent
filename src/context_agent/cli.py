@@ -210,12 +210,14 @@ def read_chat_query() -> str | None:
         first_line = input("you> ")
     except (EOFError, KeyboardInterrupt):
         return None
-    if first_line.strip().casefold() != "/paste":
+    stripped = first_line.strip()
+    command, separator, remainder = stripped.partition(" ")
+    if command.casefold() != "/paste":
         return first_line.strip()
 
     print("Paste mode: enter /end on its own line to send, /cancel to discard.")
-    lines: list[str] = []
-    prompt_bytes = 0
+    lines = [remainder] if separator and remainder else []
+    prompt_bytes = len(remainder.encode("utf-8")) + 1 if lines else 0
     while True:
         try:
             line = input("... ")

@@ -22,6 +22,7 @@ class SequenceChatModel(BaseChatModel):
     generation_attempts: int = 0
     bound_tool_names: list[str] = Field(default_factory=list)
     bound_tool_name_batches: list[list[str]] = Field(default_factory=list)
+    bound_tool_kwargs_batches: list[dict[str, Any]] = Field(default_factory=list)
     received_message_batches: list[list[BaseMessage]] = Field(default_factory=list)
 
     @property
@@ -31,12 +32,13 @@ class SequenceChatModel(BaseChatModel):
     def bind_tools(
         self,
         tools: Sequence[Any],
-        **_: Any,
+        **kwargs: Any,
     ) -> SequenceChatModel:
         self.bound_tool_names = [
             tool.name if hasattr(tool, "name") else str(tool) for tool in tools
         ]
         self.bound_tool_name_batches.append(list(self.bound_tool_names))
+        self.bound_tool_kwargs_batches.append(dict(kwargs))
         return self
 
     def _generate(

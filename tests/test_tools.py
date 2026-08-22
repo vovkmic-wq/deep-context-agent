@@ -13,6 +13,7 @@ from context_agent.errors import WebSearchError
 from context_agent.tools import (
     build_agent_tools,
     fetch_public_web_page,
+    fetch_pypi_package_info,
     search_web,
 )
 
@@ -98,6 +99,35 @@ class FakeOpener:
         return FakeResponse(body)
 
 
+class FakePypiResponse(FakeResponse):
+    def __init__(
+        self,
+        body: bytes,
+        final_url: str = "https://pypi.org/pypi/langchain/json",
+    ) -> None:
+        super().__init__(body)
+        self.headers.replace_header("Content-Type", "application/json")
+        self.final_url = final_url
+
+    def geturl(self) -> str:
+        return self.final_url
+
+
+class FakePypiOpener:
+    def __init__(
+        self,
+        body: bytes,
+        final_url: str = "https://pypi.org/pypi/langchain/json",
+    ) -> None:
+        self.body = body
+        self.final_url = final_url
+
+    def open(self, request: Any, *, timeout: float) -> FakePypiResponse:
+        assert request.full_url == "https://pypi.org/pypi/langchain/json"
+        assert timeout == 10.0
+        return FakePypiResponse(self.body, self.final_url)
+
+
 def fake_resolver(
     host: str,
     port: int,
@@ -114,6 +144,19 @@ def fake_resolver(
 def fake_opener_factory(resolver: Any) -> FakeOpener:
     assert resolver is fake_resolver
     return FakeOpener()
+
+
+def fake_pypi_resolver(
+    host: str,
+    port: int,
+    family: int,
+    socket_type: int,
+) -> list[tuple[Any, ...]]:
+    assert host == "pypi.org"
+    assert port == 443
+    assert family == 0
+    assert socket_type == socket.SOCK_STREAM
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("151.101.0.223", port))]
 
 
 def _tool_map(tools: list[Any]) -> dict[str, Any]:
@@ -183,6 +226,47 @@ def test_public_web_page_fetch_rejects_private_addresses() -> None:
         )
 
 
+def test_pypi_package_info_uses_official_bounded_json() -> None:
+    body = json.dumps({"info": {"name": "langchain", "version": "9.8.7"}}).encode()
+
+    package = fetch_pypi_package_info(
+        "langchain",
+        resolver=fake_pypi_resolver,
+        opener_factory=lambda resolver: FakePypiOpener(body),
+    )
+
+    assert package == {
+        "package": "langchain",
+        "version": "9.8.7",
+        "project_url": "https://pypi.org/project/langchain/",
+        "api_url": "https://pypi.org/pypi/langchain/json",
+    }
+
+
+def test_pypi_package_info_rejects_invalid_and_oversized_payloads() -> None:
+    with pytest.raises(WebSearchError, match="package name"):
+        fetch_pypi_package_info("../private")
+
+    oversized = b"x" * 2_000_001
+    with pytest.raises(WebSearchError, match="size limit"):
+        fetch_pypi_package_info(
+            "langchain",
+            resolver=fake_pypi_resolver,
+            opener_factory=lambda resolver: FakePypiOpener(oversized),
+        )
+
+    body = json.dumps({"info": {"name": "langchain", "version": "9.8.7"}}).encode()
+    with pytest.raises(WebSearchError, match="redirected outside"):
+        fetch_pypi_package_info(
+            "langchain",
+            resolver=fake_pypi_resolver,
+            opener_factory=lambda resolver: FakePypiOpener(
+                body,
+                "https://93.184.216.34/metadata",
+            ),
+        )
+
+
 def test_bound_web_tools_return_structured_current_errors(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -222,6 +306,12 @@ def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
                 workspace,
                 search_client_factory=FakeSearchClient,
                 page_fetcher=FakePageFetcher(),
+                pypi_fetcher=lambda package: {
+                    "package": package,
+                    "version": "9.8.7",
+                    "project_url": "https://pypi.org/project/langchain/",
+                    "api_url": "https://pypi.org/pypi/langchain/json",
+                },
                 runtime_metadata={"model": "test-model"},
             )
         )
@@ -240,6 +330,12 @@ def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
         )
         assert page_payload["page"]["text"] == "Version 9.8.7"
         assert page_payload["checked_at"].endswith("+00:00")
+        pypi_payload = json.loads(
+            tools["get_pypi_package_info"].invoke({"package": "langchain"})
+        )
+        assert pypi_payload["status"] == "success"
+        assert pypi_payload["version"] == "9.8.7"
+        assert pypi_payload["checked_at"].endswith("+00:00")
 
         directory_payload = json.loads(
             tools["make_directory"].invoke({"path": "/workspace/notes"})

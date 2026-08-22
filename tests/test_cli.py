@@ -25,6 +25,16 @@ def test_chat_paste_mode_returns_one_multiline_query(
     monkeypatch.setattr(builtins, "input", lambda _: next(lines))
 
     assert read_chat_query() == "first line\nsecond line"
+
+
+def test_chat_inline_paste_keeps_the_first_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lines = iter(["/paste first line", "second line", "/end"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(lines))
+
+    assert read_chat_query() == "first line\nsecond line"
     assert "Paste mode" in capsys.readouterr().out
 
 

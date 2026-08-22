@@ -26,6 +26,7 @@ from context_agent.runtime import (
     is_incomplete_mutation_request,
     limit_retrieved_hits,
     message_text,
+    redact_marked_secrets,
     should_preflight_deny_mutation,
     should_skip_automatic_retrieval,
 )
@@ -99,6 +100,40 @@ def test_llm_cannot_self_certify_overall_acceptance() -> None:
     )
     assert "Runtime acceptance verdict: FAIL" in answer
 
+    candidate = append_acceptance_guard(
+        "CANDIDATE_RESULT: FAIL",
+        (
+            ToolAuditEntry(
+                name="runtime_info",
+                path=None,
+                status="success",
+                result="metadata",
+            ),
+        ),
+    )
+    assert "Runtime acceptance verdict: NOT_VERIFIED" in candidate
+
+
+def test_marked_secret_redaction_is_atomic_and_case_insensitive() -> None:
+    assert redact_marked_secrets("value DECOY_SECRET_DO_NOT_SHOW_71935 end") == (
+        "value [REDACTED] end"
+    )
+    assert redact_marked_secrets("secret-do_not_show-42") == "[REDACTED]"
+    audited = append_filesystem_verification(
+        "done",
+        "Search context",
+        (
+            ToolAuditEntry(
+                name="search_context",
+                path="DECOY_DO_NOT_SHOW_42",
+                status="success",
+                result="Returned 1 result(s).",
+            ),
+        ),
+    )
+    assert "DECOY_DO_NOT_SHOW_42" not in audited
+    assert "search_context [REDACTED]: success" in audited
+
 
 def test_current_web_fact_requires_successful_page_fetch() -> None:
     query = "Find the latest package version and release date"
@@ -129,6 +164,18 @@ def test_current_web_fact_requires_successful_page_fetch() -> None:
     assert (
         append_current_web_verification_guard("Verified.", query, fetched)
         == "Verified."
+    )
+
+    pypi = (
+        ToolAuditEntry(
+            name="get_pypi_package_info",
+            path="langchain",
+            status="success",
+            result="Verified langchain 9.8.7.",
+        ),
+    )
+    assert append_current_web_verification_guard("Verified.", query, pypi) == (
+        "Verified."
     )
 
 
@@ -211,6 +258,7 @@ def test_runtime_invokes_real_deep_agent_and_archives_turn(
         assert answer == "test answer"
         assert "search_context" in static_model.bound_tool_names
         assert "runtime_info" in static_model.bound_tool_names
+        assert "get_pypi_package_info" in static_model.bound_tool_names
         assert "write_file" in static_model.bound_tool_names
         assert "remove_path" in static_model.bound_tool_names
         assert all(
@@ -271,6 +319,180 @@ def test_agent_can_create_directory_and_file_inside_workspace(tmp_path: Path) ->
         assert "write_file /workspace/notes/result.txt: success" in answer
     result_path = app_config.workspace / "notes" / "result.txt"
     assert result_path.read_text(encoding="utf-8") == "saved by agent"
+
+
+def test_parallel_model_tool_calls_are_reduced_to_one_per_step(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "make_directory",
+                        "args": {"path": "/workspace/serial"},
+                        "id": "call-first",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/serial/unsafe.txt",
+                            "content": "MUST_NOT_RUN_IN_PARALLEL",
+                        },
+                        "id": "call-surplus",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            AIMessage(content="Only the first decision was executed."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask("Create the /workspace/serial directory")
+
+    assert (app_config.workspace / "serial").is_dir()
+    assert not (app_config.workspace / "serial" / "unsafe.txt").exists()
+    assert [entry.name for entry in runtime.last_tool_audit] == ["make_directory"]
+    assert "make_directory /workspace/serial: success" in answer
+    assert model.bound_tool_kwargs_batches
+    assert all(
+        kwargs.get("parallel_tool_calls") is False
+        for kwargs in model.bound_tool_kwargs_batches
+    )
+
+
+def test_identical_mutation_is_denied_within_one_turn(tmp_path: Path) -> None:
+    duplicate_call = {
+        "name": "write_file",
+        "args": {
+            "file_path": "/workspace/once.txt",
+            "content": "WRITE_ONCE",
+        },
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{**duplicate_call, "id": "call-write-first"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**duplicate_call, "id": "call-write-duplicate"}],
+            ),
+            AIMessage(content="Duplicate handled."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask("Write /workspace/once.txt with WRITE_ONCE")
+
+    assert (app_config.workspace / "once.txt").read_text(encoding="utf-8") == (
+        "WRITE_ONCE"
+    )
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "denied",
+    ]
+    assert "Duplicate mutation denied" in answer
+
+
+def test_duplicate_mutation_ledger_resets_between_turns(tmp_path: Path) -> None:
+    call = {
+        "name": "make_directory",
+        "args": {"path": "/workspace/reusable"},
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(content="", tool_calls=[{**call, "id": "call-turn-one"}]),
+            AIMessage(content="first done"),
+            AIMessage(content="", tool_calls=[{**call, "id": "call-turn-two"}]),
+            AIMessage(content="second done"),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        runtime.ask("Create /workspace/reusable", thread_id="one")
+        runtime.ask("Create /workspace/reusable", thread_id="two")
+        assert runtime.last_tool_audit[0].status == "success"
+
+
+def test_exact_directory_delete_is_forced_recursive_once(tmp_path: Path) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "remove_path",
+                        "args": {
+                            "path": "/workspace/remove-me",
+                            "recursive": False,
+                        },
+                        "id": "call-remove-directory",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Directory removed."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    target = app_config.workspace / "remove-me"
+    target.mkdir()
+    (target / "child.txt").write_text("child", encoding="utf-8")
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask("Удали папку /workspace/remove-me целиком")
+
+    assert not target.exists()
+    assert len(runtime.last_tool_audit) == 1
+    assert runtime.last_tool_audit[0].status == "success"
+    assert "remove_path /workspace/remove-me [recursive=true]: success" in answer
+
+
+def test_marked_secret_is_kept_in_file_but_redacted_from_output(
+    tmp_path: Path,
+) -> None:
+    secret = "DECOY_SECRET_DO_NOT_SHOW_71935"
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/secret.txt",
+                            "content": secret,
+                        },
+                        "id": "call-secret-write",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=f"Created file containing {secret}."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            f"Write {secret} to /workspace/secret.txt but do not show it"
+        )
+
+    assert (app_config.workspace / "secret.txt").read_text(encoding="utf-8") == secret
+    assert secret not in answer
+    assert "[REDACTED]" in answer
 
 
 def test_agent_cannot_delete_workspace_root_or_its_children(tmp_path: Path) -> None:
@@ -709,3 +931,69 @@ def test_failed_web_search_cannot_confirm_a_stale_current_version(
 
     assert "web_search latest package version: error" in answer
     assert "Runtime web verification: FAIL" in answer
+
+
+def test_exact_private_url_is_rejected_by_current_fetch_tool(tmp_path: Path) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fetch_web_page",
+                        "args": {"url": "http://127.0.0.1:8000/private"},
+                        "id": "call-private-fetch",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Local URL was rejected."),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask("Open http://127.0.0.1:8000/private")
+
+    assert runtime.last_tool_audit[0].name == "fetch_web_page"
+    assert runtime.last_tool_audit[0].status == "error"
+    assert "fetch_web_page http://127.0.0.1:8000/private: error" in answer
+
+
+def test_official_pypi_tool_verifies_current_version_without_page_body(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_pypi_package_info",
+                        "args": {"package": "langchain"},
+                        "id": "call-pypi",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Current version is 9.8.7."),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path),
+        _provider_config(),
+        model=model,
+        pypi_fetcher=lambda package: {
+            "package": package,
+            "version": "9.8.7",
+            "project_url": "https://pypi.org/project/langchain/",
+            "api_url": "https://pypi.org/pypi/langchain/json",
+        },
+    ) as runtime:
+        answer = runtime.ask("Find the current langchain version on PyPI")
+
+    assert "get_pypi_package_info langchain: success" in answer
+    assert "Verified langchain 9.8.7 at" in answer
+    assert "Runtime web verification: FAIL" not in answer
