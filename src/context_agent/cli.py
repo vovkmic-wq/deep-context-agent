@@ -7,6 +7,7 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TextIO
 
 from dotenv import load_dotenv
 
@@ -15,6 +16,8 @@ from context_agent.context_store import ContextStore
 from context_agent.errors import AgentError
 from context_agent.providers import create_chat_model
 from context_agent.runtime import AgentRuntime, message_text
+
+MAX_PROMPT_FILE_BYTES = 2 * 1024 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,12 +36,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("AGENT_THREAD_ID", "default"),
         help="Persistent conversation thread ID.",
     )
+    parser.add_argument(
+        "--no-auto-context",
+        action="store_true",
+        help=(
+            "Disable automatic retrieval for this request/session; tools remain "
+            "available."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("chat", help="Start an interactive chat session.")
 
     ask_parser = subparsers.add_parser("ask", help="Send one request.")
-    ask_parser.add_argument("query", help="User request.")
+    ask_parser.add_argument(
+        "query",
+        nargs="?",
+        help="User request, or '-' to read one request from stdin.",
+    )
+    ask_parser.add_argument(
+        "--file",
+        type=Path,
+        help="Read one UTF-8 multi-line request from a file (max 2 MiB).",
+    )
 
     index_parser = subparsers.add_parser(
         "index",
@@ -138,19 +158,99 @@ def _runtime(args: argparse.Namespace, base_dir: Path) -> AgentRuntime:
     )
 
 
+def read_prompt_file(path: Path) -> str:
+    """Read one bounded UTF-8 prompt from an explicitly selected file."""
+
+    try:
+        with path.open("rb") as prompt_file:
+            payload = prompt_file.read(MAX_PROMPT_FILE_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"Cannot access prompt file '{path}': {exc}") from exc
+    if len(payload) > MAX_PROMPT_FILE_BYTES:
+        raise ValueError(
+            f"Prompt file is too large; maximum is {MAX_PROMPT_FILE_BYTES} bytes"
+        )
+    try:
+        query = payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError(f"Prompt file must be valid UTF-8: {path}") from exc
+    query = query.replace("\r\n", "\n").replace("\r", "\n")
+    if not query.strip():
+        raise ValueError("Prompt cannot be empty")
+    return query
+
+
+def resolve_ask_query(args: argparse.Namespace, stdin: TextIO | None = None) -> str:
+    """Resolve a single ask request from an argument, file, or stdin."""
+
+    stream = stdin or sys.stdin
+    if args.file is not None and args.query is not None:
+        raise ValueError("Use either a query argument or --file, not both")
+    if args.file is not None:
+        return read_prompt_file(args.file)
+    if args.query == "-" or (args.query is None and not stream.isatty()):
+        query = stream.read(MAX_PROMPT_FILE_BYTES + 1)
+        if not query.strip():
+            raise ValueError("Prompt from stdin cannot be empty")
+        if (
+            len(query) > MAX_PROMPT_FILE_BYTES
+            or len(query.encode("utf-8")) > MAX_PROMPT_FILE_BYTES
+        ):
+            raise ValueError("Prompt from stdin exceeds the 2 MiB limit")
+        return query
+    if args.query is None:
+        raise ValueError("Provide a query, use --file, or pipe a prompt to ask -")
+    return args.query
+
+
+def read_chat_query() -> str | None:
+    """Read one chat turn, supporting explicit multi-line paste mode."""
+
+    try:
+        first_line = input("you> ")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if first_line.strip().casefold() != "/paste":
+        return first_line.strip()
+
+    print("Paste mode: enter /end on its own line to send, /cancel to discard.")
+    lines: list[str] = []
+    prompt_bytes = 0
+    while True:
+        try:
+            line = input("... ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        command = line.strip().casefold()
+        if command == "/cancel":
+            return ""
+        if command == "/end":
+            return "\n".join(lines).strip()
+        prompt_bytes += len(line.encode("utf-8")) + 1
+        if prompt_bytes > MAX_PROMPT_FILE_BYTES:
+            raise ValueError("Pasted prompt exceeds the 2 MiB limit")
+        lines.append(line)
+
+
 def _run_ask(args: argparse.Namespace, base_dir: Path) -> int:
     with _runtime(args, base_dir) as runtime:
-        print(runtime.ask(args.query, thread_id=args.thread))
+        print(
+            runtime.ask(
+                resolve_ask_query(args),
+                thread_id=args.thread,
+                auto_context=not args.no_auto_context,
+            )
+        )
     return 0
 
 
 def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
-    print("Deep Context Agent. Enter /exit to stop.")
+    print("Deep Context Agent. Enter /paste for multi-line input, /exit to stop.")
     with _runtime(args, base_dir) as runtime:
         while True:
-            try:
-                query = input("you> ").strip()
-            except (EOFError, KeyboardInterrupt):
+            query = read_chat_query()
+            if query is None:
                 print()
                 break
             if query.casefold() in {"/exit", "/quit", "exit", "quit"}:
@@ -158,7 +258,11 @@ def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
             if not query:
                 continue
             try:
-                answer = runtime.ask(query, thread_id=args.thread)
+                answer = runtime.ask(
+                    query,
+                    thread_id=args.thread,
+                    auto_context=not args.no_auto_context,
+                )
             except Exception as exc:
                 print(f"request failed: {type(exc).__name__}: {exc}", file=sys.stderr)
                 continue

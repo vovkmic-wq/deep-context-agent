@@ -101,16 +101,38 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_DATA_DIR": "data",
             "AGENT_CONTEXT_ROOT": "context",
             "AGENT_CONTEXT_TOP_K": "9",
+            "AGENT_AUTO_CONTEXT_MAX_CHARS": "6000",
+            "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS": "1500",
             "AGENT_CONTEXT_MAX_FILE_MB": "64",
+            "AGENT_MODEL_CALL_RETRIES": "4",
+            "AGENT_MODEL_RETRY_INITIAL_DELAY": "0.5",
+            "AGENT_MODEL_RETRY_MAX_DELAY": "5",
+            "AGENT_WEB_RETRY_ATTEMPTS": "2",
         },
     )
     config.prepare_directories()
     assert config.workspace == (tmp_path / "work").resolve()
     assert config.context_top_k == 9
+    assert config.auto_context_max_chars == 6000
+    assert config.auto_context_query_max_chars == 1500
     assert config.max_file_bytes == 64 * 1024 * 1024
+    assert config.model_call_retries == 4
+    assert config.model_retry_initial_delay == 0.5
+    assert config.model_retry_max_delay == 5
+    assert config.web_retry_attempts == 2
     assert config.workspace.is_dir()
     assert config.data_dir.is_dir()
     assert config.context_root.is_dir()
+
+
+def test_legacy_retrieval_limit_alias_is_supported(tmp_path: Path) -> None:
+    legacy = AppConfig.from_env(tmp_path, {"AGENT_RETRIEVAL_LIMIT": "4"})
+    canonical = AppConfig.from_env(
+        tmp_path,
+        {"AGENT_RETRIEVAL_LIMIT": "4", "AGENT_CONTEXT_TOP_K": "7"},
+    )
+    assert legacy.context_top_k == 4
+    assert canonical.context_top_k == 7
 
 
 def test_chat_model_factory_preserves_compatible_settings() -> None:
@@ -122,3 +144,4 @@ def test_chat_model_factory_preserves_compatible_settings() -> None:
     assert model.model_name == "deepseek-v4-flash"
     assert str(model.openai_api_base) == "https://api.deepseek.com"
     assert model.extra_body == {"thinking": {"type": "disabled"}}
+    assert model.max_retries == 0

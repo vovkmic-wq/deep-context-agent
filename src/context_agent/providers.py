@@ -16,7 +16,9 @@ def create_chat_model(config: ProviderConfig) -> ChatOpenAI:
         "base_url": config.base_url,
         "temperature": config.temperature,
         "timeout": config.timeout,
-        "max_retries": config.max_retries,
+        # Retries are owned by ModelRetryMiddleware so a whole agent graph and
+        # already completed tools can never be replayed by provider settings.
+        "max_retries": 0,
     }
     if config.extra_body:
         kwargs["extra_body"] = config.extra_body

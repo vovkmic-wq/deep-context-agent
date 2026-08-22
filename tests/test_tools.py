@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from context_agent.context_store import ContextStore
-from context_agent.errors import PathSecurityError, WebSearchError
+from context_agent.errors import WebSearchError
 from context_agent.tools import (
     build_agent_tools,
     fetch_public_web_page,
@@ -38,6 +38,17 @@ class FailingSearchClient:
         raise TimeoutError("network timeout")
 
 
+class FlakySearchClient:
+    calls = 0
+
+    def text(self, query: str, **kwargs: Any) -> list[dict[str, str]]:
+        del query, kwargs
+        type(self).calls += 1
+        if type(self).calls < 3:
+            raise TimeoutError("temporary timeout")
+        return [{"title": "Recovered", "href": "https://example.test"}]
+
+
 class FakePageFetcher:
     def __call__(self, url: str, *, max_chars: int) -> dict[str, Any]:
         assert url == "https://example.test/docs"
@@ -49,6 +60,12 @@ class FakePageFetcher:
             "text": "Version 9.8.7",
             "truncated": False,
         }
+
+
+class FailingPageFetcher:
+    def __call__(self, url: str, *, max_chars: int) -> dict[str, Any]:
+        del url, max_chars
+        raise TimeoutError("page timeout")
 
 
 class FakeResponse:
@@ -120,9 +137,28 @@ def test_web_search_normalizes_results() -> None:
 
 def test_web_search_has_bounded_errors() -> None:
     with pytest.raises(WebSearchError, match="TimeoutError"):
-        search_web("current docs", client_factory=FailingSearchClient)
+        search_web(
+            "current docs",
+            client_factory=FailingSearchClient,
+            attempts=1,
+        )
     with pytest.raises(WebSearchError, match="two characters"):
         search_web("x")
+
+
+def test_web_search_retries_transient_failure_with_backoff() -> None:
+    FlakySearchClient.calls = 0
+    delays: list[float] = []
+    results = search_web(
+        "current docs",
+        client_factory=FlakySearchClient,
+        attempts=3,
+        retry_delay=0.25,
+        sleeper=delays.append,
+    )
+    assert results[0]["title"] == "Recovered"
+    assert FlakySearchClient.calls == 3
+    assert delays == [0.25, 0.5]
 
 
 def test_public_web_page_fetch_extracts_text_and_blocks_scripts() -> None:
@@ -147,6 +183,34 @@ def test_public_web_page_fetch_rejects_private_addresses() -> None:
         )
 
 
+def test_bound_web_tools_return_structured_current_errors(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with ContextStore(tmp_path / "context.sqlite3") as store:
+        tools = _tool_map(
+            build_agent_tools(
+                store,
+                workspace,
+                search_client_factory=FailingSearchClient,
+                page_fetcher=FailingPageFetcher(),
+                web_retry_attempts=1,
+            )
+        )
+        search_payload = json.loads(
+            tools["web_search"].invoke({"query": "current docs"})
+        )
+        page_payload = json.loads(
+            tools["fetch_web_page"].invoke({"url": "https://example.test/docs"})
+        )
+
+    assert search_payload["status"] == "error"
+    assert search_payload["results"] == []
+    assert search_payload["checked_at"].endswith("+00:00")
+    assert page_payload["status"] == "error"
+    assert page_payload["message"] == "Web page fetch failed: TimeoutError"
+    assert page_payload["checked_at"].endswith("+00:00")
+
+
 def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -158,8 +222,11 @@ def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
                 workspace,
                 search_client_factory=FakeSearchClient,
                 page_fetcher=FakePageFetcher(),
+                runtime_metadata={"model": "test-model"},
             )
         )
+        runtime_payload = json.loads(tools["runtime_info"].invoke({}))
+        assert runtime_payload == {"model": "test-model"}
         context_payload = json.loads(
             tools["search_context"].invoke({"query": "ORBITAL"})
         )
@@ -172,13 +239,30 @@ def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
             )
         )
         assert page_payload["page"]["text"] == "Version 9.8.7"
+        assert page_payload["checked_at"].endswith("+00:00")
 
-        tools["make_directory"].invoke({"path": "/workspace/notes"})
+        directory_payload = json.loads(
+            tools["make_directory"].invoke({"path": "/workspace/notes"})
+        )
+        assert directory_payload["status"] == "success"
         assert (workspace / "notes").is_dir()
         file_path = workspace / "notes" / "a.txt"
         file_path.write_text("data", encoding="utf-8")
-        tools["remove_path"].invoke({"path": "notes/a.txt"})
+        remove_payload = json.loads(
+            tools["remove_path"].invoke({"path": "notes/a.txt"})
+        )
+        assert remove_payload["status"] == "success"
         assert not file_path.exists()
 
-        with pytest.raises(PathSecurityError):
+        missing_payload = json.loads(
+            tools["remove_path"].invoke({"path": "notes/missing.txt"})
+        )
+        assert missing_payload["status"] == "not_found"
+
+        sentinel = workspace / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        denied_payload = json.loads(
             tools["remove_path"].invoke({"path": "/workspace", "recursive": True})
+        )
+        assert denied_payload["status"] == "denied"
+        assert sentinel.read_text(encoding="utf-8") == "keep"

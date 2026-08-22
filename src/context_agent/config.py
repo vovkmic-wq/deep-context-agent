@@ -36,6 +36,21 @@ def _int_setting(environ: Mapping[str, str], name: str, default: int) -> int:
         raise ConfigurationError(f"{name} must be an integer") from exc
 
 
+def _int_setting_with_alias(
+    environ: Mapping[str, str],
+    name: str,
+    alias: str,
+    default: int,
+) -> int:
+    """Read a canonical integer setting, falling back to a legacy alias."""
+
+    raw_value = environ.get(name, environ.get(alias, str(default)))
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
     """Resolved settings for one OpenAI-compatible chat model."""
@@ -46,7 +61,6 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     temperature: float = 0.1
     timeout: float = 120.0
-    max_retries: int = 2
     extra_body: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -61,8 +75,6 @@ class ProviderConfig:
             raise ConfigurationError("Provider base URL must use HTTP or HTTPS")
         if self.timeout <= 0:
             raise ConfigurationError("Request timeout must be positive")
-        if self.max_retries < 0:
-            raise ConfigurationError("Max retries cannot be negative")
 
     @classmethod
     def from_env(
@@ -79,7 +91,6 @@ class ProviderConfig:
             0.1,
         )
         timeout = _float_setting(values, "AGENT_REQUEST_TIMEOUT", 120.0)
-        max_retries = _int_setting(values, "AGENT_MAX_RETRIES", 2)
 
         if name == "lmstudio":
             return cls(
@@ -92,7 +103,6 @@ class ProviderConfig:
                 api_key=values.get("LM_STUDIO_API_KEY") or "lm-studio",
                 temperature=temperature,
                 timeout=timeout,
-                max_retries=max_retries,
             )
 
         if name == "openai":
@@ -106,7 +116,6 @@ class ProviderConfig:
                 api_key=_required_key(values, "OPENAI_API_KEY", name),
                 temperature=temperature,
                 timeout=timeout,
-                max_retries=max_retries,
             )
 
         if name == "yandex":
@@ -128,7 +137,6 @@ class ProviderConfig:
                 api_key=_required_key(values, "YANDEX_API_KEY", name),
                 temperature=temperature,
                 timeout=timeout,
-                max_retries=max_retries,
             )
 
         if name == "deepseek":
@@ -142,7 +150,6 @@ class ProviderConfig:
                 api_key=_required_key(values, "DEEPSEEK_API_KEY", name),
                 temperature=temperature,
                 timeout=timeout,
-                max_retries=max_retries,
                 extra_body={"thinking": {"type": "disabled"}},
             )
 
@@ -157,7 +164,6 @@ class ProviderConfig:
                 api_key=_required_key(values, "DASHSCOPE_API_KEY", name),
                 temperature=temperature,
                 timeout=timeout,
-                max_retries=max_retries,
                 extra_body={"enable_thinking": False},
             )
 
@@ -187,13 +193,25 @@ class AppConfig:
     data_dir: Path
     context_root: Path
     context_top_k: int = 8
+    auto_context_max_chars: int = 12_000
+    auto_context_query_max_chars: int = 2_000
     chunk_size: int = 4_000
     chunk_overlap: int = 400
     max_file_bytes: int = 2 * 1024 * 1024 * 1024
+    model_call_retries: int = 3
+    model_retry_initial_delay: float = 1.0
+    model_retry_max_delay: float = 15.0
+    web_retry_attempts: int = 3
 
     def __post_init__(self) -> None:
         if self.context_top_k <= 0:
             raise ConfigurationError("AGENT_CONTEXT_TOP_K must be positive")
+        if self.auto_context_max_chars <= 0:
+            raise ConfigurationError("AGENT_AUTO_CONTEXT_MAX_CHARS must be positive")
+        if self.auto_context_query_max_chars <= 0:
+            raise ConfigurationError(
+                "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS must be positive"
+            )
         if self.chunk_size <= 0:
             raise ConfigurationError("AGENT_CONTEXT_CHUNK_SIZE must be positive")
         if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
@@ -202,6 +220,18 @@ class AppConfig:
             )
         if self.max_file_bytes <= 0:
             raise ConfigurationError("AGENT_CONTEXT_MAX_FILE_MB must be positive")
+        if self.model_call_retries < 0:
+            raise ConfigurationError("AGENT_MODEL_CALL_RETRIES cannot be negative")
+        if self.model_retry_initial_delay < 0:
+            raise ConfigurationError(
+                "AGENT_MODEL_RETRY_INITIAL_DELAY cannot be negative"
+            )
+        if self.model_retry_max_delay < self.model_retry_initial_delay:
+            raise ConfigurationError(
+                "AGENT_MODEL_RETRY_MAX_DELAY must be at least the initial delay"
+            )
+        if self.web_retry_attempts <= 0:
+            raise ConfigurationError("AGENT_WEB_RETRY_ATTEMPTS must be positive")
 
     @property
     def context_database(self) -> Path:
@@ -236,7 +266,22 @@ class AppConfig:
                 values.get("AGENT_CONTEXT_ROOT", "./agent_workspace"),
                 root,
             ),
-            context_top_k=_int_setting(values, "AGENT_CONTEXT_TOP_K", 8),
+            context_top_k=_int_setting_with_alias(
+                values,
+                "AGENT_CONTEXT_TOP_K",
+                "AGENT_RETRIEVAL_LIMIT",
+                8,
+            ),
+            auto_context_max_chars=_int_setting(
+                values,
+                "AGENT_AUTO_CONTEXT_MAX_CHARS",
+                12_000,
+            ),
+            auto_context_query_max_chars=_int_setting(
+                values,
+                "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS",
+                2_000,
+            ),
             chunk_size=_int_setting(values, "AGENT_CONTEXT_CHUNK_SIZE", 4_000),
             chunk_overlap=_int_setting(
                 values,
@@ -245,6 +290,26 @@ class AppConfig:
             ),
             max_file_bytes=(
                 _int_setting(values, "AGENT_CONTEXT_MAX_FILE_MB", 2_048) * 1024 * 1024
+            ),
+            model_call_retries=_int_setting(
+                values,
+                "AGENT_MODEL_CALL_RETRIES",
+                3,
+            ),
+            model_retry_initial_delay=_float_setting(
+                values,
+                "AGENT_MODEL_RETRY_INITIAL_DELAY",
+                1.0,
+            ),
+            model_retry_max_delay=_float_setting(
+                values,
+                "AGENT_MODEL_RETRY_MAX_DELAY",
+                15.0,
+            ),
+            web_retry_attempts=_int_setting(
+                values,
+                "AGENT_WEB_RETRY_ATTEMPTS",
+                3,
             ),
         )
 
