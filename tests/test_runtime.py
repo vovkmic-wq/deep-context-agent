@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from conftest import SequenceChatModel
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import SearchHit
@@ -18,6 +18,7 @@ from context_agent.errors import AgentError
 from context_agent.runtime import (
     AcceptanceManifest,
     AgentRuntime,
+    ExplicitToolBudgetMiddleware,
     SequentialToolCallMiddleware,
     ToolAuditEntry,
     acceptance_forced_tool_choice,
@@ -728,6 +729,64 @@ def test_sequential_middleware_omits_parallel_setting_without_tools() -> None:
 
     assert response.result[0].content == "done"
     assert "parallel_tool_calls" not in captured
+
+
+def test_budget_precedes_sequential_normalization_for_empty_toolset() -> None:
+    model = SequenceChatModel(responses=[AIMessage(content="done")])
+    first_call = {
+        "name": "runtime_info",
+        "args": {},
+        "id": "call-order-first",
+        "type": "tool_call",
+    }
+    second_call = {
+        "name": "list_context_sources",
+        "args": {},
+        "id": "call-order-second",
+        "type": "tool_call",
+    }
+    state = {
+        "messages": [
+            HumanMessage(content="Use at most 2 functional tool calls."),
+            AIMessage(content="", tool_calls=[first_call]),
+            ToolMessage(
+                content='{"status":"success"}',
+                tool_call_id=first_call["id"],
+                name=first_call["name"],
+            ),
+            AIMessage(content="", tool_calls=[second_call]),
+            ToolMessage(
+                content='{"status":"success","sources":[]}',
+                tool_call_id=second_call["id"],
+                name=second_call["name"],
+            ),
+        ]
+    }
+    request = ModelRequest(
+        model=model,
+        messages=[],
+        tools=[{"name": "runtime_info"}, {"name": "search_context"}],
+        state=state,
+        model_settings={"parallel_tool_calls": False},
+    )
+    captured: dict[str, Any] = {}
+
+    def final_handler(current: ModelRequest) -> ModelResponse:
+        captured["tools"] = current.tools
+        captured["tool_choice"] = current.tool_choice
+        captured["model_settings"] = current.model_settings
+        return ModelResponse(result=[AIMessage(content="done")])
+
+    sequential = SequentialToolCallMiddleware()
+    response = ExplicitToolBudgetMiddleware().wrap_model_call(
+        request,
+        lambda budgeted: sequential.wrap_model_call(budgeted, final_handler),
+    )
+
+    assert response.result[0].content == "done"
+    assert captured["tools"] == []
+    assert captured["tool_choice"] is None
+    assert "parallel_tool_calls" not in captured["model_settings"]
 
 
 def test_identical_mutation_is_denied_within_one_turn(tmp_path: Path) -> None:

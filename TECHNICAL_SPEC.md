@@ -179,6 +179,9 @@
 47. Если runtime policy исчерпала все tools, следующий model request не содержит
     `tools`, `tool_choice` и `parallel_tool_calls`; это обязательно для
     совместимости с OpenAI API и проверяется отдельной regression.
+48. Middleware, меняющие доступный toolset или `tool_choice`, выполняются до
+    `SequentialToolCallMiddleware`; последовательный normalizer последним перед
+    model handler формирует согласованные `tools`/`parallel_tool_calls`.
 
 ## 3. Провайдеры и переменные
 

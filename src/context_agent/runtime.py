@@ -2037,10 +2037,10 @@ class AgentRuntime:
             checkpointer=checkpointer,
             middleware=[
                 filesystem_middleware,
-                SequentialToolCallMiddleware(),
                 AcceptanceCompletionMiddleware(),
                 ExactOnceToolMiddleware(),
                 ExplicitToolBudgetMiddleware(),
+                SequentialToolCallMiddleware(),
                 ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
                 tool_call_policy_middleware,

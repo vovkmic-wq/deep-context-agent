@@ -3,6 +3,15 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.8.2] — 2026-08-23
+
+### Исправлено
+
+- Budget/exact middleware теперь выполняются перед sequential normalizer, и
+  `parallel_tool_calls` вычисляется уже после окончательного сужения toolset.
+- Композиционный regression воспроизводит исчерпанный total budget и проверяет
+  отсутствие `tools`, `tool_choice` и `parallel_tool_calls` у model handler.
+
 ## [0.8.1] — 2026-08-23
 
 ### Исправлено
