@@ -17,6 +17,7 @@ from context_agent.runtime import (
     AcceptanceManifest,
     AgentRuntime,
     ToolAuditEntry,
+    acceptance_forced_tool_choice,
     append_acceptance_guard,
     append_current_web_verification_guard,
     append_filesystem_verification,
@@ -26,7 +27,9 @@ from context_agent.runtime import (
     evaluate_acceptance_manifest,
     explicit_filesystem_paths,
     final_response_text,
+    forbidden_mutation_paths,
     forbidden_read_paths,
+    format_acceptance_evaluation,
     is_incomplete_mutation_request,
     limit_retrieved_hits,
     message_text,
@@ -147,6 +150,7 @@ def test_acceptance_manifest_is_strict_bounded_and_machine_readable() -> None:
             }
         ],
         "pending_requirements": ["restart memory check"],
+        "allowed_unlisted_tools": ["write_todos"],
     }
     query = (
         "Run acceptance.\n<acceptance_manifest>\n"
@@ -158,6 +162,7 @@ def test_acceptance_manifest_is_strict_bounded_and_machine_readable() -> None:
 
     assert isinstance(manifest, AcceptanceManifest)
     assert manifest.exact_tool_call_counts == {"remove_path": 1, "read_file": 1}
+    assert manifest.allowed_unlisted_tools == ("write_todos",)
     with pytest.raises(ValueError, match="unknown tool"):
         parse_acceptance_manifest(
             '<acceptance_manifest>{"exact_tool_call_counts": '
@@ -184,6 +189,22 @@ def test_acceptance_manifest_is_strict_bounded_and_machine_readable() -> None:
     with pytest.raises(ValueError, match="20000-character"):
         parse_acceptance_manifest(
             f'<acceptance_manifest>{{"padding":"{oversized}"}}</acceptance_manifest>'
+        )
+    with pytest.raises(ValueError, match="unknown tool"):
+        parse_acceptance_manifest(
+            '<acceptance_manifest>{"exact_tool_call_counts": {"read_file": 1},'
+            '"allowed_unlisted_tools": ["shell"]}</acceptance_manifest>'
+        )
+    with pytest.raises(ValueError, match="duplicate tool"):
+        parse_acceptance_manifest(
+            '<acceptance_manifest>{"exact_tool_call_counts": {"read_file": 1},'
+            '"allowed_unlisted_tools": ["write_todos", "write_todos"]}'
+            "</acceptance_manifest>"
+        )
+    with pytest.raises(ValueError, match="cannot overlap"):
+        parse_acceptance_manifest(
+            '<acceptance_manifest>{"exact_tool_call_counts": {"read_file": 1},'
+            '"allowed_unlisted_tools": ["read_file"]}</acceptance_manifest>'
         )
 
 
@@ -239,6 +260,55 @@ def test_acceptance_manifest_evaluates_order_counts_and_forbidden_events() -> No
     assert "Runtime acceptance verdict: PASS" in report
 
 
+def test_allowed_unlisted_tool_is_reported_without_failing_manifest() -> None:
+    manifest = parse_acceptance_manifest(
+        """<acceptance_manifest>{
+        "exact_tool_call_counts": {"runtime_info": 1},
+        "allowed_unlisted_tools": ["write_todos"]
+        }</acceptance_manifest>"""
+    )
+    assert manifest is not None
+
+    evaluation = evaluate_acceptance_manifest(
+        manifest,
+        (
+            ToolAuditEntry("write_todos", None, "error", "bad plan"),
+            ToolAuditEntry("write_todos", None, "success", "plan"),
+            ToolAuditEntry("runtime_info", None, "success", "metadata"),
+        ),
+    )
+
+    assert evaluation.failed == 0
+    assert evaluation.blocked == 0
+    assert evaluation.tool_counts["write_todos"] == 2
+
+
+def test_missing_required_event_blocks_dependents_without_cascade_failures() -> None:
+    manifest = parse_acceptance_manifest(
+        """<acceptance_manifest>{
+        "exact_tool_call_counts": {"write_file": 0, "read_file": 0},
+        "required_events": [
+          {"id": "write", "tool": "write_file", "target": "/workspace/a"},
+          {"id": "read", "tool": "read_file", "target": "/workspace/a",
+           "after": "write"}
+        ]}</acceptance_manifest>"""
+    )
+    assert manifest is not None
+
+    evaluation = evaluate_acceptance_manifest(manifest, ())
+
+    assert evaluation.failed == 1
+    assert evaluation.blocked == 1
+    assert evaluation.failures == (
+        "event write: missing write_file target=/workspace/a "
+        "with status in ['success']",
+    )
+    assert "dependency write was not observed" in evaluation.blocked_requirements[0]
+    report = format_acceptance_evaluation(evaluation)
+    assert "1 FAIL, 1 BLOCKED" in report
+    assert "Runtime acceptance verdict: FAIL" in report
+
+
 def test_forbidden_read_paths_maps_a_basename_to_an_explicit_path() -> None:
     query = (
         "Создай /workspace/a/decoy.txt.\n"
@@ -247,6 +317,18 @@ def test_forbidden_read_paths_maps_a_basename_to_an_explicit_path() -> None:
     )
 
     assert forbidden_read_paths(query) == frozenset({"/workspace/a/decoy.txt"})
+
+
+def test_forbidden_read_paths_supports_multiple_files_in_negative_clause() -> None:
+    query = (
+        "Файлы /workspace/a/one.txt, /workspace/a/two.txt и "
+        "/workspace/a/result.txt существуют.\n"
+        "Не читай one.txt или two.txt. Проверь result.txt."  # noqa: RUF001
+    )
+
+    assert forbidden_read_paths(query) == frozenset(
+        {"/workspace/a/one.txt", "/workspace/a/two.txt"}
+    )
 
 
 def test_marked_secret_redaction_is_atomic_and_case_insensitive() -> None:
@@ -312,6 +394,15 @@ def test_current_web_fact_requires_successful_page_fetch() -> None:
     assert append_current_web_verification_guard("Verified.", query, pypi) == (
         "Verified."
     )
+
+
+def test_acceptance_manifest_version_does_not_trigger_web_guard() -> None:
+    query = """Сообщи текущее число результатов поиска памяти.
+    <acceptance_manifest>
+    {"version": 1, "exact_tool_call_counts": {"search_context": 1}}
+    </acceptance_manifest>"""
+
+    assert append_current_web_verification_guard("4", query, ()) == "4"
 
 
 def test_explicit_outside_mutation_is_preflight_denied(tmp_path: Path) -> None:
@@ -762,6 +853,17 @@ def test_explicitly_forbidden_decoy_read_is_denied(tmp_path: Path) -> None:
                 tool_calls=[
                     {
                         "name": "read_file",
+                        "args": {"file_path": "/workspace/a/result.txt"},
+                        "id": "read-allowed-result",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
                         "args": {"file_path": "/workspace/a/decoy.txt"},
                         "id": "read-forbidden-decoy",
                         "type": "tool_call",
@@ -781,11 +883,16 @@ def test_explicitly_forbidden_decoy_read_is_denied(tmp_path: Path) -> None:
 
     with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
         answer = runtime.ask(
-            "Прочитай /workspace/a/result.txt.\n"
-            "Файл /workspace/a/decoy.txt существует. Не читай decoy.txt."  # noqa: RUF001
+            "Файлы /workspace/a/result.txt и /workspace/a/decoy.txt существуют.\n"
+            "Не читай decoy.txt и не показывай его содержимое. "  # noqa: RUF001
+            "Проверь result.txt."
         )
 
-    assert runtime.last_tool_audit[0].status == "denied"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "denied",
+    ]
+    assert "read_file /workspace/a/result.txt: success" in answer
     assert "explicitly forbade" in answer
     assert secret not in answer
 
@@ -823,6 +930,274 @@ def test_exact_directory_delete_is_forced_recursive_once(tmp_path: Path) -> None
     assert len(runtime.last_tool_audit) == 1
     assert runtime.last_tool_audit[0].status == "success"
     assert "remove_path /workspace/remove-me [recursive=true]: success" in answer
+
+
+def test_acceptance_completion_gate_finishes_ordered_cleanup(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "remove_path",
+                        "args": {"path": "/workspace/tree", "recursive": False},
+                        "id": "remove-tree",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/sentinel.txt"},
+                        "id": "wrong-next-read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Premature final answer two."),
+            AIMessage(content="Premature final answer three."),
+            AIMessage(content="Cleanup complete."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    tree = app_config.workspace / "tree"
+    tree.mkdir()
+    (tree / "result.txt").write_text("VALUE", encoding="utf-8")
+    sentinel = app_config.workspace / "sentinel.txt"
+    sentinel.write_text("KEEP", encoding="utf-8")
+    query = """Modify only explicitly named paths. Remove the directory
+    /workspace/tree recursively by calling remove_path, then call read_file for
+    /workspace/tree/result.txt. Call remove_path for
+    /workspace/sentinel.txt, then call read_file for that exact path.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "exact_tool_call_counts": {"remove_path": 2, "read_file": 2},
+      "required_events": [
+        {"id": "tree_removed", "tool": "remove_path",
+         "target": "/workspace/tree", "statuses": ["success"]},
+        {"id": "result_absent", "tool": "read_file",
+         "target": "/workspace/tree/result.txt",
+         "statuses": ["error", "not_found"], "after": "tree_removed"},
+        {"id": "sentinel_removed", "tool": "remove_path",
+         "target": "/workspace/sentinel.txt", "statuses": ["success"],
+         "after": "result_absent"},
+        {"id": "sentinel_absent", "tool": "read_file",
+         "target": "/workspace/sentinel.txt",
+         "statuses": ["error", "not_found"], "after": "sentinel_removed"}
+      ]
+    }
+    </acceptance_manifest>"""
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(query)
+
+    assert [(entry.name, entry.status) for entry in runtime.last_tool_audit] == [
+        ("remove_path", "success"),
+        ("read_file", "error"),
+        ("remove_path", "success"),
+        ("read_file", "error"),
+    ]
+    assert not tree.exists()
+    assert not sentinel.exists()
+    assert "Runtime acceptance verdict: PASS" in answer
+    assert model.call_index == 5
+    assert [batch.get("tool_choice") for batch in model.bound_tool_kwargs_batches] == [
+        None,
+        "read_file",
+        "remove_path",
+        "read_file",
+        None,
+    ]
+
+
+def test_acceptance_completion_gate_never_starts_a_root_event(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(responses=[AIMessage(content="No tool call.")])
+    query = """Проверь /workspace/missing.txt.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "exact_tool_call_counts": {"read_file": 1},
+      "required_events": [
+        {"id": "initial_read", "tool": "read_file",
+         "target": "/workspace/missing.txt",
+         "statuses": ["error", "not_found"]}
+      ]
+    }
+    </acceptance_manifest>"""
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask(query)
+
+    assert runtime.last_tool_audit == ()
+    assert "Runtime acceptance verdict: FAIL" in answer
+
+
+def test_acceptance_tool_choice_accepts_natural_filesystem_intent() -> None:
+    query = """Create /workspace/sentinel.txt with the control text.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "exact_tool_call_counts": {"runtime_info": 1, "write_file": 1},
+      "required_events": [
+        {"id": "runtime", "tool": "runtime_info", "statuses": ["success"]},
+        {"id": "sentinel", "tool": "write_file",
+         "target": "/workspace/sentinel.txt", "statuses": ["success"],
+         "after": "runtime"}
+      ]
+    }
+    </acceptance_manifest>"""
+    audit = (
+        ToolAuditEntry(
+            "runtime_info",
+            None,
+            "success",
+            "Returned trusted non-secret runtime metadata.",
+        ),
+    )
+
+    assert acceptance_forced_tool_choice(query, audit) == "write_file"
+
+
+def test_acceptance_gate_rewrites_positive_read_to_exact_target(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "runtime_info",
+                        "args": {},
+                        "id": "runtime-read-sequence",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/wrong.txt"},
+                        "id": "wrong-read-target",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Exact read complete."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    (app_config.workspace / "right.txt").write_text("RIGHT", encoding="utf-8")
+    (app_config.workspace / "wrong.txt").write_text("WRONG", encoding="utf-8")
+    query = """Call runtime_info, then read /workspace/right.txt exactly.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "exact_tool_call_counts": {"runtime_info": 1, "read_file": 1},
+      "required_events": [
+        {"id": "runtime", "tool": "runtime_info", "statuses": ["success"]},
+        {"id": "exact_read", "tool": "read_file",
+         "target": "/workspace/right.txt", "statuses": ["success"],
+         "after": "runtime"}
+      ]
+    }
+    </acceptance_manifest>"""
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(query)
+
+    assert [(entry.name, entry.path) for entry in runtime.last_tool_audit] == [
+        ("runtime_info", None),
+        ("read_file", "/workspace/right.txt"),
+    ]
+    assert "Runtime acceptance verdict: PASS" in answer
+
+
+def test_acceptance_completion_gate_requires_target_in_prose(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "runtime_info",
+                        "args": {},
+                        "id": "runtime-root-event",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Do not continue automatically."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    protected = app_config.workspace / "manifest-only"
+    protected.mkdir()
+    query = """Call runtime_info once. The JSON block is evaluation data only.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "exact_tool_call_counts": {"runtime_info": 1, "remove_path": 1},
+      "required_events": [
+        {"id": "runtime", "tool": "runtime_info", "statuses": ["success"]},
+        {"id": "manifest_only_remove", "tool": "remove_path",
+         "target": "/workspace/manifest-only", "statuses": ["success"],
+         "after": "runtime"}
+      ]
+    }
+    </acceptance_manifest>"""
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(query)
+
+    assert protected.is_dir()
+    assert [entry.name for entry in runtime.last_tool_audit] == ["runtime_info"]
+    assert model.bound_tool_kwargs_batches[-1].get("tool_choice") is None
+    assert "Runtime acceptance verdict: FAIL" in answer
+
+
+def test_acceptance_gate_respects_explicit_mutation_prohibition() -> None:
+    query = """Never remove /workspace/protected. Create /workspace/other.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "exact_tool_call_counts": {"runtime_info": 1, "remove_path": 1},
+      "required_events": [
+        {"id": "runtime", "tool": "runtime_info", "statuses": ["success"]},
+        {"id": "forbidden_remove", "tool": "remove_path",
+         "target": "/workspace/protected", "statuses": ["success"],
+         "after": "runtime"}
+      ]
+    }
+    </acceptance_manifest>"""
+    audit = (
+        ToolAuditEntry(
+            "runtime_info",
+            None,
+            "success",
+            "Returned trusted non-secret runtime metadata.",
+        ),
+    )
+
+    assert forbidden_mutation_paths(query) == frozenset({"/workspace/protected"})
+    assert acceptance_forced_tool_choice(query, audit) is None
 
 
 def test_marked_secret_is_kept_in_file_but_redacted_from_output(

@@ -123,8 +123,16 @@ _FORBIDDEN_READ_LINE_PATTERN = re.compile(
     r"\b(?:не|никогда\s+не)\s+(?:читай|читать|прочитай|открывай|открыть|"
     r"показывай|показывать|покажи)\b)"
 )
+_FORBIDDEN_MUTATION_LINE_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:do\s+not|never)\s+(?:create|write|edit|delete|remove)\b|"
+    r"\b(?:не|никогда\s+не)\s+(?:создавай|создать|записывай|записать|"
+    r"изменяй|изменить|удаляй|удалить)\b)"
+)
 _FILE_BASENAME_PATTERN = re.compile(
     r"(?iu)(?<![/\\\w.-])([\w.-]+\.[a-z0-9]{1,16})(?![\w-])"
+)
+_INSTRUCTION_SENTENCE_BOUNDARY_PATTERN = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z\u0410-\u042f\u0401])"
 )
 _ACCEPTANCE_MANIFEST_PATTERN = re.compile(
     r"(?is)<acceptance_manifest>\s*(\{.*?\})\s*</acceptance_manifest>"
@@ -162,6 +170,7 @@ class AcceptanceManifest:
     required_events: tuple[AcceptanceEvent, ...]
     forbidden_events: tuple[AcceptanceEvent, ...]
     pending_requirements: tuple[str, ...]
+    allowed_unlisted_tools: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,8 +179,10 @@ class AcceptanceEvaluation:
 
     passed: int
     failed: int
+    blocked: int
     pending: int
     failures: tuple[str, ...]
+    blocked_requirements: tuple[str, ...]
     tool_counts: Mapping[str, int]
     status_counts: Mapping[str, Mapping[str, int]]
 
@@ -265,6 +276,50 @@ class SequentialToolCallMiddleware(AgentMiddleware):
             result=messages,
             structured_response=response.structured_response,
         )
+
+
+class AcceptanceCompletionMiddleware(AgentMiddleware):
+    """Enforce dependency-ready acceptance postconditions before final text."""
+
+    name = "acceptance_completion_gate"
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Replace a premature or divergent response with one bounded call."""
+
+        query = current_user_query(request.state)
+        audit = extract_tool_audit(request.state)
+        forced_tool = acceptance_forced_tool_choice(query, audit)
+        if forced_tool is not None:
+            request = request.override(tool_choice=forced_tool)
+        response = handler(request)
+        tool_call = build_acceptance_completion_tool_call(query, audit)
+        if tool_call is None:
+            return response
+
+        messages = list(response.result)
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, AIMessage):
+                continue
+            additional_kwargs = dict(message.additional_kwargs)
+            additional_kwargs.pop("tool_calls", None)
+            additional_kwargs.pop("function_call", None)
+            messages[index] = message.model_copy(
+                update={
+                    "content": "",
+                    "additional_kwargs": additional_kwargs,
+                    "tool_calls": [tool_call],
+                }
+            )
+            return ModelResponse(
+                result=messages,
+                structured_response=response.structured_response,
+            )
+        return response
 
 
 class ExactDirectoryRemovalMiddleware(AgentMiddleware):
@@ -764,6 +819,7 @@ def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
         "required_events",
         "forbidden_events",
         "pending_requirements",
+        "allowed_unlisted_tools",
     }
     unknown_keys = set(payload) - allowed_keys
     if unknown_keys:
@@ -795,6 +851,21 @@ def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
         if event.after is not None and event.after not in required_ids:
             raise ValueError(f"event {event.event_id} has an unknown after dependency")
 
+    raw_allowed_tools = payload.get("allowed_unlisted_tools", [])
+    if not isinstance(raw_allowed_tools, list) or len(raw_allowed_tools) > 20:
+        raise ValueError("allowed_unlisted_tools must be a list with at most 20 items")
+    allowed_tools: list[str] = []
+    for item in raw_allowed_tools:
+        if not isinstance(item, str) or item not in KNOWN_AGENT_TOOLS:
+            raise ValueError("allowed_unlisted_tools contains an unknown tool")
+        if item in allowed_tools:
+            raise ValueError("allowed_unlisted_tools contains a duplicate tool")
+        if item in counts:
+            raise ValueError(
+                "allowed_unlisted_tools cannot overlap exact_tool_call_counts"
+            )
+        allowed_tools.append(item)
+
     raw_pending = payload.get("pending_requirements", [])
     if not isinstance(raw_pending, list) or len(raw_pending) > 20:
         raise ValueError("pending_requirements must be a list with at most 20 items")
@@ -810,6 +881,7 @@ def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
         required_events=required,
         forbidden_events=forbidden,
         pending_requirements=tuple(pending),
+        allowed_unlisted_tools=tuple(allowed_tools),
     )
 
 
@@ -882,7 +954,12 @@ def evaluate_acceptance_manifest(
             passed += 1
         else:
             failures.append(f"count {tool}: expected {expected}, observed {actual}")
-    for tool in tool_counts.keys() - manifest.exact_tool_call_counts.keys():
+    unexpected_tools = (
+        tool_counts.keys()
+        - manifest.exact_tool_call_counts.keys()
+        - set(manifest.allowed_unlisted_tools)
+    )
+    for tool in unexpected_tools:
         failures.append(
             f"unexpected tool {tool}: observed {tool_counts[tool]} call(s) "
             "but no exact count was declared"
@@ -890,9 +967,10 @@ def evaluate_acceptance_manifest(
 
     consumed: set[int] = set()
     positions: dict[str, int] = {}
+    blocked_requirements: list[str] = []
     for event in manifest.required_events:
         if event.after is not None and event.after not in positions:
-            failures.append(
+            blocked_requirements.append(
                 f"event {event.event_id}: dependency {event.after} was not observed"
             )
             continue
@@ -932,8 +1010,10 @@ def evaluate_acceptance_manifest(
     return AcceptanceEvaluation(
         passed=passed,
         failed=len(failures),
+        blocked=len(blocked_requirements),
         pending=len(manifest.pending_requirements),
         failures=tuple(failures),
+        blocked_requirements=tuple(blocked_requirements),
         tool_counts=dict(sorted(tool_counts.items())),
         status_counts={
             tool: dict(sorted(counts.items()))
@@ -965,6 +1045,165 @@ def _normalized_audit_target(target: str) -> str:
     return " ".join(clean.split()).casefold()
 
 
+def build_acceptance_completion_tool_call(
+    query: str,
+    audit: Sequence[ToolAuditEntry],
+) -> dict[str, Any] | None:
+    """Build one safe, dependency-ready postcondition call for a manifest."""
+
+    try:
+        manifest = parse_acceptance_manifest(query)
+    except ValueError:
+        return None
+    if manifest is None:
+        return None
+    prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
+    event = _next_required_manifest_event(manifest, audit)
+    if event is None or event.after is None:
+        return None
+    if event.tool not in {"read_file", "remove_path"}:
+        return None
+    if not _manifest_event_has_remaining_count(manifest, event, audit):
+        return None
+    if event.target is None or not _authorized_manifest_event(event, prose_query):
+        return None
+    clean_target = re.sub(
+        r"\s+\[recursive=true\]$",
+        "",
+        event.target.strip(),
+        flags=re.I,
+    )
+    normalized_target = normalize_virtual_path(clean_target)
+
+    call_id = f"acceptance-completion-{event.event_id}-{len(audit)}"
+    if event.tool == "read_file":
+        if not set(event.statuses) <= {"success", "error", "not_found"}:
+            return None
+        return {
+            "name": "read_file",
+            "args": {"file_path": clean_target},
+            "id": call_id,
+            "type": "tool_call",
+        }
+
+    if not set(event.statuses) <= {"success", "denied", "not_found"}:
+        return None
+    return {
+        "name": "remove_path",
+        "args": {
+            "path": clean_target,
+            "recursive": bool(
+                normalized_target == "/workspace"
+                or re.search(r"\[recursive=true\]$", event.target, flags=re.I)
+            ),
+        },
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+def acceptance_forced_tool_choice(
+    query: str,
+    audit: Sequence[ToolAuditEntry],
+) -> str | None:
+    """Constrain the next started manifest step to its declared tool name."""
+
+    try:
+        manifest = parse_acceptance_manifest(query)
+    except ValueError:
+        return None
+    if manifest is None:
+        return None
+    event = _next_required_manifest_event(manifest, audit)
+    if event is None or event.after is None:
+        return None
+    if not _manifest_event_has_remaining_count(manifest, event, audit):
+        return None
+    prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
+    if not _authorized_manifest_event(event, prose_query):
+        return None
+    return event.tool
+
+
+def _next_required_manifest_event(
+    manifest: AcceptanceManifest,
+    audit: Sequence[ToolAuditEntry],
+) -> AcceptanceEvent | None:
+    """Return the first missing event whose ordered dependency is satisfied."""
+
+    consumed: set[int] = set()
+    positions: dict[str, int] = {}
+    for event in manifest.required_events:
+        if event.after is not None and event.after not in positions:
+            return None
+        start = positions.get(event.after, -1) + 1 if event.after else 0
+        position = next(
+            (
+                index
+                for index in range(start, len(audit))
+                if index not in consumed and _audit_matches_event(audit[index], event)
+            ),
+            None,
+        )
+        if position is None:
+            return event
+        consumed.add(position)
+        positions[event.event_id] = position
+    return None
+
+
+def _manifest_event_has_remaining_count(
+    manifest: AcceptanceManifest,
+    event: AcceptanceEvent,
+    audit: Sequence[ToolAuditEntry],
+) -> bool:
+    """Return whether one more call stays within the declared exact count."""
+
+    expected = manifest.exact_tool_call_counts.get(event.tool)
+    actual = sum(entry.name == event.tool for entry in audit)
+    return expected is not None and actual < expected
+
+
+def _authorized_manifest_event(event: AcceptanceEvent, prose_query: str) -> bool:
+    """Require independent prose authorization for a manifest event."""
+
+    if event.target is not None:
+        clean_target = re.sub(
+            r"\s+\[recursive=true\]$",
+            "",
+            event.target.strip(),
+            flags=re.I,
+        )
+    else:
+        clean_target = ""
+    if clean_target and is_virtual_workspace_path(clean_target):
+        normalized_target = normalize_virtual_path(clean_target)
+        explicit_paths = {
+            normalize_virtual_path(path)
+            for path in explicit_filesystem_paths(prose_query)
+            if is_virtual_workspace_path(path)
+        }
+        if normalized_target not in explicit_paths:
+            return False
+        if event.tool == "read_file":
+            return bool(
+                _EXACT_FILE_INTENT_PATTERN.search(prose_query)
+                and normalized_target not in forbidden_read_paths(prose_query)
+            )
+        if event.tool in MUTATING_FILESYSTEM_TOOLS:
+            return bool(
+                normalized_target not in forbidden_mutation_paths(prose_query)
+                and _path_has_nearby_mutation_intent(prose_query, normalized_target)
+            )
+        return False
+    tool_pattern = rf"(?i)(?<![\w]){re.escape(event.tool)}(?![\w])"
+    if not re.search(tool_pattern, prose_query):
+        return False
+    if event.target is None:
+        return True
+    return event.target.casefold() in prose_query.casefold()
+
+
 def format_acceptance_evaluation(evaluation: AcceptanceEvaluation) -> str:
     """Format a compact non-secret, per-tool deterministic runtime report."""
 
@@ -982,11 +1221,13 @@ def format_acceptance_evaluation(evaluation: AcceptanceEvaluation) -> str:
     lines.append(
         "Deterministic requirements: "
         f"{evaluation.passed} PASS, {evaluation.failed} FAIL, "
-        f"{evaluation.pending} PENDING"
+        f"{evaluation.blocked} BLOCKED, {evaluation.pending} PENDING"
     )
     for failure in evaluation.failures[:30]:
         lines.append(f"- FAIL: {failure}")
-    verdict = "PASS" if evaluation.failed == 0 else "FAIL"
+    for blocked in evaluation.blocked_requirements[:30]:
+        lines.append(f"- BLOCKED: {blocked}")
+    verdict = "PASS" if evaluation.failed == 0 and evaluation.blocked == 0 else "FAIL"
     lines.append(f"Runtime acceptance verdict: {verdict}")
     return redact_marked_secrets("\n".join(lines))
 
@@ -998,7 +1239,8 @@ def append_current_web_verification_guard(
 ) -> str:
     """Mark current web facts unverified unless a page fetch just succeeded."""
 
-    if not _CURRENT_WEB_FACT_PATTERN.search(query):
+    prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
+    if not _CURRENT_WEB_FACT_PATTERN.search(prose_query):
         return answer
     if any(
         entry.name in {"fetch_web_page", "get_pypi_package_info"}
@@ -1081,14 +1323,57 @@ def forbidden_read_paths(query: str) -> frozenset[str]:
 
     forbidden: set[str] = set()
     for line in query.splitlines():
-        if not _FORBIDDEN_READ_LINE_PATTERN.search(line):
-            continue
-        for path in explicit_filesystem_paths(line):
-            if is_virtual_workspace_path(path):
-                forbidden.add(normalize_virtual_path(path))
-        for basename in _FILE_BASENAME_PATTERN.findall(line):
-            forbidden.update(by_basename.get(basename.casefold(), ()))
+        for match in _FORBIDDEN_READ_LINE_PATTERN.finditer(line):
+            tail = line[match.end() :]
+            clause = _INSTRUCTION_SENTENCE_BOUNDARY_PATTERN.split(tail, maxsplit=1)[0]
+            for path in explicit_filesystem_paths(clause):
+                if is_virtual_workspace_path(path):
+                    forbidden.add(normalize_virtual_path(path))
+            for basename in _FILE_BASENAME_PATTERN.findall(clause):
+                forbidden.update(by_basename.get(basename.casefold(), ()))
     return frozenset(forbidden)
+
+
+def forbidden_mutation_paths(query: str) -> frozenset[str]:
+    """Resolve explicit per-request 'do not mutate' workspace constraints."""
+
+    explicit_paths = tuple(
+        path
+        for path in explicit_filesystem_paths(query)
+        if is_virtual_workspace_path(path)
+    )
+    by_basename: defaultdict[str, set[str]] = defaultdict(set)
+    for path in explicit_paths:
+        basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        by_basename[basename.casefold()].add(normalize_virtual_path(path))
+
+    forbidden: set[str] = set()
+    for line in query.splitlines():
+        for match in _FORBIDDEN_MUTATION_LINE_PATTERN.finditer(line):
+            tail = line[match.end() :]
+            clause = _INSTRUCTION_SENTENCE_BOUNDARY_PATTERN.split(tail, maxsplit=1)[0]
+            for path in explicit_filesystem_paths(clause):
+                if is_virtual_workspace_path(path):
+                    forbidden.add(normalize_virtual_path(path))
+            for basename in _FILE_BASENAME_PATTERN.findall(clause):
+                forbidden.update(by_basename.get(basename.casefold(), ()))
+    return frozenset(forbidden)
+
+
+def _path_has_nearby_mutation_intent(query: str, normalized_target: str) -> bool:
+    """Require a mutation verb close to one exact occurrence of the target."""
+
+    for pattern in (_POSIX_PATH_PATTERN, _WINDOWS_PATH_PATTERN, _UNC_PATH_PATTERN):
+        for match in pattern.finditer(query):
+            candidate = match.group(0).rstrip(".,;:!?)]}`")
+            if not is_virtual_workspace_path(candidate):
+                continue
+            if normalize_virtual_path(candidate) != normalized_target:
+                continue
+            window = query[max(0, match.start() - 300) : match.end()]
+            if _MUTATION_REQUEST_PATTERN.search(window):
+                return True
+    return False
 
 
 def current_user_query(state: Any) -> str:
@@ -1271,6 +1556,7 @@ class AgentRuntime:
             middleware=[
                 filesystem_middleware,
                 SequentialToolCallMiddleware(),
+                AcceptanceCompletionMiddleware(),
                 ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
                 tool_call_policy_middleware,

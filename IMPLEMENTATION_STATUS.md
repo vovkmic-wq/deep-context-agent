@@ -5,7 +5,7 @@
 
 | Этап | Статус | Проверка | Примечание |
 | --- | --- | --- | --- |
-| 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `ACCEPTANCE_COMPLETION_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручных логов |
+| 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `ACCEPTANCE_COMPLETION_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручных и live-логов |
 | 2. Каркас и провайдеры | Завершён | Unit-тесты конфигурации и фабрики | LM Studio, OpenAI, YandexGPT, DeepSeek и Qwen; provider retry выключен, retry выполняет middleware model call |
 | 3. Большой контекст | Завершён | 1 000 001 строка, 200 документов, повторное открытие SQLite | Потоковый FTS5, BM25, соседние чанки и cross-thread archive без загрузки корпуса в окно LLM |
 | 4. Deep Agent и CLI | Завершён | Fake-model tool loops, CLI unit/smoke, OpenAI live | `/paste`, `ask --file`, stdin, bounded input, `--no-auto-context` и доверенная runtime identity |
@@ -17,6 +17,8 @@
 | 10. Финальная проверка 0.3.0 | Завершён | Ruff, 72 passed, 1 planned skip, CLI help, `doctor --live` | Изолированный OpenAI `gpt-5-nano` smoke: один `runtime_info`, точные provider/model, ключ не выведен |
 | 11. Acceptance completion 0.4.0 | Завершён | Repeat policy, forbidden read, manifest parser/evaluator | Exact counts, ordered/forbidden events и negative statuses проверяются независимо от LLM |
 | 12. Финальная проверка 0.4.0 | Завершён | Ruff, 81 passed, 1 planned skip, package/CLI/doctor/live | OpenAI `gpt-5-nano`: один `runtime_info`, runtime manifest — 2 PASS, 0 FAIL |
+| 13. Acceptance correctness 0.5.0 | Завершён | Sentence scope, allowed-unlisted, BLOCKED, completion gate | Runtime завершает только dependency-ready cleanup/postconditions и не расширяет filesystem scope |
+| 14. Финальная проверка 0.5.0 | Завершён | Ruff, 91 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: полный manifest — 32 PASS; новый процесс/thread — 2 PASS и 4 context results |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -118,4 +120,42 @@ Production-hardening от 2026-08-22 проверен в изолированн�
 отдельным операторским прогоном из-за числа платных model calls; его лог теперь
 оценивается runtime автоматически. Многопользовательский сетевой сервис по-
 прежнему требует отдельной процессной изоляции, аутентификации и координации
+записей и не входит в область данного ТЗ.
+
+Результат 0.4.0 выше сохранён как история. Проверка 0.5.0 от 2026-08-23
+выполнена после итеративных диагностических live-прогонов и финального чистого
+прогона:
+
+- отрицательная инструкция ограничена своим предложением: `decoy.txt` остаётся
+  запрещённым, а положительно указанный `result.txt` читается;
+- `write_todos` разрешается только как явно объявленный unlisted planning-tool,
+  а функциональные tools сохраняют exact counts;
+- первичный missing event получает FAIL, зависимые события — BLOCKED;
+- bounded completion middleware продолжает только доказанную ordered
+  cleanup/postcondition цепочку, не начинает root event, не читает запрещённый
+  путь, не выходит из `/workspace/` и не превышает exact count;
+- после root event provider получает имя следующего prose-разрешённого tool, а
+  dependency-ready `read_file`/`remove_path` — точный ordered target; JSON
+  manifest без независимого prose-разрешения не инициирует действие;
+- машинный manifest исключён из классификации текущих web-фактов, поэтому его
+  поле `version` не создаёт ложный web FAIL для локального context search;
+- `ruff check --no-cache .` и `ruff format --check --no-cache .` — успешно;
+- `pytest -ra` — 91 passed, 1 planned skip; skip относится только к системному
+  запрету Windows на создание symlink для текущей учётной записи;
+- editable package `deep-context-agent==0.5.0`, `pip check`, CLI `--help` и
+  безопасный OpenAI doctor — успешно;
+- полный изолированный live acceptance использовал run
+  `20260823-125545`, `gpt-5-nano`, `AGENT_MODEL_TEMPERATURE=0` и новые
+  workspace/data/thread; runtime manifest дал `32 PASS, 0 FAIL, 0 BLOCKED,
+  1 PENDING`, а exact counts совпали для всех десяти функциональных tool types;
+- физическая проверка после live-run подтвердила отсутствие тестового каталога,
+  root sentinel и outside placeholder при сохранённом prompt-файле;
+- новый процесс с тем же `AGENT_DATA_DIR` и thread
+  `restart-v050-release-20260823-125545` вызвал `search_context` ровно один раз,
+  получил `4 result(s)` и runtime verdict `2 PASS, 0 FAIL, 0 BLOCKED`; restart
+  PENDING тем самым закрыт внешней проверкой.
+
+Версия 0.5.0 считается production-ready в границах локального
+однопользовательского CLI. Многопользовательский сетевой сервис требует
+отдельной процессной изоляции, аутентификации и координации одновременных
 записей и не входит в область данного ТЗ.

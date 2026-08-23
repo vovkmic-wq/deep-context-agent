@@ -106,6 +106,46 @@
 27. Полный acceptance обязан завершать точный recursive cleanup, проверять
     отсутствие результата после него, отдельно удалять root sentinel и
     подтверждать его отсутствие новым чтением.
+28. Отрицательная инструкция чтения действует только в текущем предложении или
+    инструкционной части. Путь из следующего положительного предложения той же
+    строки не наследует запрет; точка внутри basename не является границей.
+29. Manifest версии 1 может объявить ограниченный `allowed_unlisted_tools` для
+    недетерминированных служебных tools. Они отображаются в counts, но не
+    участвуют в exact/unexpected-проверке; неизвестные tools, дубликаты и
+    пересечение с exact counts запрещены.
+30. Отсутствующий required event при выполненной зависимости является
+    первичным FAIL. События с невыполненной `after`-dependency получают BLOCKED;
+    runtime PASS требует одновременно `FAIL=0` и `BLOCKED=0`.
+31. В manifest-сценарии сам manifest является планом, поэтому модель не обязана
+    использовать `write_todos`. Перед финальным ответом она обязана завершить
+    все cleanup/post-delete events и опираться на точные ToolMessage.
+32. Если модель преждевременно возвращает финальный текст либо выбирает иной
+    следующий call, runtime completion gate может продолжить только первый
+    пропущенный dependency-ready event типа
+    `read_file` с ожидаемым `error/not_found` либо явно запрошенный `remove_path`
+    с ожидаемым `success`. Target обязан быть явно указан в запросе и находиться
+    внутри prose-части запроса вне JSON manifest и находиться внутри
+    `/workspace/`; root event, `/workspace/`, запрещённое чтение, исчерпанный
+    exact count и event без доказанной dependency не исполняются.
+33. Классификатор актуальных web-фактов анализирует prose запроса без блока
+    `<acceptance_manifest>`: служебное поле `version` не может само по себе
+    требовать web verification для context/filesystem acceptance.
+34. После выполненного моделью root event manifest-режим может ограничить
+    provider `tool_choice` именем следующего dependency-ready event. Для
+    filesystem event prose обязана независимо содержать точный target и явное
+    read/mutation-намерение; для остальных — имя tool и target. Exact count не
+    должен быть исчерпан. Runtime не синтезирует содержимое write/edit и не
+    запускает первый event.
+35. Для dependency-ready `read_file` runtime фиксирует не только tool name, но
+    и точный event target, если этот target явно разрешён prose и не запрещён
+    отрицательной инструкцией. Разрешены ожидаемые `success/error/not_found`;
+    иные статусы не синтезируются.
+36. Dependency-ready `remove_path` получает точный prose-разрешённый target и
+    manifest-декорацию `recursive=true`. `/workspace/` может быть вызван только
+    как явно описанный negative event и всегда отклоняется filesystem guard.
+37. Явный sentence-scoped запрет create/write/edit/delete/remove для workspace-
+    пути имеет приоритет над manifest. Положительная filesystem-авторизация
+    требует mutation intent в пределах 300 символов перед точным prose-путём.
 
 ## 3. Провайдеры и переменные
 
@@ -198,6 +238,10 @@
 - Acceptance 0.4-регрессии: повторные read-only/web calls, budget чтения по
   версии пути, запрещённый decoy read, строгий manifest parser, exact counts,
   ordered post-delete evidence, forbidden events и ожидаемые negative statuses.
+- Acceptance 0.5-регрессии: sentence-scoped negative read, разрешённый
+  planning-tool вне exact counts, отдельный BLOCKED status и обязательный
+  финальный sentinel post-delete event, включая bounded runtime completion gate
+  и запрет автономного запуска root event.
 - Prompt-файл и stdin читаются с жёстким пределом до декодирования/дальнейшей
   обработки, поэтому проверка размера не допускает race с неограниченным чтением.
 - Сетевые тесты не являются частью обычного `pytest`; `doctor` и опциональный
@@ -252,6 +296,25 @@
 22. Итог полного acceptance содержит точные количества tools и отдельные
     доказательства удаления тестового каталога и sentinel с последующим
     `error/not_found` чтением.
+23. Составная строка «не читай decoy; проверь result» запрещает только decoy;
+    все предусмотренные чтения result выполняются и проверяются.
+24. Недетерминированный `write_todos` не изменяет functional verdict при явном
+    `allowed_unlisted_tools`, но любой другой необъявленный tool остаётся FAIL.
+25. Один первичный сбой ordered chain не раздувается в независимые FAIL:
+    зависимые требования явно отображаются как BLOCKED.
+26. Полный изолированный acceptance завершается runtime PASS, а физическая
+    проверка подтверждает отсутствие тестового каталога, sentinel и placeholder.
+27. Преждевременный финальный текст после доказанного cleanup не обрывает
+    dependency-ready postcondition chain; runtime выполняет по одному безопасному
+    event, но не начинает исходную операцию и не расширяет права manifest.
+28. Поле `version` внутри acceptance manifest не создаёт ложный web FAIL для
+    запроса текущего количества результатов локального context search.
+29. После root event дешёвая модель не может переставить ordered tool calls:
+    каждый следующий разрешённый шаг получает точный provider `tool_choice`.
+30. Неправильный target правильного `read_file` заменяется точным разрешённым
+    event target; unrelated/forbidden файл не читается.
+31. Путь из «не создавай/не изменяй/не удаляй» не выполняется completion gate,
+    даже если manifest содержит event и запрос мутирует другой путь.
 
 ## 8. Этапы
 

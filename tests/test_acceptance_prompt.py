@@ -15,7 +15,9 @@ def test_canonical_acceptance_manifest_accepts_the_intended_ordered_audit() -> N
     manifest = parse_acceptance_manifest(query)
     assert manifest is not None
     audit = (
+        ToolAuditEntry("write_todos", None, "error", "invalid plan"),
         ToolAuditEntry("write_todos", None, "success", "planned"),
+        ToolAuditEntry("write_todos", None, "success", "updated"),
         ToolAuditEntry("runtime_info", None, "success", "metadata"),
         ToolAuditEntry(
             "make_directory", "/workspace/acceptance-v040-82641", "success", "ok"
@@ -124,6 +126,7 @@ def test_canonical_acceptance_manifest_accepts_the_intended_ordered_audit() -> N
     evaluation = evaluate_acceptance_manifest(manifest, audit)
 
     assert evaluation.failed == 0
+    assert evaluation.blocked == 0
     assert evaluation.pending == 1
     assert evaluation.tool_counts["read_file"] == 8
     assert evaluation.tool_counts["remove_path"] == 3

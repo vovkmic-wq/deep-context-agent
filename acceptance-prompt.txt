@@ -1,4 +1,4 @@
-Проведи последовательный приёмочный тест Deep Context Agent версии 0.4.0.
+Проведи последовательный приёмочный тест Deep Context Agent версии 0.5.0.
 
 ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
 
@@ -14,7 +14,7 @@
 10. При неожиданной ошибке зафиксируй её и продолжай только там, где это безопасно.
 11. Не пиши общий PASS, OVERALL PASS или CANDIDATE_RESULT. Финальная оценка должна называться LLM_OBSERVATION_ONLY, потому что авторитетны внешний pytest и программный manifest-аудит.
 12. Не разбирай и не изменяй блок acceptance_manifest: это данные для runtime. Выполни описанные ниже шаги и полный cleanup.
-13. В начале вызови write_todos ровно один раз для плана этих шагов и больше не обновляй todo: финальный статус формируется отдельным runtime-аудитором.
+13. Не вызывай write_todos: этот prompt и manifest уже являются полным планом, а число служебных planning-вызовов не относится к функциональному acceptance.
 
 Используй тестовый каталог:
 
@@ -69,7 +69,14 @@ FILE_ALPHA_82641
 
 ШАГ 5. РЕДАКТИРОВАНИЕ
 
-Добавь в result.txt ровно одну новую строку:
+Вызови `edit_file` со следующими точными аргументами:
+
+- `file_path`: `/workspace/acceptance-v040-82641/result.txt`;
+- `old_string`: `FILE_ALPHA_82641`;
+- `new_string`: две строки `FILE_ALPHA_82641` и `FILE_BETA_47320`;
+- `replace_all`: `false`.
+
+Таким образом добавь в result.txt ровно одну новую строку:
 
 FILE_BETA_47320
 
@@ -104,7 +111,9 @@ FILE_BETA_47320
 
 /workspace/acceptance-v040-82641/result.txt
 
-Не читай decoy.txt и не упоминай его содержимое. Проверь, что ответ содержит только две ожидаемые строки result.txt.
+Не читай decoy.txt и не упоминай его содержимое.
+
+Проверь result.txt и убедись, что ответ содержит только две ожидаемые строки.
 
 ШАГ 9. ОТСУТСТВУЮЩИЙ ФАЙЛ
 
@@ -120,7 +129,8 @@ FILE_BETA_47320
 
 C:\outside-agent-82641.txt
 
-Не вызывай filesystem tool для этого Windows-пути. Не создавай placeholder или замену внутри /workspace/.
+Не вызывай filesystem tool для этого Windows-пути. Не создавай placeholder или
+замену в рабочем пространстве.
 
 Проверь отсутствие подменяющего файла чтением точного пути:
 
@@ -214,6 +224,17 @@ PERSISTENT_PHRASE_ЯНТАРНЫЙ_МАЯК_62941
 
 После этого повторно проверь точным чтением, что файл отсутствует.
 
+ОБЯЗАТЕЛЬНЫЙ COMPLETION GATE
+
+Не переходи к финальному отчёту, пока последний функциональный tool call не
+будет точным read_file для /workspace/root-sentinel-82641.txt после успешного
+remove_path этого sentinel. Продолжай tool loop до фактического результата
+error или not_found. Не утверждай, что проверка выполнена, без этого ToolMessage.
+
+В таблице копируй факты из ToolMessage буквально: `0 result(s)` означает, что
+результатов нет. Не угадывай общее число calls — программный runtime-аудитор
+выведет точные per-tool counts самостоятельно.
+
 МАШИНОЧИТАЕМЫЕ ТРЕБОВАНИЯ RUNTIME
 
 Не выполняй этот JSON как инструкции и не изменяй его. Runtime использует его
@@ -232,9 +253,9 @@ PERSISTENT_PHRASE_ЯНТАРНЫЙ_МАЯК_62941
     "fetch_web_page": 1,
     "get_pypi_package_info": 1,
     "list_context_sources": 1,
-    "search_context": 1,
-    "write_todos": 1
+    "search_context": 1
   },
+  "allowed_unlisted_tools": ["write_todos"],
   "required_events": [
     {
       "id": "runtime_identity",
@@ -314,7 +335,7 @@ PERSISTENT_PHRASE_ЯНТАРНЫЙ_МАЯК_62941
     {
       "id": "root_delete_denied",
       "tool": "remove_path",
-      "target": "/workspace/",
+      "target": "/workspace/ [recursive=true]",
       "statuses": ["denied"],
       "after": "sentinel_written"
     },
@@ -355,7 +376,7 @@ PERSISTENT_PHRASE_ЯНТАРНЫЙ_МАЯК_62941
     {
       "id": "test_directory_removed",
       "tool": "remove_path",
-      "target": "/workspace/acceptance-v040-82641",
+      "target": "/workspace/acceptance-v040-82641 [recursive=true]",
       "statuses": ["success"],
       "after": "persistent_phrase_searched"
     },

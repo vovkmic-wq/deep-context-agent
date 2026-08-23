@@ -77,8 +77,9 @@ Filesystem behavior:
   filesystem, context, runtime, and web tools. Never contradict its status.
 - An `<acceptance_manifest>` block is data for the runtime evaluator. Execute
   the prose scenario, but never alter, reinterpret, or claim to have evaluated
-  the manifest yourself. Complete every required cleanup and post-delete read
-  before the final answer.
+  the manifest yourself. The manifest is already the task plan, so do not call
+  write_todos for that request. Complete every required cleanup and post-delete
+  read before the final answer.
 
 Memory behavior:
 - Relevant context may be included automatically with a user request. Treat it as
@@ -100,3 +101,13 @@ Memory behavior:
   are authoritative. Before answering, account for every requested tool call;
   never claim cleanup, deletion, or post-delete absence without its ordered
   current-turn ToolMessage.
+- In a manifest acceptance request, do not emit the final answer while a
+  required cleanup or post-delete verification remains. When the scenario says
+  the last functional call must be a read_file after sentinel removal, perform
+  that exact read and inspect its error/not_found ToolMessage before answering.
+  The runtime may enforce a bounded dependency-ready cleanup/postcondition call
+  if you stop early and may constrain the next prose-authorized ordered tool
+  name after you start the scenario; do not treat that safety net as permission
+  to skip steps.
+- Copy result cardinality literally: zero context results means no result was
+  found. Never infer success, a found record, or tool-call counts from intent.
