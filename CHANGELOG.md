@@ -3,6 +3,27 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.4.0] — 2026-08-23
+
+### Добавлено
+
+- Единая per-turn политика повторов для mutating, runtime, context, listing и
+  web-tools, а также ограничение чтений по версии состояния пути.
+- Абсолютный запрет `read_file` для путей, явно помеченных пользователем «не
+  читай/не открывай/не показывай» или английским эквивалентом.
+- Ограниченный JSON acceptance manifest с exact counts, ordered/forbidden
+  events, ожидаемыми negative statuses и внешними pending-проверками.
+- Программный отчёт acceptance с per-tool/per-status counts и причинами FAIL.
+
+### Исправлено
+
+- Повторные PyPI, private URL и context-list вызовы больше не исполняются в
+  одном ходе; лишние попытки получают `denied` в audit.
+- `LLM_OBSERVATION_ONLY` больше не может скрыть пропущенный cleanup,
+  post-delete read, удаление sentinel или запрещённое чтение decoy.
+- `denied`, `error` и `not_found` не считаются безусловным провалом: manifest
+  оценивает их относительно ожидаемого результата конкретного шага.
+
 ## [0.3.0] — 2026-08-22
 
 ### Добавлено

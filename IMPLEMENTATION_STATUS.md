@@ -5,7 +5,7 @@
 
 | Этап | Статус | Проверка | Примечание |
 | --- | --- | --- | --- |
-| 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `PRODUCTION_HARDENING_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручного лога |
+| 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `ACCEPTANCE_COMPLETION_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручных логов |
 | 2. Каркас и провайдеры | Завершён | Unit-тесты конфигурации и фабрики | LM Studio, OpenAI, YandexGPT, DeepSeek и Qwen; provider retry выключен, retry выполняет middleware model call |
 | 3. Большой контекст | Завершён | 1 000 001 строка, 200 документов, повторное открытие SQLite | Потоковый FTS5, BM25, соседние чанки и cross-thread archive без загрузки корпуса в окно LLM |
 | 4. Deep Agent и CLI | Завершён | Fake-model tool loops, CLI unit/smoke, OpenAI live | `/paste`, `ask --file`, stdin, bounded input, `--no-auto-context` и доверенная runtime identity |
@@ -15,6 +15,8 @@
 | 8. Финальная проверка 0.2.0 | История | Ruff, 61 passed, 1 planned skip, CLI help, `doctor --live` | Результат предыдущего production-hardening сохранён для трассировки |
 | 9. Acceptance reliability 0.3.0 | Завершён | Последовательность, duplicate guard, redaction, PyPI, recursive cleanup | Каждый дефект последнего ручного лога закреплён кодом и регрессионным тестом |
 | 10. Финальная проверка 0.3.0 | Завершён | Ruff, 72 passed, 1 planned skip, CLI help, `doctor --live` | Изолированный OpenAI `gpt-5-nano` smoke: один `runtime_info`, точные provider/model, ключ не выведен |
+| 11. Acceptance completion 0.4.0 | Завершён | Repeat policy, forbidden read, manifest parser/evaluator | Exact counts, ordered/forbidden events и negative statuses проверяются независимо от LLM |
+| 12. Финальная проверка 0.4.0 | Завершён | Ruff, 81 passed, 1 planned skip, package/CLI/doctor/live | OpenAI `gpt-5-nano`: один `runtime_info`, runtime manifest — 2 PASS, 0 FAIL |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -81,3 +83,39 @@ Production-hardening от 2026-08-22 проверен в изолированн�
 однопользовательского CLI. Многопользовательский сетевой сервис требует
 отдельной процессной песочницы, аутентификации и координации одновременных
 записей; это не входит в область данного ТЗ.
+
+Результат 0.3.0 выше сохранён как история. Проверка 0.4.0 от 2026-08-23
+выполнена после анализа полного ручного audit из 26 tool calls:
+
+- повторные идентичные runtime/context/listing/web-вызовы блокируются до
+  повторного исполнения и получают `denied` в текущем audit;
+- третье чтение неизменённого пути блокируется; успешная мутация самого пути
+  или recursive removal родителя открывает новую проверяемую версию;
+- basename из явного «не читай/не открывай/не показывай» сопоставляется только с
+  явно указанным полным workspace-путём и запрещает `read_file` для decoy;
+- строгий bounded manifest parser отклоняет неизвестные поля/tools/status,
+  неверные зависимости и превышение размера;
+- manifest evaluator сверяет все attempts, точные количества, ordered required
+  events, forbidden calls и ожидаемые `denied/error/not_found`; один audit event
+  не используется дважды, а необъявленный tool является FAIL;
+- канонический `acceptance-prompt.txt` содержит 21 ordered event, один forbidden
+  decoy read, точные количества для 11 tool types и одну restart-проверку;
+- contract-тест канонического manifest подтверждает предусмотренную полную
+  последовательность cleanup и post-delete reads без выполнения платного API;
+- `ruff check --no-cache .` — успешно;
+- `ruff format --check --no-cache .` — 27 файлов отформатированы;
+- `pytest -ra` — 81 passed, 1 planned skip; skip относится только к системному
+  запрету Windows на создание symlink для текущей учётной записи;
+- editable wheel `deep-context-agent==0.4.0` собран и установлен, `pip check` не
+  обнаружил конфликтов, CLI `--help` и безопасный OpenAI doctor прошли;
+- изолированный live-smoke использовал
+  `v040-ff3825cf02f8410bb7c7530eeb087bf2`, новый workspace/data/thread и
+  `gpt-5-nano`; audit зафиксировал ровно `runtime_info: success`, а runtime
+  manifest — `2 PASS, 0 FAIL, 0 PENDING` без вывода API-ключа.
+
+Версия 0.4.0 считается production-ready для заявленного локального
+однопользовательского CLI. Полный канонический live acceptance остаётся
+отдельным операторским прогоном из-за числа платных model calls; его лог теперь
+оценивается runtime автоматически. Многопользовательский сетевой сервис по-
+прежнему требует отдельной процессной изоляции, аутентификации и координации
+записей и не входит в область данного ТЗ.

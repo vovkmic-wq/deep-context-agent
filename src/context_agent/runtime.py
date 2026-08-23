@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,29 @@ from context_agent.tools import (
 MUTATING_FILESYSTEM_TOOLS = frozenset(
     {"write_file", "edit_file", "make_directory", "remove_path"}
 )
+REPEAT_LIMITED_TOOLS = frozenset(
+    {
+        "runtime_info",
+        "search_context",
+        "read_context_window",
+        "list_context_sources",
+        "web_search",
+        "fetch_web_page",
+        "get_pypi_package_info",
+        "ls",
+        "glob",
+        "grep",
+    }
+)
+KNOWN_AGENT_TOOLS = frozenset(
+    {
+        *MUTATING_FILESYSTEM_TOOLS,
+        *REPEAT_LIMITED_TOOLS,
+        "read_file",
+        "write_todos",
+    }
+)
+AUDIT_STATUSES = frozenset({"success", "error", "denied", "not_found", "missing"})
 _MUTATION_REQUEST_PATTERN = re.compile(
     r"(?iu)(?:\b(?:create|write|append|edit|replace|delete|remove|rename|mkdir)\b|"
     r"созда(?:й|ть)|запиш(?:и|ите)|добав(?:ь|ить)|измен(?:и|ить)|"
@@ -69,6 +93,7 @@ _TOOL_EVIDENCE_PATTERN = re.compile(
 )
 _OVERALL_PASS_CLAIM_PATTERN = re.compile(
     r"(?iu)(?:candidate_result\s*:\s*[a-z_]+|"
+    r"llm_observation_only\s*:\s*[^\r\n]+|"
     r"общ(?:ий|его)\s+итог\s*:?\s*(?:pass|fail|partial)|"  # noqa: RUF001
     r"overall\s+(?:result\s*)?:?\s*(?:pass|fail|partial)|"
     r"все\s+обязательные\s+пункты\s+выполнены)"
@@ -93,6 +118,19 @@ _MARKED_SECRET_PATTERN = re.compile(
     r"\u041d\u0415_\u041f\u041e\u041a\u0410\u0417\u042b\u0412\u0410\u0422\u042c)"
     r"[\w-]*(?![\w-])"
 )
+_FORBIDDEN_READ_LINE_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:do\s+not|never)\s+(?:read|open|show|display)\b|"
+    r"\b(?:не|никогда\s+не)\s+(?:читай|читать|прочитай|открывай|открыть|"
+    r"показывай|показывать|покажи)\b)"
+)
+_FILE_BASENAME_PATTERN = re.compile(
+    r"(?iu)(?<![/\\\w.-])([\w.-]+\.[a-z0-9]{1,16})(?![\w-])"
+)
+_ACCEPTANCE_MANIFEST_PATTERN = re.compile(
+    r"(?is)<acceptance_manifest>\s*(\{.*?\})\s*</acceptance_manifest>"
+)
+_MAX_ACCEPTANCE_MANIFEST_CHARS = 20_000
+_MANIFEST_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +141,39 @@ class ToolAuditEntry:
     path: str | None
     status: str
     result: str
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceEvent:
+    """One required or forbidden event in a deterministic acceptance manifest."""
+
+    event_id: str
+    tool: str
+    target: str | None
+    statuses: tuple[str, ...]
+    after: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceManifest:
+    """Bounded machine-readable requirements embedded in an acceptance prompt."""
+
+    exact_tool_call_counts: Mapping[str, int]
+    required_events: tuple[AcceptanceEvent, ...]
+    forbidden_events: tuple[AcceptanceEvent, ...]
+    pending_requirements: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceEvaluation:
+    """Deterministic evaluation result derived only from the current tool audit."""
+
+    passed: int
+    failed: int
+    pending: int
+    failures: tuple[str, ...]
+    tool_counts: Mapping[str, int]
+    status_counts: Mapping[str, Mapping[str, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +200,17 @@ class ExactReadPathMiddleware(AgentMiddleware):
         if request.tool_call["name"] != "read_file":
             return handler(request)
         query = current_user_query(request.state)
+        raw_args = request.tool_call.get("args", {})
+        requested = raw_args.get("file_path") if isinstance(raw_args, Mapping) else None
+        normalized_requested = (
+            normalize_virtual_path(requested) if isinstance(requested, str) else None
+        )
+        if normalized_requested in forbidden_read_paths(query):
+            return denied_tool_message(
+                request,
+                "Read denied: the user explicitly forbade reading this path.",
+                requested,
+            )
         allowed_paths = {
             normalize_virtual_path(path)
             for path in explicit_filesystem_paths(query)
@@ -136,27 +218,12 @@ class ExactReadPathMiddleware(AgentMiddleware):
         }
         if not allowed_paths:
             return handler(request)
-        args = request.tool_call.get("args", {})
-        requested = args.get("file_path") if isinstance(args, Mapping) else None
-        if isinstance(requested, str) and normalize_virtual_path(requested) in (
-            allowed_paths
-        ):
+        if normalized_requested in allowed_paths:
             return handler(request)
-        payload = json.dumps(
-            {
-                "operation": "read_file",
-                "path": requested,
-                "status": "denied",
-                "message": "Read denied: the tool path differs from the exact path.",
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        return ToolMessage(
-            content=payload,
-            tool_call_id=request.tool_call["id"],
-            name=request.tool_call["name"],
-            status="error",
+        return denied_tool_message(
+            request,
+            "Read denied: the tool path differs from the exact path.",
+            requested,
         )
 
 
@@ -238,29 +305,31 @@ class ExactDirectoryRemovalMiddleware(AgentMiddleware):
         return handler(request.override(tool_call=tool_call))
 
 
-class DuplicateMutationGuardMiddleware(AgentMiddleware):
-    """Deny an identical filesystem mutation repeated in the same user turn."""
+class ToolCallPolicyMiddleware(AgentMiddleware):
+    """Bound repeated calls and duplicate mutations within one user turn."""
 
-    name = "duplicate_mutation_guard"
+    name = "tool_call_policy"
 
     def __init__(self) -> None:
-        self._seen: set[str] = set()
+        self._seen_signatures: set[str] = set()
+        self._path_versions: defaultdict[str, int] = defaultdict(int)
+        self._read_counts: Counter[tuple[str, int]] = Counter()
 
     def reset(self) -> None:
-        """Start a fresh mutation ledger for the next user turn."""
+        """Start fresh per-turn call, path-version, and read ledgers."""
 
-        self._seen.clear()
+        self._seen_signatures.clear()
+        self._path_versions.clear()
+        self._read_counts.clear()
 
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Any],
     ) -> Any:
-        """Execute the first exact mutation and reject later duplicates."""
+        """Execute permitted calls and reject redundant calls deterministically."""
 
         name = str(request.tool_call.get("name", "unknown"))
-        if name not in MUTATING_FILESYSTEM_TOOLS:
-            return handler(request)
         raw_args = request.tool_call.get("args", {})
         args = raw_args if isinstance(raw_args, Mapping) else {}
         signature = json.dumps(
@@ -269,26 +338,100 @@ class DuplicateMutationGuardMiddleware(AgentMiddleware):
             sort_keys=True,
             default=str,
         )
-        if signature not in self._seen:
-            self._seen.add(signature)
-            return handler(request)
-        path = _audit_target(args)
-        payload = json.dumps(
-            {
-                "operation": name,
-                "path": path,
-                "status": "denied",
-                "message": "Duplicate mutation denied in the current turn.",
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+        if name in MUTATING_FILESYSTEM_TOOLS | REPEAT_LIMITED_TOOLS:
+            if signature in self._seen_signatures:
+                category = (
+                    "mutation" if name in MUTATING_FILESYSTEM_TOOLS else "tool call"
+                )
+                return denied_tool_message(
+                    request,
+                    f"Duplicate {category} denied in the current turn.",
+                    _audit_target(args),
+                )
+            self._seen_signatures.add(signature)
+
+        requested_path = _filesystem_target(args)
+        normalized_path = (
+            normalize_virtual_path(requested_path) if requested_path else None
         )
-        return ToolMessage(
-            content=payload,
-            tool_call_id=request.tool_call["id"],
-            name=name,
-            status="error",
-        )
+        if name == "read_file" and normalized_path:
+            read_key = (normalized_path, self._path_versions[normalized_path])
+            if self._read_counts[read_key] >= 2:
+                return denied_tool_message(
+                    request,
+                    "Redundant read denied: this path was already read twice "
+                    "without an intervening mutation.",
+                    requested_path,
+                )
+            self._read_counts[read_key] += 1
+
+        result = handler(request)
+        if (
+            name in MUTATING_FILESYSTEM_TOOLS
+            and normalized_path
+            and _tool_message_status(result) == "success"
+        ):
+            self._advance_path_version(name, normalized_path, args)
+        return result
+
+    def _advance_path_version(
+        self,
+        tool_name: str,
+        normalized_path: str,
+        args: Mapping[str, Any],
+    ) -> None:
+        """Invalidate read budgets only for the mutated path or removed subtree."""
+
+        affected = {normalized_path}
+        if tool_name == "remove_path" and args.get("recursive") is True:
+            prefix = f"{normalized_path.rstrip('/')}/"
+            affected.update(
+                path for path in self._path_versions if path.startswith(prefix)
+            )
+        for path in affected:
+            self._path_versions[path] += 1
+
+
+def _filesystem_target(args: Mapping[str, Any]) -> str | None:
+    """Return a filesystem target from a normalized tool argument mapping."""
+
+    target = args.get("file_path", args.get("path"))
+    return target if isinstance(target, str) else None
+
+
+def _tool_message_status(result: Any) -> str:
+    """Return the semantic status of a tool result without exposing its content."""
+
+    if not isinstance(result, ToolMessage):
+        return "success"
+    status, _ = _tool_result(str(result.name or "unknown"), result)
+    return status
+
+
+def denied_tool_message(
+    request: ToolCallRequest,
+    message: str,
+    path: object = None,
+) -> ToolMessage:
+    """Build a consistent audited denial for a policy-blocked tool call."""
+
+    name = str(request.tool_call.get("name", "unknown"))
+    payload = json.dumps(
+        {
+            "operation": name,
+            "path": path,
+            "status": "denied",
+            "message": message,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return ToolMessage(
+        content=payload,
+        tool_call_id=request.tool_call["id"],
+        name=name,
+        status="error",
+    )
 
 
 def load_system_prompt() -> str:
@@ -572,26 +715,280 @@ def request_requires_tool_evidence(query: str) -> bool:
 def append_acceptance_guard(
     answer: str,
     audit: Sequence[ToolAuditEntry],
+    query: str = "",
 ) -> str:
-    """Prevent an LLM from certifying its own multi-step acceptance test."""
+    """Attach a manifest verdict or mark an LLM self-verdict non-authoritative."""
 
+    try:
+        manifest = parse_acceptance_manifest(query)
+    except ValueError as exc:
+        verdict = (
+            f"Runtime acceptance verdict: FAIL — invalid acceptance manifest: {exc}"
+        )
+        return f"{answer.rstrip()}\n\n{verdict}"
+    if manifest is not None:
+        evaluation = evaluate_acceptance_manifest(manifest, audit)
+        report = format_acceptance_evaluation(evaluation)
+        return f"{answer.rstrip()}\n\n{report}"
     if not _OVERALL_PASS_CLAIM_PATTERN.search(answer):
         return answer
-    verified_entries = list(audit)
-    if not verified_entries or any(
-        entry.status != "success" for entry in verified_entries
-    ):
-        verdict = (
-            "Runtime acceptance verdict: FAIL — current-turn tool evidence is "
-            "missing or contains a non-success result."
-        )
-    else:
-        verdict = (
-            "Runtime acceptance verdict: NOT_VERIFIED — the LLM self-assessment "
-            "is non-authoritative even when current tool calls succeeded; use "
-            "the external pytest/acceptance harness."
-        )
+    verdict = (
+        "Runtime acceptance verdict: NOT_VERIFIED — the LLM self-assessment is "
+        "non-authoritative without a valid acceptance manifest and the external "
+        "pytest/acceptance harness. Expected negative tests may legitimately "
+        "produce denied, error, or not_found statuses."
+    )
     return f"{answer.rstrip()}\n\n{verdict}"
+
+
+def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
+    """Parse and strictly validate one bounded JSON acceptance manifest."""
+
+    matches = list(_ACCEPTANCE_MANIFEST_PATTERN.finditer(query))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("exactly one <acceptance_manifest> block is allowed")
+    raw = matches[0].group(1)
+    if len(raw) > _MAX_ACCEPTANCE_MANIFEST_CHARS:
+        raise ValueError("manifest exceeds the 20000-character limit")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest is not valid JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("manifest root must be a JSON object")
+    allowed_keys = {
+        "version",
+        "exact_tool_call_counts",
+        "required_events",
+        "forbidden_events",
+        "pending_requirements",
+    }
+    unknown_keys = set(payload) - allowed_keys
+    if unknown_keys:
+        raise ValueError(f"unknown manifest field: {sorted(unknown_keys)[0]}")
+    if payload.get("version", 1) != 1:
+        raise ValueError("only acceptance manifest version 1 is supported")
+
+    raw_counts = payload.get("exact_tool_call_counts", {})
+    if not isinstance(raw_counts, Mapping) or len(raw_counts) > 50:
+        raise ValueError("exact_tool_call_counts must contain at most 50 entries")
+    counts: dict[str, int] = {}
+    for raw_tool, raw_count in raw_counts.items():
+        tool = str(raw_tool)
+        if tool not in KNOWN_AGENT_TOOLS:
+            raise ValueError(f"unknown tool in exact counts: {tool}")
+        if not isinstance(raw_count, int) or isinstance(raw_count, bool):
+            raise ValueError(f"exact count for {tool} must be an integer")
+        if not 0 <= raw_count <= 100:
+            raise ValueError(f"exact count for {tool} must be between 0 and 100")
+        counts[tool] = raw_count
+
+    required = _parse_manifest_events(payload.get("required_events", []), "required")
+    forbidden = _parse_manifest_events(payload.get("forbidden_events", []), "forbidden")
+    all_ids = [event.event_id for event in (*required, *forbidden)]
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError("event ids must be unique")
+    required_ids = {event.event_id for event in required}
+    for event in required:
+        if event.after is not None and event.after not in required_ids:
+            raise ValueError(f"event {event.event_id} has an unknown after dependency")
+
+    raw_pending = payload.get("pending_requirements", [])
+    if not isinstance(raw_pending, list) or len(raw_pending) > 20:
+        raise ValueError("pending_requirements must be a list with at most 20 items")
+    pending: list[str] = []
+    for item in raw_pending:
+        if not isinstance(item, str) or not item.strip() or len(item) > 200:
+            raise ValueError("each pending requirement must be 1-200 characters")
+        pending.append(item.strip())
+    if not counts and not required and not forbidden:
+        raise ValueError("manifest must define at least one deterministic requirement")
+    return AcceptanceManifest(
+        exact_tool_call_counts=counts,
+        required_events=required,
+        forbidden_events=forbidden,
+        pending_requirements=tuple(pending),
+    )
+
+
+def _parse_manifest_events(
+    raw_events: object,
+    category: str,
+) -> tuple[AcceptanceEvent, ...]:
+    """Validate one bounded event list from a manifest."""
+
+    if not isinstance(raw_events, list) or len(raw_events) > 100:
+        raise ValueError(f"{category}_events must be a list with at most 100 items")
+    events: list[AcceptanceEvent] = []
+    for index, raw_event in enumerate(raw_events, start=1):
+        if not isinstance(raw_event, Mapping):
+            raise ValueError(f"{category} event {index} must be an object")
+        unknown = set(raw_event) - {"id", "tool", "target", "statuses", "after"}
+        if unknown:
+            raise ValueError(
+                f"unknown field in {category} event {index}: {sorted(unknown)[0]}"
+            )
+        event_id = raw_event.get("id")
+        tool = raw_event.get("tool")
+        target = raw_event.get("target")
+        after = raw_event.get("after")
+        raw_statuses = raw_event.get("statuses", ["success"])
+        if not isinstance(event_id, str) or not _MANIFEST_ID_PATTERN.fullmatch(
+            event_id
+        ):
+            raise ValueError(f"{category} event {index} has an invalid id")
+        if not isinstance(tool, str) or tool not in KNOWN_AGENT_TOOLS:
+            raise ValueError(f"{category} event {event_id} has an unknown tool")
+        if target is not None and (not isinstance(target, str) or len(target) > 500):
+            raise ValueError(f"{category} event {event_id} has an invalid target")
+        if after is not None and not isinstance(after, str):
+            raise ValueError(f"{category} event {event_id} has an invalid after value")
+        if (
+            not isinstance(raw_statuses, list)
+            or not raw_statuses
+            or len(raw_statuses) > len(AUDIT_STATUSES)
+            or any(status not in AUDIT_STATUSES for status in raw_statuses)
+        ):
+            raise ValueError(f"{category} event {event_id} has invalid statuses")
+        events.append(
+            AcceptanceEvent(
+                event_id=event_id,
+                tool=tool,
+                target=target,
+                statuses=tuple(raw_statuses),
+                after=after,
+            )
+        )
+    return tuple(events)
+
+
+def evaluate_acceptance_manifest(
+    manifest: AcceptanceManifest,
+    audit: Sequence[ToolAuditEntry],
+) -> AcceptanceEvaluation:
+    """Evaluate exact counts and ordered evidence without trusting model prose."""
+
+    tool_counts = Counter(entry.name for entry in audit)
+    status_counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for entry in audit:
+        status_counts[entry.name][entry.status] += 1
+    passed = 0
+    failures: list[str] = []
+    for tool, expected in manifest.exact_tool_call_counts.items():
+        actual = tool_counts[tool]
+        if actual == expected:
+            passed += 1
+        else:
+            failures.append(f"count {tool}: expected {expected}, observed {actual}")
+    for tool in tool_counts.keys() - manifest.exact_tool_call_counts.keys():
+        failures.append(
+            f"unexpected tool {tool}: observed {tool_counts[tool]} call(s) "
+            "but no exact count was declared"
+        )
+
+    consumed: set[int] = set()
+    positions: dict[str, int] = {}
+    for event in manifest.required_events:
+        if event.after is not None and event.after not in positions:
+            failures.append(
+                f"event {event.event_id}: dependency {event.after} was not observed"
+            )
+            continue
+        start = positions.get(event.after, -1) + 1 if event.after else 0
+        position = next(
+            (
+                index
+                for index in range(start, len(audit))
+                if index not in consumed and _audit_matches_event(audit[index], event)
+            ),
+            None,
+        )
+        if position is None:
+            target = f" target={event.target}" if event.target is not None else ""
+            failures.append(
+                f"event {event.event_id}: missing {event.tool}{target} "
+                f"with status in {list(event.statuses)}"
+            )
+            continue
+        consumed.add(position)
+        positions[event.event_id] = position
+        passed += 1
+
+    for event in manifest.forbidden_events:
+        match = next(
+            (entry for entry in audit if _audit_matches_event(entry, event)),
+            None,
+        )
+        if match is None:
+            passed += 1
+        else:
+            target = f" target={event.target}" if event.target is not None else ""
+            failures.append(
+                f"forbidden event {event.event_id}: observed {event.tool}{target} "
+                f"with status {match.status}"
+            )
+    return AcceptanceEvaluation(
+        passed=passed,
+        failed=len(failures),
+        pending=len(manifest.pending_requirements),
+        failures=tuple(failures),
+        tool_counts=dict(sorted(tool_counts.items())),
+        status_counts={
+            tool: dict(sorted(counts.items()))
+            for tool, counts in sorted(status_counts.items())
+        },
+    )
+
+
+def _audit_matches_event(entry: ToolAuditEntry, event: AcceptanceEvent) -> bool:
+    """Return whether one sanitized audit entry satisfies one manifest event."""
+
+    if entry.name != event.tool or entry.status not in event.statuses:
+        return False
+    if event.target is None:
+        return True
+    if entry.path is None:
+        return False
+    return _normalized_audit_target(entry.path) == _normalized_audit_target(
+        event.target
+    )
+
+
+def _normalized_audit_target(target: str) -> str:
+    """Normalize audit decoration and path casing for deterministic matching."""
+
+    clean = re.sub(r"\s+\[recursive=true\]$", "", target.strip(), flags=re.I)
+    if is_virtual_workspace_path(clean):
+        return normalize_virtual_path(clean)
+    return " ".join(clean.split()).casefold()
+
+
+def format_acceptance_evaluation(evaluation: AcceptanceEvaluation) -> str:
+    """Format a compact non-secret, per-tool deterministic runtime report."""
+
+    lines = ["Runtime acceptance audit (authoritative current-turn tool evidence):"]
+    if evaluation.tool_counts:
+        lines.append("Tool call counts:")
+        for tool, count in evaluation.tool_counts.items():
+            statuses = ", ".join(
+                f"{status}={status_count}"
+                for status, status_count in evaluation.status_counts[tool].items()
+            )
+            lines.append(f"- {tool}: {count} ({statuses})")
+    else:
+        lines.append("Tool call counts: none")
+    lines.append(
+        "Deterministic requirements: "
+        f"{evaluation.passed} PASS, {evaluation.failed} FAIL, "
+        f"{evaluation.pending} PENDING"
+    )
+    for failure in evaluation.failures[:30]:
+        lines.append(f"- FAIL: {failure}")
+    verdict = "PASS" if evaluation.failed == 0 else "FAIL"
+    lines.append(f"Runtime acceptance verdict: {verdict}")
+    return redact_marked_secrets("\n".join(lines))
 
 
 def append_current_web_verification_guard(
@@ -667,6 +1064,31 @@ def normalize_virtual_path(path: str) -> str:
     if not normalized.casefold().startswith("/workspace"):
         normalized = f"/workspace/{normalized.lstrip('/')}"
     return normalized.casefold()
+
+
+def forbidden_read_paths(query: str) -> frozenset[str]:
+    """Resolve explicit per-request 'do not read/open/show' path constraints."""
+
+    explicit_paths = tuple(
+        path
+        for path in explicit_filesystem_paths(query)
+        if is_virtual_workspace_path(path)
+    )
+    by_basename: defaultdict[str, set[str]] = defaultdict(set)
+    for path in explicit_paths:
+        basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        by_basename[basename.casefold()].add(normalize_virtual_path(path))
+
+    forbidden: set[str] = set()
+    for line in query.splitlines():
+        if not _FORBIDDEN_READ_LINE_PATTERN.search(line):
+            continue
+        for path in explicit_filesystem_paths(line):
+            if is_virtual_workspace_path(path):
+                forbidden.add(normalize_virtual_path(path))
+        for basename in _FILE_BASENAME_PATTERN.findall(line):
+            forbidden.update(by_basename.get(basename.casefold(), ()))
+    return frozenset(forbidden)
 
 
 def current_user_query(state: Any) -> str:
@@ -837,8 +1259,8 @@ class AgentRuntime:
         )
         tool_audit_middleware = ToolAuditMiddleware()
         self._tool_audit_middleware = tool_audit_middleware
-        duplicate_mutation_middleware = DuplicateMutationGuardMiddleware()
-        self._duplicate_mutation_middleware = duplicate_mutation_middleware
+        tool_call_policy_middleware = ToolCallPolicyMiddleware()
+        self._tool_call_policy_middleware = tool_call_policy_middleware
         chat_model = model or create_chat_model(self.provider_config)
         self.agent = create_deep_agent(
             model=chat_model,
@@ -851,7 +1273,7 @@ class AgentRuntime:
                 SequentialToolCallMiddleware(),
                 ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
-                duplicate_mutation_middleware,
+                tool_call_policy_middleware,
                 ExactReadPathMiddleware(),
                 ModelRetryMiddleware(
                     max_retries=self.app_config.model_call_retries,
@@ -995,7 +1417,7 @@ class AgentRuntime:
             raise ValueError("thread_id cannot be empty")
         self.last_tool_audit = ()
         self._tool_audit_middleware.reset()
-        self._duplicate_mutation_middleware.reset()
+        self._tool_call_policy_middleware.reset()
         if is_incomplete_mutation_request(clean_query):
             clarification = (
                 "Команда не выполнена: после двоеточия или указания точного "
@@ -1093,7 +1515,7 @@ class AgentRuntime:
             clean_query,
             self.last_tool_audit,
         )
-        answer = append_acceptance_guard(answer, self.last_tool_audit)
+        answer = append_acceptance_guard(answer, self.last_tool_audit, clean_query)
         self.context_store.archive_message(clean_thread_id, "user", clean_query)
         self.context_store.archive_message(clean_thread_id, "assistant", answer)
         return answer

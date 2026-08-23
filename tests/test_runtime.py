@@ -1,5 +1,6 @@
 """Integration tests for Deep Agent assembly and persistent turns."""
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import SearchHit
 from context_agent.errors import AgentError
 from context_agent.runtime import (
+    AcceptanceManifest,
     AgentRuntime,
     ToolAuditEntry,
     append_acceptance_guard,
@@ -21,11 +23,14 @@ from context_agent.runtime import (
     build_retrieved_request,
     build_system_prompt,
     current_user_query,
+    evaluate_acceptance_manifest,
     explicit_filesystem_paths,
     final_response_text,
+    forbidden_read_paths,
     is_incomplete_mutation_request,
     limit_retrieved_hits,
     message_text,
+    parse_acceptance_manifest,
     redact_marked_secrets,
     should_preflight_deny_mutation,
     should_skip_automatic_retrieval,
@@ -98,7 +103,7 @@ def test_llm_cannot_self_certify_overall_acceptance() -> None:
         "Общий итог: PASS (все обязательные пункты выполнены)",
         (),
     )
-    assert "Runtime acceptance verdict: FAIL" in answer
+    assert "Runtime acceptance verdict: NOT_VERIFIED" in answer
 
     candidate = append_acceptance_guard(
         "CANDIDATE_RESULT: FAIL",
@@ -112,6 +117,136 @@ def test_llm_cannot_self_certify_overall_acceptance() -> None:
         ),
     )
     assert "Runtime acceptance verdict: NOT_VERIFIED" in candidate
+
+
+def test_acceptance_manifest_is_strict_bounded_and_machine_readable() -> None:
+    payload = {
+        "version": 1,
+        "exact_tool_call_counts": {"remove_path": 1, "read_file": 1},
+        "required_events": [
+            {
+                "id": "removed",
+                "tool": "remove_path",
+                "target": "/workspace/a",
+                "statuses": ["success"],
+            },
+            {
+                "id": "missing_after_remove",
+                "tool": "read_file",
+                "target": "/workspace/a/result.txt",
+                "statuses": ["error", "not_found"],
+                "after": "removed",
+            },
+        ],
+        "forbidden_events": [
+            {
+                "id": "no_decoy_read",
+                "tool": "read_file",
+                "target": "/workspace/a/decoy.txt",
+                "statuses": ["success", "error", "denied", "not_found"],
+            }
+        ],
+        "pending_requirements": ["restart memory check"],
+    }
+    query = (
+        "Run acceptance.\n<acceptance_manifest>\n"
+        f"{json.dumps(payload)}\n"
+        "</acceptance_manifest>"
+    )
+
+    manifest = parse_acceptance_manifest(query)
+
+    assert isinstance(manifest, AcceptanceManifest)
+    assert manifest.exact_tool_call_counts == {"remove_path": 1, "read_file": 1}
+    with pytest.raises(ValueError, match="unknown tool"):
+        parse_acceptance_manifest(
+            '<acceptance_manifest>{"exact_tool_call_counts": '
+            '{"shell": 1}}</acceptance_manifest>'
+        )
+    with pytest.raises(ValueError, match="invalid statuses"):
+        parse_acceptance_manifest(
+            """<acceptance_manifest>{
+            "required_events": [{"id": "bad_status", "tool": "read_file",
+            "statuses": ["maybe"]}]}</acceptance_manifest>"""
+        )
+    with pytest.raises(ValueError, match="unknown manifest field"):
+        parse_acceptance_manifest(
+            '<acceptance_manifest>{"unexpected": true, '
+            '"exact_tool_call_counts": {"read_file": 1}}</acceptance_manifest>'
+        )
+    with pytest.raises(ValueError, match="unknown after dependency"):
+        parse_acceptance_manifest(
+            """<acceptance_manifest>{
+            "required_events": [{"id": "child", "tool": "read_file",
+            "after": "missing_parent"}]}</acceptance_manifest>"""
+        )
+    oversized = "x" * 20_001
+    with pytest.raises(ValueError, match="20000-character"):
+        parse_acceptance_manifest(
+            f'<acceptance_manifest>{{"padding":"{oversized}"}}</acceptance_manifest>'
+        )
+
+
+def test_acceptance_manifest_evaluates_order_counts_and_forbidden_events() -> None:
+    manifest = parse_acceptance_manifest(
+        """<acceptance_manifest>
+        {
+          "exact_tool_call_counts": {"remove_path": 1, "read_file": 1},
+          "required_events": [
+            {"id": "removed", "tool": "remove_path",
+             "target": "/workspace/a", "statuses": ["success"]},
+            {"id": "missing", "tool": "read_file",
+             "target": "/workspace/a/result.txt",
+             "statuses": ["error", "not_found"], "after": "removed"}
+          ],
+          "forbidden_events": [
+            {"id": "no_decoy", "tool": "read_file",
+             "target": "/workspace/a/decoy.txt",
+             "statuses": ["success", "error", "denied", "not_found"]}
+          ],
+          "pending_requirements": ["restart"]
+        }
+        </acceptance_manifest>"""
+    )
+    assert manifest is not None
+    good_audit = (
+        ToolAuditEntry("remove_path", "/workspace/a [recursive=true]", "success", "ok"),
+        ToolAuditEntry("read_file", "/workspace/a/result.txt", "error", "missing"),
+    )
+
+    good = evaluate_acceptance_manifest(manifest, good_audit)
+    bad = evaluate_acceptance_manifest(
+        manifest,
+        (
+            ToolAuditEntry("read_file", "/workspace/a/result.txt", "error", "missing"),
+            ToolAuditEntry("remove_path", "/workspace/a", "success", "ok"),
+            ToolAuditEntry("read_file", "/workspace/a/decoy.txt", "denied", "blocked"),
+            ToolAuditEntry("write_todos", None, "success", "extra"),
+        ),
+    )
+
+    assert (good.passed, good.failed, good.pending) == (5, 0, 1)
+    assert bad.failed >= 4
+    assert any("unexpected tool write_todos" in failure for failure in bad.failures)
+    report = append_acceptance_guard(
+        "LLM_OBSERVATION_ONLY: 99 PASS, 0 FAIL",
+        good_audit,
+        """<acceptance_manifest>
+        {"exact_tool_call_counts": {"remove_path": 1, "read_file": 1}}
+        </acceptance_manifest>""",
+    )
+    assert "Tool call counts:" in report
+    assert "Runtime acceptance verdict: PASS" in report
+
+
+def test_forbidden_read_paths_maps_a_basename_to_an_explicit_path() -> None:
+    query = (
+        "Создай /workspace/a/decoy.txt.\n"
+        "Прочитай /workspace/a/result.txt.\n"
+        "Не читай и не показывай decoy.txt."  # noqa: RUF001
+    )
+
+    assert forbidden_read_paths(query) == frozenset({"/workspace/a/decoy.txt"})
 
 
 def test_marked_secret_redaction_is_atomic_and_case_insensitive() -> None:
@@ -423,6 +558,236 @@ def test_duplicate_mutation_ledger_resets_between_turns(tmp_path: Path) -> None:
         runtime.ask("Create /workspace/reusable", thread_id="one")
         runtime.ask("Create /workspace/reusable", thread_id="two")
         assert runtime.last_tool_audit[0].status == "success"
+
+
+def test_duplicate_read_only_and_web_calls_are_denied_within_turn(
+    tmp_path: Path,
+) -> None:
+    calls = [
+        {
+            "name": "runtime_info",
+            "args": {},
+            "type": "tool_call",
+        },
+        {
+            "name": "get_pypi_package_info",
+            "args": {"package": "langchain"},
+            "type": "tool_call",
+        },
+        {
+            "name": "fetch_web_page",
+            "args": {"url": "https://example.test/source", "max_chars": 12000},
+            "type": "tool_call",
+        },
+        {
+            "name": "list_context_sources",
+            "args": {"limit": 100, "offset": 0, "kind": ""},
+            "type": "tool_call",
+        },
+    ]
+    responses: list[AIMessage] = []
+    for index, call in enumerate(calls):
+        responses.extend(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[{**call, "id": f"call-{index}-first"}],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[{**call, "id": f"call-{index}-duplicate"}],
+                ),
+            ]
+        )
+    responses.append(AIMessage(content="Repeated calls handled."))
+    model = SequenceChatModel(responses=responses)
+
+    with AgentRuntime(
+        _app_config(tmp_path),
+        _provider_config(),
+        model=model,
+        pypi_fetcher=lambda package: {
+            "package": package,
+            "version": "1.2.3",
+            "project_url": "https://pypi.org/project/langchain/",
+            "api_url": "https://pypi.org/pypi/langchain/json",
+        },
+        page_fetcher=lambda url, max_chars: {
+            "url": url,
+            "title": "Source",
+            "content_type": "text/plain",
+            "text": "verified",
+            "truncated": len("verified") > max_chars,
+        },
+    ) as runtime:
+        runtime.ask(
+            "Acceptance: call runtime_info, get_pypi_package_info for langchain, "
+            "fetch_web_page for https://example.test/source, and "
+            "list_context_sources exactly once."
+        )
+
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "denied",
+        "success",
+        "denied",
+        "success",
+        "denied",
+        "success",
+        "denied",
+    ]
+
+
+def test_third_read_without_path_mutation_is_denied(tmp_path: Path) -> None:
+    read_call = {
+        "name": "read_file",
+        "args": {"file_path": "/workspace/repeat.txt"},
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{**read_call, "id": f"read-{index}"}],
+            )
+            for index in range(3)
+        ]
+        + [AIMessage(content="Reads complete.")]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    (app_config.workspace / "repeat.txt").write_text("VALUE", encoding="utf-8")
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask("Прочитай /workspace/repeat.txt и проверь результат.")
+
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "success",
+        "denied",
+    ]
+
+
+def test_recursive_parent_removal_opens_a_new_child_read_state(
+    tmp_path: Path,
+) -> None:
+    read_call = {
+        "name": "read_file",
+        "args": {"file_path": "/workspace/tree/value.txt"},
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(content="", tool_calls=[{**read_call, "id": "read-one"}]),
+            AIMessage(content="", tool_calls=[{**read_call, "id": "read-two"}]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "remove_path",
+                        "args": {"path": "/workspace/tree", "recursive": False},
+                        "id": "remove-tree",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**read_call, "id": "read-after-remove"}],
+            ),
+            AIMessage(content="Cleanup checked."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    tree = app_config.workspace / "tree"
+    tree.mkdir()
+    (tree / "value.txt").write_text("VALUE", encoding="utf-8")
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask(
+            "Прочитай /workspace/tree/value.txt для проверки, затем удали "
+            "папку /workspace/tree целиком и проверь чтением, что файл отсутствует."
+        )
+
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "success",
+        "success",
+        "error",
+    ]
+    assert not tree.exists()
+
+
+def test_read_only_call_ledger_resets_between_turns(tmp_path: Path) -> None:
+    runtime_call = {
+        "name": "runtime_info",
+        "args": {},
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="", tool_calls=[{**runtime_call, "id": "runtime-turn-one"}]
+            ),
+            AIMessage(content="first"),
+            AIMessage(
+                content="", tool_calls=[{**runtime_call, "id": "runtime-turn-two"}]
+            ),
+            AIMessage(content="second"),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        runtime.ask("Call runtime_info once", thread_id="turn-one")
+        runtime.ask("Call runtime_info once", thread_id="turn-two")
+
+    assert runtime.last_tool_audit == (
+        ToolAuditEntry(
+            "runtime_info",
+            None,
+            "success",
+            "Returned trusted non-secret runtime metadata.",
+        ),
+    )
+
+
+def test_explicitly_forbidden_decoy_read_is_denied(tmp_path: Path) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/a/decoy.txt"},
+                        "id": "read-forbidden-decoy",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Decoy was not read."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    target = app_config.workspace / "a"
+    target.mkdir()
+    secret = "DECOY_SECRET_DO_NOT_SHOW_71935"
+    (target / "decoy.txt").write_text(secret, encoding="utf-8")
+    (target / "result.txt").write_text("SAFE", encoding="utf-8")
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            "Прочитай /workspace/a/result.txt.\n"
+            "Файл /workspace/a/decoy.txt существует. Не читай decoy.txt."  # noqa: RUF001
+        )
+
+    assert runtime.last_tool_audit[0].status == "denied"
+    assert "explicitly forbade" in answer
+    assert secret not in answer
 
 
 def test_exact_directory_delete_is_forced_recursive_once(tmp_path: Path) -> None:
