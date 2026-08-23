@@ -652,6 +652,10 @@ def _file_sha256(path: Path) -> str:
 def _detect_encoding(path: Path) -> str:
     with path.open("rb") as stream:
         sample = stream.read(1024 * 1024)
+    if sample.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "utf-32"
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
     if b"\x00" in sample:
         raise ContextStoreError("binary file is not indexable")
     for encoding in ("utf-8-sig", "cp1251"):

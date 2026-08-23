@@ -23,6 +23,7 @@
 | 16. Финальная проверка 0.6.0 | Завершён | Ruff, 97 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: полный v2 manifest — 32 PASS; restart — ровно один call, 4 results, 2 PASS |
 | 17. Ozon hardening 0.7.0 | Завершён | Root-scope, index-filter и listing regression tests | Общий root не блокирует child-read; generated/browser/cache пути отсечены; listing ограничен 20/50 |
 | 18. Финальная проверка 0.7.0 | Завершён | Ruff, 100 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: root-scope read успешен; полный manifest — 32 PASS; restart — 4 results и 2 PASS |
+| 19. BOM text patch 0.7.1 | Завершён | Ruff, 102 passed, package/pip/doctor live, UTF-16/UTF-32 regression | Обнаруженный Ozon UTF-16LE отчёт теперь индексируется; clean-DB повтор выполняется после публикации |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -226,3 +227,9 @@ Production-hardening от 2026-08-22 проверен в изолированн�
 Версия 0.7.0 считается production-ready в границах локального
 однопользовательского CLI. Проверка Ozon выполняется отдельно на временной
 копии и чистой БД; её изменения не переносятся в исходный проект автоматически.
+
+Patch 0.7.1 добавлен после первого clean-DB индексирования Ozon: файл
+`analysis_30_days.txt` имеет корректный UTF-16LE BOM, но 0.7.0 принимал его
+NUL-байты за binary. После переноса BOM-detection перед binary guard выполнены
+Ruff и format-check, `pytest -ra` дал 102 passed и 1 planned symlink skip,
+editable package сообщает 0.7.1, `pip check` и OpenAI `doctor --live` успешны.

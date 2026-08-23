@@ -152,6 +152,25 @@ def test_binary_file_becomes_reported_error(tmp_path: Path) -> None:
     assert "binary file" in report.errors[0]
 
 
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_bom_encoded_text_is_indexed(tmp_path: Path, encoding: str) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    document = source_root / "report.txt"
+    document.write_text(
+        "OZON_UTF_REPORT_ANCHOR product analytics\n",
+        encoding=encoding,
+    )
+
+    with ContextStore(tmp_path / "context.sqlite3") as store:
+        report = store.index_path(document, source_root)
+        hits = store.search("OZON_UTF_REPORT_ANCHOR")
+
+    assert report.files_indexed == 1
+    assert report.errors == ()
+    assert hits[0].source == "file://report.txt"
+
+
 def test_context_path_outside_root_is_rejected(tmp_path: Path) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()

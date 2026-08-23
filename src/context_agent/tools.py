@@ -200,7 +200,7 @@ def fetch_public_web_page(
         safe_url,
         headers={
             "Accept": "text/html,text/plain,application/json,application/xml",
-            "User-Agent": "DeepContextAgent/0.7.0 (+public-page-reader)",
+            "User-Agent": "DeepContextAgent/0.7.1 (+public-page-reader)",
         },
     )
     try:
@@ -275,7 +275,7 @@ def fetch_pypi_package_info(
         api_url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "DeepContextAgent/0.7.0 (+pypi-metadata-reader)",
+            "User-Agent": "DeepContextAgent/0.7.1 (+pypi-metadata-reader)",
         },
     )
     try:

@@ -1,6 +1,6 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.7.0 находится в
+Актуальный обязательный промпт версии 0.7.1 находится в
 `OZON_EXPERIMENT_HARDENING_PROMPT.md`. Его требования имеют приоритет для
 исправления scope/index/token дефектов Ozon-эксперимента от 2026-08-23.
 `EVIDENCE_INTEGRITY_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md`,
@@ -16,6 +16,10 @@ coverage, browser-profile и generated/cache артефакты. Огранич�
 одного доказанного дефекта и 15 tool calls. Обнови global prompt, ТЗ, версию и
 историю; выполни Ruff, pytest, package/doctor/live, опубликуй и только затем
 повтори Ozon на чистых workspace/data/thread.
+
+Patch 0.7.1: распознавай BOM до NUL/binary-проверки и потоково индексируй
+UTF-16/UTF-32 документы. Закрепи regression-тестами и повтори весь локальный
+контур, package/doctor live, публикацию и Ozon index на новой пустой БД.
 
 ## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
 
