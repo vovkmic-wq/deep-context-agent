@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sqlite3
 import threading
@@ -19,17 +20,34 @@ from context_agent.paths import resolve_inside
 _TOKEN_PATTERN = re.compile(r"[^\W_]{2,}", flags=re.UNICODE)
 _SKIPPED_DIRECTORIES = {
     ".agent_data",
+    ".cache",
     ".git",
     ".hg",
+    ".hypothesis",
     ".mypy_cache",
+    ".nox",
     ".pytest_cache",
     ".ruff_cache",
     ".svn",
+    ".tox",
     ".venv",
     "__pycache__",
+    "build",
+    "dist",
+    "htmlcov",
     "node_modules",
+    "playwright-report",
+    "test-results",
 }
-_SKIPPED_FILENAMES = {".env", ".env.local"}
+_SKIPPED_DIRECTORY_PREFIXES = (
+    ".pytest-",
+    ".pytest_",
+    "browser-profile",
+    "chrome-profile",
+    "edge-profile",
+)
+_SKIPPED_FILENAMES = {".coverage", ".env", ".env.local"}
+_SKIPPED_FILENAME_PREFIXES = (".coverage.",)
 _TEXT_EXTENSIONS = {
     "",
     ".cfg",
@@ -573,12 +591,33 @@ def _fts_expression(query: str) -> str:
 
 
 def _iter_text_files(path: Path, allowed_root: Path) -> Iterator[Path]:
-    for candidate in path.rglob("*"):
-        if not candidate.is_file():
-            continue
-        if _should_skip(candidate, allowed_root):
-            continue
-        yield candidate
+    for root, directory_names, file_names in os.walk(path, followlinks=False):
+        root_path = Path(root)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not _should_skip_directory(root_path / name, allowed_root)
+        ]
+        for file_name in file_names:
+            candidate = root_path / file_name
+            if candidate.is_file() and not _should_skip(candidate, allowed_root):
+                yield candidate
+
+
+def _should_skip_directory(path: Path, allowed_root: Path) -> bool:
+    """Return whether a directory is generated, cached, or secret-bearing."""
+
+    try:
+        relative = path.relative_to(allowed_root)
+    except ValueError:
+        return True
+    for part in relative.parts:
+        normalized = part.casefold()
+        if normalized in _SKIPPED_DIRECTORIES or normalized.startswith(
+            _SKIPPED_DIRECTORY_PREFIXES
+        ):
+            return True
+    return False
 
 
 def _should_skip(path: Path, allowed_root: Path) -> bool:
@@ -586,9 +625,18 @@ def _should_skip(path: Path, allowed_root: Path) -> bool:
         relative = path.relative_to(allowed_root)
     except ValueError:
         return True
-    if any(part in _SKIPPED_DIRECTORIES for part in relative.parts):
+    if any(
+        part.casefold() in _SKIPPED_DIRECTORIES
+        or part.casefold().startswith(_SKIPPED_DIRECTORY_PREFIXES)
+        for part in relative.parts[:-1]
+    ):
         return True
-    if path.name in _SKIPPED_FILENAMES or path.name.startswith(".env."):
+    normalized_name = path.name.casefold()
+    if (
+        normalized_name in _SKIPPED_FILENAMES
+        or normalized_name.startswith(".env.")
+        or normalized_name.startswith(_SKIPPED_FILENAME_PREFIXES)
+    ):
         return True
     return path.suffix.casefold() not in _TEXT_EXTENSIONS
 

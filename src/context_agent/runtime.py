@@ -249,6 +249,7 @@ class ExactReadPathMiddleware(AgentMiddleware):
             normalize_virtual_path(path)
             for path in explicit_filesystem_paths(query)
             if is_virtual_workspace_path(path)
+            and normalize_virtual_path(path) != "/workspace"
         }
         if not allowed_paths:
             return handler(request)

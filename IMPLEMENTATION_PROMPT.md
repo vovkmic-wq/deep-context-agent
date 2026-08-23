@@ -1,11 +1,21 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.6.0 находится в
-`EVIDENCE_INTEGRITY_PROMPT.md`. Его требования имеют приоритет для исправления
-трёх дефектов restart/runtime audit от 2026-08-23.
-`ACCEPTANCE_CORRECTNESS_PROMPT.md`, `ACCEPTANCE_COMPLETION_PROMPT.md`,
-`ACCEPTANCE_RELIABILITY_PROMPT.md` и `PRODUCTION_HARDENING_PROMPT.md`
-сохраняются как история версий 0.5.0–0.2.0.
+Актуальный обязательный промпт версии 0.7.0 находится в
+`OZON_EXPERIMENT_HARDENING_PROMPT.md`. Его требования имеют приоритет для
+исправления scope/index/token дефектов Ozon-эксперимента от 2026-08-23.
+`EVIDENCE_INTEGRITY_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md`,
+`ACCEPTANCE_COMPLETION_PROMPT.md`, `ACCEPTANCE_RELIABILITY_PROMPT.md` и
+`PRODUCTION_HARDENING_PROMPT.md` сохраняются как история версий 0.6.0–0.2.0.
+
+## Краткий промпт Ozon hardening 0.7.0 (2026-08-23)
+
+Не трактуй общий `/workspace/` как exact-file allowlist; сохрани строгую
+изоляцию для явно названных файлов. До чтения исключай из индекса pytest,
+coverage, browser-profile и generated/cache артефакты. Ограничь listing
+источников 20 записями по умолчанию и 50 максимум. Сократи Ozon-промпт до
+одного доказанного дефекта и 15 tool calls. Обнови global prompt, ТЗ, версию и
+историю; выполни Ruff, pytest, package/doctor/live, опубликуй и только затем
+повтори Ozon на чистых workspace/data/thread.
 
 ## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
 
@@ -87,6 +97,9 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
     предикатами `min_results`/`content_sha256`, детерминированно исправляй
     cardinality финального ответа и не исполняй повторный call после явного
     контракта «ровно один раз» / `exactly once`.
+13. После Ozon-аудита 0.6.0 обеспечь hardening 0.7.0: отличай общий корень от
+    exact-file scope, отсекай generated/browser/cache пути до индексирования,
+    ограничивай source listing и используй узкие ограниченные project-аудиты.
 
 Инженерные ограничения:
 

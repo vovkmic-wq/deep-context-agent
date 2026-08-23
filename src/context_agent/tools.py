@@ -200,7 +200,7 @@ def fetch_public_web_page(
         safe_url,
         headers={
             "Accept": "text/html,text/plain,application/json,application/xml",
-            "User-Agent": "DeepContextAgent/0.6.0 (+public-page-reader)",
+            "User-Agent": "DeepContextAgent/0.7.0 (+public-page-reader)",
         },
     )
     try:
@@ -275,7 +275,7 @@ def fetch_pypi_package_info(
         api_url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "DeepContextAgent/0.6.0 (+pypi-metadata-reader)",
+            "User-Agent": "DeepContextAgent/0.7.0 (+pypi-metadata-reader)",
         },
     )
     try:
@@ -466,15 +466,17 @@ def build_agent_tools(
         )
 
     def list_context_sources(
-        limit: int = 100,
+        limit: int = 20,
         offset: int = 0,
         kind: str = "",
     ) -> str:
-        """List indexed document sources in pages without loading their text."""
+        """List at most 50 indexed source records without loading their text."""
+        bounded_limit = max(1, min(limit, 50))
+        bounded_offset = max(0, offset)
         return format_context_sources(
             context_store.list_sources(
-                limit=limit,
-                offset=offset,
+                limit=bounded_limit,
+                offset=bounded_offset,
                 kind=kind or None,
             )
         )

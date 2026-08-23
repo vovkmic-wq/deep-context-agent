@@ -362,3 +362,21 @@ def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
         )
         assert denied_payload["status"] == "denied"
         assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_list_context_sources_has_a_small_bounded_page(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with ContextStore(tmp_path / "context.sqlite3") as store:
+        for index in range(60):
+            store.add_text(f"memory://{index:02}", f"document {index}")
+        tools = _tool_map(build_agent_tools(store, workspace))
+
+        default_payload = json.loads(tools["list_context_sources"].invoke({}))
+        oversized_payload = json.loads(
+            tools["list_context_sources"].invoke({"limit": 100, "offset": -5})
+        )
+
+    assert len(default_payload["sources"]) == 20
+    assert len(oversized_payload["sources"]) == 50
+    assert default_payload["sources"][0] == oversized_payload["sources"][0]

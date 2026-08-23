@@ -21,6 +21,8 @@
 | 14. Финальная проверка 0.5.0 | Завершён | Ruff, 91 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: полный manifest — 32 PASS; новый процесс/thread — 2 PASS и 4 context results |
 | 15. Evidence integrity 0.6.0 | Завершён | Structured audit, manifest v2, cardinality/exact-once guards | Hash/count predicates независимы от LLM; устаревший exact-once повтор не исполняется |
 | 16. Финальная проверка 0.6.0 | Завершён | Ruff, 97 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: полный v2 manifest — 32 PASS; restart — ровно один call, 4 results, 2 PASS |
+| 17. Ozon hardening 0.7.0 | Завершён | Root-scope, index-filter и listing regression tests | Общий root не блокирует child-read; generated/browser/cache пути отсечены; listing ограничен 20/50 |
+| 18. Финальная проверка 0.7.0 | Завершён | Ruff, 100 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: root-scope read успешен; полный manifest — 32 PASS; restart — 4 results и 2 PASS |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -196,3 +198,31 @@ Production-hardening от 2026-08-22 проверен в изолированн�
 однопользовательского CLI. Многопользовательский сетевой сервис по-прежнему
 требует отдельной процессной изоляции, аутентификации, централизованного аудита
 и координации одновременных записей и не входит в область данного ТЗ.
+
+Результат 0.6.0 выше сохранён как история. Проверка 0.7.0 от 2026-08-23
+выполнена после устранения дефектов первого Ozon-эксперимента:
+
+- общий `/workspace/` исключён из exact-file allowlist, при этом точный
+  дочерний путь по-прежнему ограничивает чтение;
+- индексатор до обхода отсекает generated/cache/coverage, Playwright и browser-
+  profile пути с регистронезависимым сопоставлением;
+- `list_context_sources` ограничен 20 источниками по умолчанию и 50 максимум;
+- Ozon-промпт сокращён до одного доказанного дефекта, узких retrieval-запросов
+  и не более 15 функциональных tool calls;
+- `ruff check --no-cache .` и `ruff format --check --no-cache .` — успешно;
+- `pytest -ra` — 100 passed, 1 planned skip; skip относится только к системному
+  запрету Windows на создание symlink для текущей учётной записи;
+- editable package `deep-context-agent==0.7.0`, `pip check`, CLI `--help`,
+  безопасный OpenAI doctor и `doctor --live` — успешно;
+- отдельный live root-scope ход нашёл и прочитал `/workspace/pyproject.toml`
+  после общего упоминания `/workspace/`, вернул `0.7.0` без denied events;
+- полный изолированный live acceptance использовал run
+  `20260823-231533`, `gpt-5-nano` и новые workspace/data/thread; runtime дал
+  `32 PASS, 0 FAIL, 0 BLOCKED, 1 PENDING`, а cleanup завершился;
+- новый процесс/thread на той же SQLite-БД вызвал `search_context` ровно один
+  раз, получил `4 result(s)` и закрыл restart-аудит с
+  `2 PASS, 0 FAIL, 0 BLOCKED, 0 PENDING`.
+
+Версия 0.7.0 считается production-ready в границах локального
+однопользовательского CLI. Проверка Ozon выполняется отдельно на временной
+копии и чистой БД; её изменения не переносятся в исходный проект автоматически.

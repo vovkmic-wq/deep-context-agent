@@ -84,6 +84,39 @@ def test_hundreds_of_documents_are_paginated_and_searchable(tmp_path: Path) -> N
         assert hits[0].source == "file://document-173.txt"
 
 
+def test_generated_and_browser_artifacts_are_not_indexed(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    (source_root / "src").mkdir()
+    (source_root / "src" / "app.py").write_text(
+        "print('application source')\n",
+        encoding="utf-8",
+    )
+    (source_root / "pyproject.toml").write_text(
+        "[project]\nname = 'example'\n",
+        encoding="utf-8",
+    )
+    generated_files = {
+        ".pytest-localization-042/reports/report.json": "irrelevant report",
+        "e2e/EDGE-PROFILE2/Default/History.txt": "browser history",
+        "playwright-report/index.html": "generated report",
+        ".venv/package.py": "generated environment",
+    }
+    for relative_path, content in generated_files.items():
+        target = source_root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    (source_root / ".coverage").write_bytes(b"coverage\x00binary")
+
+    with ContextStore(tmp_path / "context.sqlite3") as store:
+        report = store.index_path(".", source_root)
+        sources = {entry.source for entry in store.list_sources(limit=100)}
+
+    assert report.files_indexed == 2
+    assert report.errors == ()
+    assert sources == {"file://pyproject.toml", "file://src/app.py"}
+
+
 def test_one_million_lines_keep_beginning_and_end_searchable(tmp_path: Path) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()

@@ -1416,6 +1416,43 @@ def test_agent_denies_reading_a_different_exact_file(tmp_path: Path) -> None:
     assert "<retrieved_context>" not in first_request
 
 
+def test_workspace_root_reference_does_not_block_project_file_reads(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/pyproject.toml"},
+                        "id": "call-read-project-config",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Project configuration inspected."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    (app_config.workspace / "pyproject.toml").write_text(
+        "[project]\nname = 'example'\n",
+        encoding="utf-8",
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            "Inspect the Python project available inside /workspace/. "
+            "Read its configuration before reporting."
+        )
+        assert runtime.last_tool_audit[0].status == "success"
+
+    assert answer.startswith("Project configuration inspected.")
+    assert "read_file /workspace/pyproject.toml: success" in answer
+
+
 def test_successful_exact_read_is_audited_without_leaking_content(
     tmp_path: Path,
 ) -> None:
