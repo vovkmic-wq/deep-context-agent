@@ -292,10 +292,11 @@ class SequentialToolCallMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         """Disable parallel calls and discard surplus calls defensively."""
 
-        model_settings = {
-            **request.model_settings,
-            "parallel_tool_calls": False,
-        }
+        model_settings = dict(request.model_settings)
+        if request.tools:
+            model_settings["parallel_tool_calls"] = False
+        else:
+            model_settings.pop("parallel_tool_calls", None)
         response = handler(request.override(model_settings=model_settings))
         messages = []
         for message in response.result:
@@ -346,7 +347,7 @@ class ExactOnceToolMiddleware(AgentMiddleware):
         ]
         updates: dict[str, Any] = {"tools": available_tools}
         if not available_tools:
-            updates["tool_choice"] = "none"
+            updates["tool_choice"] = None
         response = handler(request.override(**updates))
         return _suppress_exhausted_tool_calls(response, exhausted)
 
@@ -383,7 +384,7 @@ class ExplicitToolBudgetMiddleware(AgentMiddleware):
         ]
         updates: dict[str, Any] = {"tools": available_tools}
         if not available_tools:
-            updates["tool_choice"] = "none"
+            updates["tool_choice"] = None
         response = handler(request.override(**updates))
         return _suppress_exhausted_tool_calls(
             response,

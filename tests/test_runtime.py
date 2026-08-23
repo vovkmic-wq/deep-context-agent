@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from conftest import SequenceChatModel
+from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
 from context_agent.config import AppConfig, ProviderConfig
@@ -17,6 +18,7 @@ from context_agent.errors import AgentError
 from context_agent.runtime import (
     AcceptanceManifest,
     AgentRuntime,
+    SequentialToolCallMiddleware,
     ToolAuditEntry,
     acceptance_forced_tool_choice,
     append_acceptance_guard,
@@ -706,6 +708,26 @@ def test_parallel_model_tool_calls_are_reduced_to_one_per_step(
         kwargs.get("parallel_tool_calls") is False
         for kwargs in model.bound_tool_kwargs_batches
     )
+
+
+def test_sequential_middleware_omits_parallel_setting_without_tools() -> None:
+    model = SequenceChatModel(responses=[AIMessage(content="done")])
+    request = ModelRequest(
+        model=model,
+        messages=[],
+        tools=[],
+        model_settings={"parallel_tool_calls": False},
+    )
+    captured: dict[str, Any] = {}
+
+    def handler(current: ModelRequest) -> ModelResponse:
+        captured.update(current.model_settings)
+        return ModelResponse(result=[AIMessage(content="done")])
+
+    response = SequentialToolCallMiddleware().wrap_model_call(request, handler)
+
+    assert response.result[0].content == "done"
+    assert "parallel_tool_calls" not in captured
 
 
 def test_identical_mutation_is_denied_within_one_turn(tmp_path: Path) -> None:

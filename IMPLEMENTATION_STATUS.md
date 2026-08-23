@@ -25,6 +25,7 @@
 | 18. Финальная проверка 0.7.0 | Завершён | Ruff, 100 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: root-scope read успешен; полный manifest — 32 PASS; restart — 4 results и 2 PASS |
 | 19. BOM text patch 0.7.1 | Завершён | Ruff, 102 passed, package/pip/doctor live, UTF-16/UTF-32 regression | Обнаруженный Ozon UTF-16LE отчёт теперь индексируется; clean-DB повтор выполняется после публикации |
 | 20. Explicit tool budgets 0.8.0 | Завершён | Ruff, 105 passed, package/pip/doctor live, parser/tool-loop | Per-tool и total budget скрывают exhausted tools; stale provider-call не исполняется и не аудируется |
+| 21. Empty toolset patch 0.8.1 | Завершён | OpenAI 400 regression, Ruff, 106 passed, package/pip/doctor live | Пустой toolset не отправляет tool-only model settings; повтор Ozon выполняется после публикации |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -243,3 +244,8 @@ Hardening 0.8.0 добавлен после первого LLM-хода на ч�
 парсер, per-tool и total budget; полный прогон дал Ruff PASS, 105 passed,
 1 planned symlink skip, editable 0.8.0, чистый `pip check` и успешный OpenAI
 `doctor --live`.
+
+Первый Ozon live-run 0.8.0 остановился после ровно 15 audit events, доказав
+работу total budget, но OpenAI вернул 400: `parallel_tool_calls` запрещён без
+`tools`. Patch 0.8.1 удаляет этот model setting и сбрасывает `tool_choice` при
+пустом toolset; regression проверяет итоговый request непосредственно.

@@ -1,6 +1,6 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.8.0 находится в
+Актуальный обязательный промпт версии 0.8.1 находится в
 `OZON_EXPERIMENT_HARDENING_PROMPT.md`. Его требования имеют приоритет для
 исправления scope/index/token дефектов Ozon-эксперимента от 2026-08-23.
 `EVIDENCE_INTEGRITY_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md`,
@@ -25,6 +25,10 @@ Hardening 0.8.0: считай явные total/per-tool maximums жёсткой 
 политикой. После достижения лимита удаляй exhausted tools из model request и
 подавляй stale provider-calls без лишнего audit event. Проверь русские и
 английские формулировки unit/tool-loop тестами и повтори Ozon на новом thread.
+
+Patch 0.8.1: при исчерпанном общем budget передавай model request без tools,
+`tool_choice` и `parallel_tool_calls`. Закрепи OpenAI-совместимый empty-toolset
+regression, повтори весь контур и Ozon на новой пустой БД/thread.
 
 ## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
 

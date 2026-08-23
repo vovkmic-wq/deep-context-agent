@@ -176,6 +176,9 @@
     calls» и аналогичные лимиты конкретного tool являются жёсткими per-turn
     бюджетами. После достижения лимита exhausted tools удаляются из следующего
     model request, а устаревший provider-call подавляется без audit-события.
+47. Если runtime policy исчерпала все tools, следующий model request не содержит
+    `tools`, `tool_choice` и `parallel_tool_calls`; это обязательно для
+    совместимости с OpenAI API и проверяется отдельной regression.
 
 ## 3. Провайдеры и переменные
 

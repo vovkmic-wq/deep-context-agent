@@ -3,6 +3,14 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.8.1] — 2026-08-23
+
+### Исправлено
+
+- Empty-toolset model request после исчерпания явного budget больше не содержит
+  `parallel_tool_calls` и `tool_choice`, которые OpenAI запрещает без `tools`.
+- Добавлен regression-тест model settings для финального budget-exhausted шага.
+
 ## [0.8.0] — 2026-08-23
 
 ### Добавлено
