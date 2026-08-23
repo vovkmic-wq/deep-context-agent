@@ -1,6 +1,6 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.8.2 находится в
+Актуальный обязательный промпт версии 0.8.3 находится в
 `OZON_EXPERIMENT_HARDENING_PROMPT.md`. Его требования имеют приоритет для
 исправления scope/index/token дефектов Ozon-эксперимента от 2026-08-23.
 `EVIDENCE_INTEGRITY_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md`,
@@ -33,6 +33,10 @@ regression, повтори весь контур и Ozon на новой пус�
 Patch 0.8.2: budget/exact middleware должны оборачивать sequential normalizer,
 чтобы `parallel_tool_calls` вычислялся по окончательному toolset. Добавь
 композиционный regression, повтори полный контур, публикацию и чистый Ozon-run.
+
+Patch 0.8.3: разреши безопасный перенос строки между maximum-фразой и именем
+tool в пределах одного предложения. Добавь regression из реального Ozon-
+промпта, выполни контур, публикацию и финальный clean-DB run.
 
 ## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
 

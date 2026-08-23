@@ -27,6 +27,7 @@
 | 20. Explicit tool budgets 0.8.0 | Завершён | Ruff, 105 passed, package/pip/doctor live, parser/tool-loop | Per-tool и total budget скрывают exhausted tools; stale provider-call не исполняется и не аудируется |
 | 21. Empty toolset patch 0.8.1 | Завершён | OpenAI 400 regression, Ruff, 106 passed, package/pip/doctor live | Пустой toolset не отправляет tool-only model settings; повтор Ozon выполняется после публикации |
 | 22. Middleware order patch 0.8.2 | Завершён | Ruff, 107 passed, package/pip/doctor live, композиционный regression | Sequential normalizer видит окончательный toolset; чистый Ozon-run выполняется после публикации |
+| 23. Multiline budget patch 0.8.3 | Завершён | Ozon prompt regression, Ruff, 107 passed, package/pip/doctor live | Общий limit 15 доказан live; per-tool 2 распознаётся через перенос строки |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -255,3 +256,8 @@ Hardening 0.8.0 добавлен после первого LLM-хода на ч�
 старый непустой toolset до budget narrowing. В 0.8.2 порядок изменён так, чтобы
 sequential normalizer выполнялся после toolset policies; композиционный тест
 проверяет именно этот полный путь до model handler.
+
+Ozon live-run 0.8.2 успешно завершился без 400 и остановился ровно на 15 audit
+events, однако сделал три `search_context`: строка prompt была перенесена между
+«не более двух узких» и именем tool. Patch 0.8.3 допускает такой перенос только
+внутри того же предложения и закрепляет точную формулировку regression-тестом.

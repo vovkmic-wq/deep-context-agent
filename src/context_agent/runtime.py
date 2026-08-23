@@ -1052,7 +1052,7 @@ def explicit_tool_call_budget(query: str) -> ExplicitToolBudget:
     prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
     total_pattern = re.compile(
         rf"(?iu){_BUDGET_LIMIT_PREFIX}\s+({_BUDGET_COUNT_TOKEN})"
-        r"[^\r\n.!?]{0,100}?"
+        r"[^.!?]{0,100}?"
         r"(?:functional\s+)?tool[\s_-]*calls?",
     )
     totals = [
@@ -1065,11 +1065,11 @@ def explicit_tool_call_budget(query: str) -> ExplicitToolBudget:
     for tool_name in KNOWN_AGENT_TOOLS:
         limit_before_tool = re.compile(
             rf"(?iu){_BUDGET_LIMIT_PREFIX}\s+({_BUDGET_COUNT_TOKEN})"
-            rf"[^\r\n.!?]{{0,120}}?(?<![\w]){re.escape(tool_name)}(?![\w])",
+            rf"[^.!?]{{0,120}}?(?<![\w]){re.escape(tool_name)}(?![\w])",
         )
         tool_before_limit = re.compile(
             rf"(?iu)(?<![\w]){re.escape(tool_name)}(?![\w])"
-            rf"[^\r\n.!?]{{0,120}}?{_BUDGET_LIMIT_PREFIX}\s+"
+            rf"[^.!?]{{0,120}}?{_BUDGET_LIMIT_PREFIX}\s+"
             rf"({_BUDGET_COUNT_TOKEN})",
         )
         limits = [

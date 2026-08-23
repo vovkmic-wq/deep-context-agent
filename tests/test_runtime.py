@@ -1679,7 +1679,8 @@ def test_explicit_exact_once_suppresses_second_provider_call(
 def test_explicit_tool_call_budget_parses_ozon_prompt_limits() -> None:
     budget = explicit_tool_call_budget(
         "Используй не более 15 функциональных tool calls за весь ход. "
-        "Выполни не более двух узких `search_context(max_results=5)`."
+        "Выполни не более двух узких\n"
+        "  `search_context(max_results=5)`."
     )
 
     assert budget.total == 15
