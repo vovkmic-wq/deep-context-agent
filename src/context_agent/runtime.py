@@ -156,6 +156,16 @@ _EXACT_RESULT_COUNT_PATTERN = re.compile(
     r"сколько\s+результат|количеств\w*\s+результат\w*\s+из\s+toolmessage|"
     r"exact\s+(?:number|count)\s+of\s+results?|result\s+count)"
 )
+_BUDGET_LIMIT_PREFIX = (
+    r"(?:at\s+most|no\s+more\s+than|maximum|max(?:imum)?|"
+    r"не\s+более|максимум)"
+)
+_BUDGET_COUNT_TOKEN = (
+    r"(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"од(?:ин|ного|ну)|два|двух|три|тр[её]\u0445|четыре|четыр[её]\u0445|"
+    r"пять|пяти|шесть|шести|семь|семи|восемь|восьми|девять|"
+    r"девяти|десять|десяти)"
+)
 _AUDIT_METADATA_KEY = "context_agent_audit"
 _MAX_AUDIT_HASH_BYTES = 16 * 1024 * 1024
 
@@ -170,6 +180,14 @@ class ToolAuditEntry:
     result: str
     result_count: int | None = None
     content_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExplicitToolBudget:
+    """Restrictive tool-call budgets stated in the current user prose."""
+
+    total: int | None
+    per_tool: Mapping[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +349,50 @@ class ExactOnceToolMiddleware(AgentMiddleware):
             updates["tool_choice"] = "none"
         response = handler(request.override(**updates))
         return _suppress_exhausted_tool_calls(response, exhausted)
+
+
+class ExplicitToolBudgetMiddleware(AgentMiddleware):
+    """Enforce explicit per-turn total and per-tool maximums."""
+
+    name = "explicit_tool_call_budget"
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Hide exhausted tools and suppress stale calls after a stated limit."""
+
+        budget = explicit_tool_call_budget(current_user_query(request.state))
+        if budget.total is None and not budget.per_tool:
+            return handler(request)
+
+        audit = extract_tool_audit(request.state)
+        attempted = Counter(entry.name for entry in audit)
+        total_exhausted = budget.total is not None and len(audit) >= budget.total
+        exhausted = {
+            name for name, limit in budget.per_tool.items() if attempted[name] >= limit
+        }
+        if total_exhausted:
+            exhausted.update(_model_tool_name(tool) for tool in request.tools)
+        if not exhausted:
+            return handler(request)
+
+        available_tools = [
+            tool for tool in request.tools if _model_tool_name(tool) not in exhausted
+        ]
+        updates: dict[str, Any] = {"tools": available_tools}
+        if not available_tools:
+            updates["tool_choice"] = "none"
+        response = handler(request.override(**updates))
+        return _suppress_exhausted_tool_calls(
+            response,
+            exhausted,
+            fallback_content=(
+                "The explicit tool-call budget is exhausted. Use the existing "
+                "ToolMessage evidence and provide the final answer."
+            ),
+        )
 
 
 class AcceptanceCompletionMiddleware(AgentMiddleware):
@@ -983,6 +1045,90 @@ def explicit_exact_once_tools(query: str) -> frozenset[str]:
     return frozenset(requested)
 
 
+def explicit_tool_call_budget(query: str) -> ExplicitToolBudget:
+    """Parse restrictive total and named-tool maximums from user prose."""
+
+    prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
+    total_pattern = re.compile(
+        rf"(?iu){_BUDGET_LIMIT_PREFIX}\s+({_BUDGET_COUNT_TOKEN})"
+        r"[^\r\n.!?]{0,100}?"
+        r"(?:functional\s+)?tool[\s_-]*calls?",
+    )
+    totals = [
+        count
+        for match in total_pattern.finditer(prose_query)
+        if (count := _tool_budget_count(match.group(1))) is not None
+    ]
+
+    per_tool: dict[str, int] = {}
+    for tool_name in KNOWN_AGENT_TOOLS:
+        limit_before_tool = re.compile(
+            rf"(?iu){_BUDGET_LIMIT_PREFIX}\s+({_BUDGET_COUNT_TOKEN})"
+            rf"[^\r\n.!?]{{0,120}}?(?<![\w]){re.escape(tool_name)}(?![\w])",
+        )
+        tool_before_limit = re.compile(
+            rf"(?iu)(?<![\w]){re.escape(tool_name)}(?![\w])"
+            rf"[^\r\n.!?]{{0,120}}?{_BUDGET_LIMIT_PREFIX}\s+"
+            rf"({_BUDGET_COUNT_TOKEN})",
+        )
+        limits = [
+            count
+            for pattern in (limit_before_tool, tool_before_limit)
+            for match in pattern.finditer(prose_query)
+            if (count := _tool_budget_count(match.group(1))) is not None
+        ]
+        if limits:
+            per_tool[tool_name] = min(limits)
+    return ExplicitToolBudget(
+        total=min(totals) if totals else None,
+        per_tool=per_tool,
+    )
+
+
+def _tool_budget_count(token: str) -> int | None:
+    """Convert a small English/Russian cardinal token to an integer."""
+
+    normalized = token.casefold()
+    if normalized.isdecimal():
+        return int(normalized)
+    words = {
+        "one": 1,
+        "один": 1,
+        "одного": 1,
+        "одну": 1,
+        "two": 2,
+        "два": 2,
+        "двух": 2,
+        "three": 3,
+        "три": 3,
+        "трех": 3,
+        "трёх": 3,
+        "four": 4,
+        "четыре": 4,
+        "четырех": 4,
+        "четырёх": 4,
+        "five": 5,
+        "пять": 5,
+        "пяти": 5,
+        "six": 6,
+        "шесть": 6,
+        "шести": 6,
+        "seven": 7,
+        "семь": 7,
+        "семи": 7,
+        "eight": 8,
+        "восемь": 8,
+        "восьми": 8,
+        "nine": 9,
+        "девять": 9,
+        "девяти": 9,
+        "ten": 10,
+        "десять": 10,
+        "десяти": 10,
+    }
+    return words.get(normalized)
+
+
 def _model_tool_name(tool: Any) -> str:
     """Return a bound tool name without depending on one concrete tool type."""
 
@@ -994,6 +1140,11 @@ def _model_tool_name(tool: Any) -> str:
 def _suppress_exhausted_tool_calls(
     response: ModelResponse,
     exhausted: frozenset[str] | set[str],
+    *,
+    fallback_content: str = (
+        "Exact-once tool already completed; the repeated provider call was "
+        "not executed. Use the existing ToolMessage evidence."
+    ),
 ) -> ModelResponse:
     """Remove stale exact-once calls returned despite narrowed tool bindings."""
 
@@ -1013,14 +1164,7 @@ def _suppress_exhausted_tool_calls(
         additional_kwargs = dict(message.additional_kwargs)
         additional_kwargs.pop("tool_calls", None)
         additional_kwargs.pop("function_call", None)
-        content = (
-            message.content
-            if remaining
-            else (
-                "Exact-once tool already completed; the repeated provider call was "
-                "not executed. Use the existing ToolMessage evidence."
-            )
-        )
+        content = message.content if remaining else fallback_content
         messages.append(
             message.model_copy(
                 update={
@@ -1895,6 +2039,7 @@ class AgentRuntime:
                 SequentialToolCallMiddleware(),
                 AcceptanceCompletionMiddleware(),
                 ExactOnceToolMiddleware(),
+                ExplicitToolBudgetMiddleware(),
                 ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
                 tool_call_policy_middleware,

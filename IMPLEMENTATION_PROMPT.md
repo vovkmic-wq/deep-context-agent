@@ -1,6 +1,6 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.7.1 находится в
+Актуальный обязательный промпт версии 0.8.0 находится в
 `OZON_EXPERIMENT_HARDENING_PROMPT.md`. Его требования имеют приоритет для
 исправления scope/index/token дефектов Ozon-эксперимента от 2026-08-23.
 `EVIDENCE_INTEGRITY_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md`,
@@ -20,6 +20,11 @@ coverage, browser-profile и generated/cache артефакты. Огранич�
 Patch 0.7.1: распознавай BOM до NUL/binary-проверки и потоково индексируй
 UTF-16/UTF-32 документы. Закрепи regression-тестами и повтори весь локальный
 контур, package/doctor live, публикацию и Ozon index на новой пустой БД.
+
+Hardening 0.8.0: считай явные total/per-tool maximums жёсткой runtime-
+политикой. После достижения лимита удаляй exhausted tools из model request и
+подавляй stale provider-calls без лишнего audit event. Проверь русские и
+английские формулировки unit/tool-loop тестами и повтори Ozon на новом thread.
 
 ## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
 
@@ -104,6 +109,9 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
 13. После Ozon-аудита 0.6.0 обеспечь hardening 0.7.0: отличай общий корень от
     exact-file scope, отсекай generated/browser/cache пути до индексирования,
     ограничивай source listing и используй узкие ограниченные project-аудиты.
+14. После clean Ozon-аудита 0.7.1 обеспечь hardening 0.8.0: исполняй явные
+    total/per-tool tool-call budgets программно и не полагайся на дисциплину
+    LLM при ограничении токенов и числа инструментов.
 
 Инженерные ограничения:
 

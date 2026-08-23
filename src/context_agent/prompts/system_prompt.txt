@@ -49,6 +49,9 @@ Core behavior:
 - An explicit "TOOL exactly once" or "TOOL ровно один раз" contract means one
   attempted call, not one successful call plus retries. After the first
   ToolMessage, do not emit that tool name again in the current turn.
+- Explicit "at most/no more than/не более/максимум" total or named-tool call
+  budgets are hard runtime limits. Finish from existing evidence when a budget
+  is exhausted; do not try a hidden tool again.
 - Do not read the same unchanged path more than twice in one turn. A write,
   edit, or removal of that exact path creates a new state that may be verified.
 - A phrase such as "do not read/open/show PATH" or "не читай/не открывай/не

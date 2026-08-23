@@ -28,6 +28,7 @@ from context_agent.runtime import (
     current_user_query,
     evaluate_acceptance_manifest,
     explicit_filesystem_paths,
+    explicit_tool_call_budget,
     final_response_text,
     forbidden_mutation_paths,
     forbidden_read_paths,
@@ -1592,6 +1593,104 @@ def test_explicit_exact_once_suppresses_second_provider_call(
     assert answer.startswith(
         "Точное количество результатов search_context по ToolMessage: 1."
     )
+
+
+def test_explicit_tool_call_budget_parses_ozon_prompt_limits() -> None:
+    budget = explicit_tool_call_budget(
+        "Используй не более 15 функциональных tool calls за весь ход. "
+        "Выполни не более двух узких `search_context(max_results=5)`."
+    )
+
+    assert budget.total == 15
+    assert budget.per_tool == {"search_context": 2}
+
+
+def test_explicit_per_tool_budget_suppresses_stale_provider_call(
+    tmp_path: Path,
+) -> None:
+    calls = [
+        {
+            "name": "search_context",
+            "args": {"query": f"BUDGET_CONTROL_{index}", "max_results": 4},
+            "id": f"call-budget-{index}",
+            "type": "tool_call",
+        }
+        for index in range(3)
+    ]
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(content="", tool_calls=[calls[0]]),
+            AIMessage(content="", tool_calls=[calls[1]]),
+            AIMessage(content="", tool_calls=[calls[2]]),
+            AIMessage(content="This response must not be needed."),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask(
+            "Call search_context no more than two times, using a different "
+            "BUDGET_CONTROL query each time, then answer."
+        )
+
+    assert [entry.name for entry in runtime.last_tool_audit] == [
+        "search_context",
+        "search_context",
+    ]
+    assert "search_context" not in model.bound_tool_name_batches[-1]
+    assert "tool-call budget is exhausted" in answer
+
+
+def test_explicit_total_tool_budget_suppresses_third_tool(tmp_path: Path) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "runtime_info",
+                        "args": {},
+                        "id": "call-total-runtime",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_context_sources",
+                        "args": {},
+                        "id": "call-total-list",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_context",
+                        "args": {"query": "must not execute"},
+                        "id": "call-total-stale",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask("Use at most 2 functional tool calls, then answer.")
+
+    assert [entry.name for entry in runtime.last_tool_audit] == [
+        "runtime_info",
+        "list_context_sources",
+    ]
+    assert "tool-call budget is exhausted" in answer
 
 
 def test_runtime_and_context_tools_have_compact_current_turn_audit(

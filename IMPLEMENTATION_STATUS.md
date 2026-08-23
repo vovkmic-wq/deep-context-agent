@@ -24,6 +24,7 @@
 | 17. Ozon hardening 0.7.0 | Завершён | Root-scope, index-filter и listing regression tests | Общий root не блокирует child-read; generated/browser/cache пути отсечены; listing ограничен 20/50 |
 | 18. Финальная проверка 0.7.0 | Завершён | Ruff, 100 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: root-scope read успешен; полный manifest — 32 PASS; restart — 4 results и 2 PASS |
 | 19. BOM text patch 0.7.1 | Завершён | Ruff, 102 passed, package/pip/doctor live, UTF-16/UTF-32 regression | Обнаруженный Ozon UTF-16LE отчёт теперь индексируется; clean-DB повтор выполняется после публикации |
+| 20. Explicit tool budgets 0.8.0 | Завершён | Ruff, 105 passed, package/pip/doctor live, parser/tool-loop | Per-tool и total budget скрывают exhausted tools; stale provider-call не исполняется и не аудируется |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -233,3 +234,12 @@ Patch 0.7.1 добавлен после первого clean-DB индексир
 NUL-байты за binary. После переноса BOM-detection перед binary guard выполнены
 Ruff и format-check, `pytest -ra` дал 102 passed и 1 planned symlink skip,
 editable package сообщает 0.7.1, `pip check` и OpenAI `doctor --live` успешны.
+
+Hardening 0.8.0 добавлен после первого LLM-хода на чистой Ozon-БД. Модель
+выполнила четыре `search_context` при prose-максимуме два и превысила общий
+максимум 15 попыток. Новая model middleware парсит русские/английские числовые
+ограничения, считает фактический current-turn audit, удаляет exhausted tools из
+следующего model request и подавляет stale provider-call. Regression охватывает
+парсер, per-tool и total budget; полный прогон дал Ruff PASS, 105 passed,
+1 planned symlink skip, editable 0.8.0, чистый `pip check` и успешный OpenAI
+`doctor --live`.
