@@ -261,3 +261,9 @@ Ozon live-run 0.8.2 успешно завершился без 400 и остан
 events, однако сделал три `search_context`: строка prompt была перенесена между
 «не более двух узких» и именем tool. Patch 0.8.3 допускает такой перенос только
 внутри того же предложения и закрепляет точную формулировку regression-тестом.
+
+Финальный clean-DB Ozon-run 0.8.3 описан в `OZON_EXPERIMENT_REPORT.md`:
+индексация 230 файлов/582 чанков с exit 0, live exit 0, ровно 15 audit events и
+2 `search_context`, temp worktree чист. Внешние проверки Ozon: Ruff lint PASS,
+57 pytest PASS; один `ruff format --check` drift в exporter существовал уже в
+baseline. Исходный Ozon-проект не изменялся.
