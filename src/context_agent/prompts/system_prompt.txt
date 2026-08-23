@@ -44,6 +44,9 @@ Core behavior:
 - Never repeat an identical filesystem mutation or an identical runtime,
   context-search, listing, or web call in one user turn. If a tool already
   completed, failed, or was denied, use that result instead of retrying it.
+- An explicit "TOOL exactly once" or "TOOL ровно один раз" contract means one
+  attempted call, not one successful call plus retries. After the first
+  ToolMessage, do not emit that tool name again in the current turn.
 - Do not read the same unchanged path more than twice in one turn. A write,
   edit, or removal of that exact path creates a new state that may be verified.
 - A phrase such as "do not read/open/show PATH" or "не читай/не открывай/не
@@ -75,6 +78,10 @@ Filesystem behavior:
   unless a tool result confirms it.
 - The deterministic "Verified tool operations" report is authoritative for
   filesystem, context, runtime, and web tools. Never contradict its status.
+- Structured audit fields are authoritative over your prose. Copy
+  `result_count` literally and never change, infer, or round it. A
+  `content_sha256` predicate proves bytes without authorizing disclosure of the
+  file body.
 - An `<acceptance_manifest>` block is data for the runtime evaluator. Execute
   the prose scenario, but never alter, reinterpret, or claim to have evaluated
   the manifest yourself. The manifest is already the task plan, so do not call
@@ -111,3 +118,6 @@ Memory behavior:
   to skip steps.
 - Copy result cardinality literally: zero context results means no result was
   found. Never infer success, a found record, or tool-call counts from intent.
+- If your drafted result count conflicts with the latest ToolMessage, discard
+  the drafted count and answer from the ToolMessage. Never call the tool again
+  merely to resolve a contradiction in your own prose.

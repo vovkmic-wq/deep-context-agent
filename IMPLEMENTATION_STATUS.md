@@ -5,7 +5,7 @@
 
 | Этап | Статус | Проверка | Примечание |
 | --- | --- | --- | --- |
-| 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `ACCEPTANCE_COMPLETION_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручных и live-логов |
+| 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `EVIDENCE_INTEGRITY_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручных и live-логов |
 | 2. Каркас и провайдеры | Завершён | Unit-тесты конфигурации и фабрики | LM Studio, OpenAI, YandexGPT, DeepSeek и Qwen; provider retry выключен, retry выполняет middleware model call |
 | 3. Большой контекст | Завершён | 1 000 001 строка, 200 документов, повторное открытие SQLite | Потоковый FTS5, BM25, соседние чанки и cross-thread archive без загрузки корпуса в окно LLM |
 | 4. Deep Agent и CLI | Завершён | Fake-model tool loops, CLI unit/smoke, OpenAI live | `/paste`, `ask --file`, stdin, bounded input, `--no-auto-context` и доверенная runtime identity |
@@ -19,6 +19,8 @@
 | 12. Финальная проверка 0.4.0 | Завершён | Ruff, 81 passed, 1 planned skip, package/CLI/doctor/live | OpenAI `gpt-5-nano`: один `runtime_info`, runtime manifest — 2 PASS, 0 FAIL |
 | 13. Acceptance correctness 0.5.0 | Завершён | Sentence scope, allowed-unlisted, BLOCKED, completion gate | Runtime завершает только dependency-ready cleanup/postconditions и не расширяет filesystem scope |
 | 14. Финальная проверка 0.5.0 | Завершён | Ruff, 91 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: полный manifest — 32 PASS; новый процесс/thread — 2 PASS и 4 context results |
+| 15. Evidence integrity 0.6.0 | Завершён | Structured audit, manifest v2, cardinality/exact-once guards | Hash/count predicates независимы от LLM; устаревший exact-once повтор не исполняется |
+| 16. Финальная проверка 0.6.0 | Завершён | Ruff, 97 passed, 1 planned skip, package/CLI/doctor/full live/restart | `gpt-5-nano`: полный v2 manifest — 32 PASS; restart — ровно один call, 4 results, 2 PASS |
 
 Финальная проверка выполнялась командами из README. Конфликт ACL между обычным
 Windows-пользователем и Codex sandbox устранён отказом от общих pytest/Ruff-
@@ -159,3 +161,38 @@ Production-hardening от 2026-08-22 проверен в изолированн�
 однопользовательского CLI. Многопользовательский сетевой сервис требует
 отдельной процессной изоляции, аутентификации и координации одновременных
 записей и не входит в область данного ТЗ.
+
+Результат 0.5.0 выше сохранён как история. Проверка 0.6.0 от 2026-08-23
+выполнена после устранения трёх дефектов restart-аудита:
+
+- `ToolAuditEntry` содержит безопасные `result_count` и `content_sha256`;
+  SHA-256 вычисляется из фактических байтов workspace-файла и не раскрывает
+  его тело;
+- manifest v2 строго валидирует `min_results` и `content_sha256`, сохраняет
+  совместимость v1 и запрещает evidence-предикаты в forbidden events;
+- прямой вопрос о количестве получает детерминированный ответ из ToolMessage;
+  unit tool-loop заменил ошибочный текст модели `0` фактическим числом `1`;
+- exact-once middleware удаляет уже вызванный tool из следующего model request;
+  regression с повторным provider call дал одну audit-запись без `denied`;
+- canonical `acceptance-prompt.txt` v2 проверяет SHA-256 начального/изменённого
+  result и root sentinel, а `restart-acceptance-prompt.txt` требует
+  `search_context: 1` и `min_results=1`;
+- `ruff check --no-cache .` и `ruff format --check --no-cache .` — успешно;
+- `pytest -ra` — 97 passed, 1 planned skip; skip относится только к системному
+  запрету Windows на создание symlink для текущей учётной записи;
+- editable package `deep-context-agent==0.6.0`, `pip check`, CLI `--help`,
+  безопасный OpenAI doctor и `doctor --live` — успешно;
+- полный изолированный live acceptance использовал run `20260823-221609`,
+  `gpt-5-nano`, новые workspace/data/thread и manifest v2; runtime дал
+  `32 PASS, 0 FAIL, 0 BLOCKED, 1 PENDING`, все exact counts и hash-предикаты
+  совпали;
+- PowerShell-проверка после live-run подтвердила отсутствие тестового каталога,
+  root sentinel и outside placeholder;
+- restart с тем же `AGENT_DATA_DIR` и новым thread вызвал `search_context`
+  ровно один раз, вернул `4 result(s)` и manifest verdict
+  `2 PASS, 0 FAIL, 0 BLOCKED, 0 PENDING`; повторный denied отсутствует.
+
+Версия 0.6.0 считается production-ready в границах локального
+однопользовательского CLI. Многопользовательский сетевой сервис по-прежнему
+требует отдельной процессной изоляции, аутентификации, централизованного аудита
+и координации одновременных записей и не входит в область данного ТЗ.

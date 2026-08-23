@@ -1,5 +1,6 @@
 """Integration tests for Deep Agent assembly and persistent turns."""
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -21,6 +22,7 @@ from context_agent.runtime import (
     append_acceptance_guard,
     append_current_web_verification_guard,
     append_filesystem_verification,
+    append_result_cardinality_guard,
     build_retrieved_request,
     build_system_prompt,
     current_user_query,
@@ -206,6 +208,120 @@ def test_acceptance_manifest_is_strict_bounded_and_machine_readable() -> None:
             '<acceptance_manifest>{"exact_tool_call_counts": {"read_file": 1},'
             '"allowed_unlisted_tools": ["read_file"]}</acceptance_manifest>'
         )
+
+
+def test_acceptance_manifest_v2_validates_structured_evidence() -> None:
+    digest = hashlib.sha256(b"EXACT_BODY").hexdigest()
+    manifest = parse_acceptance_manifest(
+        f"""<acceptance_manifest>{{
+        "version": 2,
+        "exact_tool_call_counts": {{"read_file": 1, "search_context": 1}},
+        "required_events": [
+          {{"id": "read", "tool": "read_file",
+           "target": "/workspace/result.txt", "content_sha256": "{digest}"}},
+          {{"id": "search", "tool": "search_context",
+           "target": "CONTROL", "min_results": 1, "after": "read"}}
+        ]}}</acceptance_manifest>"""
+    )
+
+    assert manifest is not None
+    assert manifest.required_events[0].content_sha256 == digest
+    assert manifest.required_events[1].min_results == 1
+
+    invalid_manifests = [
+        (
+            "require version 2",
+            """<acceptance_manifest>{"version": 1,
+            "required_events": [{"id": "search", "tool": "search_context",
+            "min_results": 1}]}</acceptance_manifest>""",
+        ),
+        (
+            "invalid min_results",
+            """<acceptance_manifest>{"version": 2,
+            "required_events": [{"id": "search", "tool": "search_context",
+            "min_results": -1}]}</acceptance_manifest>""",
+        ),
+        (
+            "uses min_results",
+            """<acceptance_manifest>{"version": 2,
+            "required_events": [{"id": "read", "tool": "read_file",
+            "min_results": 1}]}</acceptance_manifest>""",
+        ),
+        (
+            "invalid content_sha256",
+            """<acceptance_manifest>{"version": 2,
+            "required_events": [{"id": "read", "tool": "read_file",
+            "content_sha256": "bad"}]}</acceptance_manifest>""",
+        ),
+        (
+            "forbidden events cannot define",
+            f"""<acceptance_manifest>{{"version": 2,
+            "forbidden_events": [{{"id": "read", "tool": "read_file",
+            "content_sha256": "{digest}"}}]}}</acceptance_manifest>""",
+        ),
+    ]
+    for expected_error, payload in invalid_manifests:
+        with pytest.raises(ValueError, match=expected_error):
+            parse_acceptance_manifest(payload)
+
+
+def test_acceptance_manifest_v2_evaluates_count_and_content_hash() -> None:
+    digest = hashlib.sha256(b"EXACT_BODY").hexdigest()
+    manifest = parse_acceptance_manifest(
+        f"""<acceptance_manifest>{{
+        "version": 2,
+        "exact_tool_call_counts": {{"read_file": 1, "search_context": 1}},
+        "required_events": [
+          {{"id": "read", "tool": "read_file",
+           "target": "/workspace/result.txt", "content_sha256": "{digest}"}},
+          {{"id": "search", "tool": "search_context", "target": "CONTROL",
+           "min_results": 1, "after": "read"}}
+        ]}}</acceptance_manifest>"""
+    )
+    assert manifest is not None
+    good = evaluate_acceptance_manifest(
+        manifest,
+        (
+            ToolAuditEntry(
+                "read_file",
+                "/workspace/result.txt",
+                "success",
+                "read",
+                content_sha256=digest,
+            ),
+            ToolAuditEntry(
+                "search_context",
+                "CONTROL",
+                "success",
+                "Returned 4 result(s).",
+                result_count=4,
+            ),
+        ),
+    )
+    bad = evaluate_acceptance_manifest(
+        manifest,
+        (
+            ToolAuditEntry(
+                "read_file",
+                "/workspace/result.txt",
+                "success",
+                "read",
+                content_sha256="0" * 64,
+            ),
+            ToolAuditEntry(
+                "search_context",
+                "CONTROL",
+                "success",
+                "Returned 0 result(s).",
+                result_count=0,
+            ),
+        ),
+    )
+
+    assert (good.failed, good.blocked) == (0, 0)
+    assert bad.failed == 1
+    assert bad.blocked == 1
+    assert "content_sha256=expected" in bad.failures[0]
 
 
 def test_acceptance_manifest_evaluates_order_counts_and_forbidden_events() -> None:
@@ -714,7 +830,7 @@ def test_duplicate_read_only_and_web_calls_are_denied_within_turn(
         runtime.ask(
             "Acceptance: call runtime_info, get_pypi_package_info for langchain, "
             "fetch_web_page for https://example.test/source, and "
-            "list_context_sources exactly once."
+            "list_context_sources; deliberately retry every call."
         )
 
     assert [entry.status for entry in runtime.last_tool_audit] == [
@@ -1330,6 +1446,115 @@ def test_successful_exact_read_is_audited_without_leaking_content(
     assert "read_file /workspace/requested.txt: success" in answer
     assert "content omitted from audit" in answer
     assert secret not in answer
+    assert (
+        runtime.last_tool_audit[0].content_sha256
+        == hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    )
+
+
+def test_result_cardinality_guard_replaces_incorrect_model_count(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_context",
+                        "args": {"query": "CARDINALITY_CONTROL", "max_results": 4},
+                        "id": "call-cardinality",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Точное количество результатов: 0."),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        runtime.context_store.add_text(
+            "memory://cardinality",
+            "CARDINALITY_CONTROL persistent evidence",
+        )
+        answer = runtime.ask(
+            "Вызови search_context для CARDINALITY_CONTROL и сообщи точное "
+            "количество результатов из ToolMessage."
+        )
+
+    assert runtime.last_tool_audit[0].result_count == 1
+    assert answer.startswith(
+        "Точное количество результатов search_context по ToolMessage: 1."
+    )
+    assert "Точное количество результатов: 0" not in answer
+
+
+def test_cardinality_guard_lists_all_structured_counts() -> None:
+    answer = append_result_cardinality_guard(
+        "Inspected.",
+        "Search and list sources",
+        (
+            ToolAuditEntry(
+                "search_context",
+                "CONTROL",
+                "success",
+                "Returned 4 result(s).",
+                result_count=4,
+            ),
+            ToolAuditEntry(
+                "list_context_sources",
+                None,
+                "success",
+                "Returned 7 source(s).",
+                result_count=7,
+            ),
+        ),
+    )
+
+    assert "search_context: 4" in answer
+    assert "list_context_sources: 7" in answer
+
+
+def test_explicit_exact_once_suppresses_second_provider_call(
+    tmp_path: Path,
+) -> None:
+    call = {
+        "name": "search_context",
+        "args": {"query": "EXACT_ONCE_CONTROL", "max_results": 4},
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(content="", tool_calls=[{**call, "id": "call-first"}]),
+            AIMessage(content="", tool_calls=[{**call, "id": "call-stale-repeat"}]),
+            AIMessage(content="This response must not be needed."),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        runtime.context_store.add_text(
+            "memory://exact-once",
+            "EXACT_ONCE_CONTROL persistent evidence",
+        )
+        answer = runtime.ask(
+            "Вызови search_context ровно один раз с запросом "  # noqa: RUF001
+            "EXACT_ONCE_CONTROL и сообщи точное количество результатов "
+            "из ToolMessage."
+        )
+
+    assert len(runtime.last_tool_audit) == 1
+    assert runtime.last_tool_audit[0].name == "search_context"
+    assert runtime.last_tool_audit[0].status == "success"
+    assert runtime.last_tool_audit[0].result_count == 1
+    assert model.call_index == 2
+    assert "search_context" not in model.bound_tool_name_batches[-1]
+    assert answer.startswith(
+        "Точное количество результатов search_context по ToolMessage: 1."
+    )
 
 
 def test_runtime_and_context_tools_have_compact_current_turn_audit(

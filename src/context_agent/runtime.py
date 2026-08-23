@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -31,7 +32,8 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore, SearchHit
-from context_agent.errors import AgentError
+from context_agent.errors import AgentError, PathSecurityError
+from context_agent.paths import resolve_inside
 from context_agent.providers import create_chat_model
 from context_agent.tools import (
     SAFE_FILESYSTEM_TOOL_DESCRIPTIONS,
@@ -67,6 +69,10 @@ KNOWN_AGENT_TOOLS = frozenset(
     }
 )
 AUDIT_STATUSES = frozenset({"success", "error", "denied", "not_found", "missing"})
+RESULT_COUNT_TOOLS = frozenset(
+    {"web_search", "search_context", "read_context_window", "list_context_sources"}
+)
+CONTENT_HASH_TOOLS = frozenset({"read_file", "write_file", "edit_file"})
 _MUTATION_REQUEST_PATTERN = re.compile(
     r"(?iu)(?:\b(?:create|write|append|edit|replace|delete|remove|rename|mkdir)\b|"
     r"созда(?:й|ть)|запиш(?:и|ите)|добав(?:ь|ить)|измен(?:и|ить)|"
@@ -139,6 +145,19 @@ _ACCEPTANCE_MANIFEST_PATTERN = re.compile(
 )
 _MAX_ACCEPTANCE_MANIFEST_CHARS = 20_000
 _MANIFEST_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_EXACT_ONCE_PHRASE_PATTERN = re.compile(
+    r"(?iu)(?:\bexactly\s+once\b|\bstrictly\s+once\b|"
+    r"\b\u0440\u043e\u0432\u043d\u043e\s+\u043e\u0434\u0438\u043d\s+"
+    r"\u0440\u0430\u0437\b)"
+)
+_EXACT_RESULT_COUNT_PATTERN = re.compile(
+    r"(?iu)(?:точн\w*\s+количеств\w*\s+результат|"
+    r"сколько\s+результат|количеств\w*\s+результат\w*\s+из\s+toolmessage|"
+    r"exact\s+(?:number|count)\s+of\s+results?|result\s+count)"
+)
+_AUDIT_METADATA_KEY = "context_agent_audit"
+_MAX_AUDIT_HASH_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +168,8 @@ class ToolAuditEntry:
     path: str | None
     status: str
     result: str
+    result_count: int | None = None
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +181,8 @@ class AcceptanceEvent:
     target: str | None
     statuses: tuple[str, ...]
     after: str | None = None
+    min_results: int | None = None
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +299,37 @@ class SequentialToolCallMiddleware(AgentMiddleware):
             result=messages,
             structured_response=response.structured_response,
         )
+
+
+class ExactOnceToolMiddleware(AgentMiddleware):
+    """Prevent a second attempt after an explicit exact-once tool contract."""
+
+    name = "exact_once_tool_contract"
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Hide exhausted tools and suppress stale provider tool calls."""
+
+        query = current_user_query(request.state)
+        exact_once = explicit_exact_once_tools(query)
+        if not exact_once:
+            return handler(request)
+        attempted = {entry.name for entry in extract_tool_audit(request.state)}
+        exhausted = exact_once & attempted
+        if not exhausted:
+            return handler(request)
+
+        available_tools = [
+            tool for tool in request.tools if _model_tool_name(tool) not in exhausted
+        ]
+        updates: dict[str, Any] = {"tools": available_tools}
+        if not available_tools:
+            updates["tool_choice"] = "none"
+        response = handler(request.override(**updates))
+        return _suppress_exhausted_tool_calls(response, exhausted)
 
 
 class AcceptanceCompletionMiddleware(AgentMiddleware):
@@ -617,6 +671,126 @@ def _tool_result(
     return status, redact_marked_secrets(compact)
 
 
+def _structured_result_count(
+    tool_name: str,
+    tool_message: ToolMessage | None,
+) -> int | None:
+    """Extract cardinality only from a structured, successful tool result."""
+
+    if tool_name not in RESULT_COUNT_TOOLS or tool_message is None:
+        return None
+    try:
+        payload = json.loads(message_text(tool_message))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    status = str(payload.get("status", getattr(tool_message, "status", "success")))
+    if status != "success":
+        return None
+    key = "sources" if tool_name == "list_context_sources" else "results"
+    values = payload.get(key)
+    if not isinstance(values, list):
+        return None
+    return len(values)
+
+
+def _workspace_content_sha256(
+    workspace: Path | None,
+    tool_name: str,
+    args: Mapping[str, Any],
+    status: str,
+) -> str | None:
+    """Hash a bounded workspace file after a successful content operation."""
+
+    if workspace is None or tool_name not in CONTENT_HASH_TOOLS or status != "success":
+        return None
+    raw_path = _filesystem_target(args)
+    if raw_path is None:
+        return None
+    try:
+        target = resolve_inside(
+            workspace,
+            raw_path,
+            must_exist=True,
+            allow_root=False,
+        )
+        if not target.is_file() or target.stat().st_size > _MAX_AUDIT_HASH_BYTES:
+            return None
+        digest = hashlib.sha256()
+        with target.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (OSError, PathSecurityError):
+        return None
+
+
+def _tool_message_audit_metadata(tool_message: ToolMessage | None) -> Mapping[str, Any]:
+    """Read only the safe audit metadata attached by this runtime."""
+
+    if tool_message is None:
+        return {}
+    metadata = tool_message.additional_kwargs.get(_AUDIT_METADATA_KEY)
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _build_tool_audit_entry(
+    name: str,
+    args: Mapping[str, Any],
+    tool_message: ToolMessage | None,
+    *,
+    workspace: Path | None = None,
+) -> ToolAuditEntry:
+    """Build one sanitized audit record with optional structured evidence."""
+
+    status, summary = _tool_result(name, tool_message)
+    metadata = _tool_message_audit_metadata(tool_message)
+    raw_count = metadata.get("result_count")
+    result_count = (
+        raw_count
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+        else _structured_result_count(name, tool_message)
+    )
+    raw_sha256 = metadata.get("content_sha256")
+    content_sha256 = (
+        raw_sha256
+        if isinstance(raw_sha256, str) and _SHA256_PATTERN.fullmatch(raw_sha256)
+        else _workspace_content_sha256(workspace, name, args, status)
+    )
+    return ToolAuditEntry(
+        name=name,
+        path=_audit_target(args, tool_message),
+        status=status,
+        result=summary,
+        result_count=result_count,
+        content_sha256=content_sha256,
+    )
+
+
+def _attach_tool_audit_metadata(
+    tool_message: ToolMessage | None,
+    entry: ToolAuditEntry,
+) -> ToolMessage | None:
+    """Persist safe structured evidence in the graph without exposing content."""
+
+    if tool_message is None:
+        return None
+    metadata = {
+        key: value
+        for key, value in {
+            "result_count": entry.result_count,
+            "content_sha256": entry.content_sha256,
+        }.items()
+        if value is not None
+    }
+    if not metadata:
+        return tool_message
+    additional_kwargs = dict(tool_message.additional_kwargs)
+    additional_kwargs[_AUDIT_METADATA_KEY] = metadata
+    return tool_message.model_copy(update={"additional_kwargs": additional_kwargs})
+
+
 def _audit_target(
     args: Mapping[str, Any],
     tool_message: ToolMessage | None = None,
@@ -650,8 +824,9 @@ class ToolAuditMiddleware(AgentMiddleware):
 
     name = "current_turn_tool_audit"
 
-    def __init__(self) -> None:
+    def __init__(self, workspace: Path) -> None:
         self.entries: list[ToolAuditEntry] = []
+        self.workspace = workspace
 
     def reset(self) -> None:
         """Discard audit entries before starting the next user turn."""
@@ -681,16 +856,15 @@ class ToolAuditMiddleware(AgentMiddleware):
             )
             raise
         tool_message = result if isinstance(result, ToolMessage) else None
-        status, summary = _tool_result(name, tool_message)
-        self.entries.append(
-            ToolAuditEntry(
-                name=name,
-                path=_audit_target(args, tool_message),
-                status=status,
-                result=summary,
-            )
+        entry = _build_tool_audit_entry(
+            name,
+            args,
+            tool_message,
+            workspace=self.workspace,
         )
-        return result
+        self.entries.append(entry)
+        enriched = _attach_tool_audit_metadata(tool_message, entry)
+        return enriched if enriched is not None else result
 
 
 def extract_tool_audit(result: Mapping[str, Any]) -> tuple[ToolAuditEntry, ...]:
@@ -721,15 +895,7 @@ def extract_tool_audit(result: Mapping[str, Any]) -> tuple[ToolAuditEntry, ...]:
 
     audit: list[ToolAuditEntry] = []
     for call_id, name, args in calls:
-        status, tool_result = _tool_result(name, results.get(call_id))
-        audit.append(
-            ToolAuditEntry(
-                name=name,
-                path=_audit_target(args, results.get(call_id)),
-                status=status,
-                result=tool_result,
-            )
-        )
+        audit.append(_build_tool_audit_entry(name, args, results.get(call_id)))
     return tuple(audit)
 
 
@@ -764,6 +930,108 @@ def request_requires_tool_evidence(query: str) -> bool:
         _MUTATION_REQUEST_PATTERN.search(query)
         or _TOOL_EVIDENCE_PATTERN.search(query)
         or explicit_filesystem_paths(query)
+    )
+
+
+def append_result_cardinality_guard(
+    answer: str,
+    query: str,
+    audit: Sequence[ToolAuditEntry],
+) -> str:
+    """Make structured ToolMessage cardinality authoritative over model prose."""
+
+    entries = [
+        entry
+        for entry in audit
+        if entry.status == "success" and entry.result_count is not None
+    ]
+    if not entries:
+        return answer
+    prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
+    if len(entries) == 1 and _EXACT_RESULT_COUNT_PATTERN.search(prose_query):
+        entry = entries[0]
+        if re.search(r"[\u0400-\u04ff]", prose_query):
+            return (
+                f"Точное количество результатов {entry.name} по ToolMessage: "
+                f"{entry.result_count}."
+            )
+        return (
+            f"Exact {entry.name} result count from ToolMessage: {entry.result_count}."
+        )
+
+    lines = ["Runtime result cardinality (authoritative ToolMessage evidence):"]
+    lines.extend(f"- {entry.name}: {entry.result_count}" for entry in entries)
+    safe_answer = answer.rstrip()
+    report = "\n".join(lines)
+    return f"{safe_answer}\n\n{report}" if safe_answer else report
+
+
+def explicit_exact_once_tools(query: str) -> frozenset[str]:
+    """Return tools covered by explicit exact-once prose instructions."""
+
+    prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
+    segments = re.split(r"(?:\r?\n)+|(?<=[.!?])\s+", prose_query)
+    requested: set[str] = set()
+    for segment in segments:
+        if not _EXACT_ONCE_PHRASE_PATTERN.search(segment):
+            continue
+        for tool_name in KNOWN_AGENT_TOOLS:
+            pattern = rf"(?i)(?<![\w]){re.escape(tool_name)}(?![\w])"
+            if re.search(pattern, segment):
+                requested.add(tool_name)
+    return frozenset(requested)
+
+
+def _model_tool_name(tool: Any) -> str:
+    """Return a bound tool name without depending on one concrete tool type."""
+
+    if isinstance(tool, Mapping):
+        return str(tool.get("name", ""))
+    return str(getattr(tool, "name", ""))
+
+
+def _suppress_exhausted_tool_calls(
+    response: ModelResponse,
+    exhausted: frozenset[str] | set[str],
+) -> ModelResponse:
+    """Remove stale exact-once calls returned despite narrowed tool bindings."""
+
+    messages: list[Any] = []
+    for message in response.result:
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            messages.append(message)
+            continue
+        remaining = [
+            call
+            for call in message.tool_calls
+            if str(call.get("name")) not in exhausted
+        ]
+        if len(remaining) == len(message.tool_calls):
+            messages.append(message)
+            continue
+        additional_kwargs = dict(message.additional_kwargs)
+        additional_kwargs.pop("tool_calls", None)
+        additional_kwargs.pop("function_call", None)
+        content = (
+            message.content
+            if remaining
+            else (
+                "Exact-once tool already completed; the repeated provider call was "
+                "not executed. Use the existing ToolMessage evidence."
+            )
+        )
+        messages.append(
+            message.model_copy(
+                update={
+                    "content": content,
+                    "additional_kwargs": additional_kwargs,
+                    "tool_calls": remaining,
+                }
+            )
+        )
+    return ModelResponse(
+        result=messages,
+        structured_response=response.structured_response,
     )
 
 
@@ -824,8 +1092,13 @@ def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
     unknown_keys = set(payload) - allowed_keys
     if unknown_keys:
         raise ValueError(f"unknown manifest field: {sorted(unknown_keys)[0]}")
-    if payload.get("version", 1) != 1:
-        raise ValueError("only acceptance manifest version 1 is supported")
+    manifest_version = payload.get("version", 1)
+    if (
+        not isinstance(manifest_version, int)
+        or isinstance(manifest_version, bool)
+        or manifest_version not in {1, 2}
+    ):
+        raise ValueError("only acceptance manifest versions 1 and 2 are supported")
 
     raw_counts = payload.get("exact_tool_call_counts", {})
     if not isinstance(raw_counts, Mapping) or len(raw_counts) > 50:
@@ -841,8 +1114,16 @@ def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
             raise ValueError(f"exact count for {tool} must be between 0 and 100")
         counts[tool] = raw_count
 
-    required = _parse_manifest_events(payload.get("required_events", []), "required")
-    forbidden = _parse_manifest_events(payload.get("forbidden_events", []), "forbidden")
+    required = _parse_manifest_events(
+        payload.get("required_events", []),
+        "required",
+        manifest_version,
+    )
+    forbidden = _parse_manifest_events(
+        payload.get("forbidden_events", []),
+        "forbidden",
+        manifest_version,
+    )
     all_ids = [event.event_id for event in (*required, *forbidden)]
     if len(all_ids) != len(set(all_ids)):
         raise ValueError("event ids must be unique")
@@ -888,6 +1169,7 @@ def parse_acceptance_manifest(query: str) -> AcceptanceManifest | None:
 def _parse_manifest_events(
     raw_events: object,
     category: str,
+    manifest_version: int,
 ) -> tuple[AcceptanceEvent, ...]:
     """Validate one bounded event list from a manifest."""
 
@@ -897,7 +1179,15 @@ def _parse_manifest_events(
     for index, raw_event in enumerate(raw_events, start=1):
         if not isinstance(raw_event, Mapping):
             raise ValueError(f"{category} event {index} must be an object")
-        unknown = set(raw_event) - {"id", "tool", "target", "statuses", "after"}
+        unknown = set(raw_event) - {
+            "id",
+            "tool",
+            "target",
+            "statuses",
+            "after",
+            "min_results",
+            "content_sha256",
+        }
         if unknown:
             raise ValueError(
                 f"unknown field in {category} event {index}: {sorted(unknown)[0]}"
@@ -906,6 +1196,8 @@ def _parse_manifest_events(
         tool = raw_event.get("tool")
         target = raw_event.get("target")
         after = raw_event.get("after")
+        min_results = raw_event.get("min_results")
+        content_sha256 = raw_event.get("content_sha256")
         raw_statuses = raw_event.get("statuses", ["success"])
         if not isinstance(event_id, str) or not _MANIFEST_ID_PATTERN.fullmatch(
             event_id
@@ -924,6 +1216,35 @@ def _parse_manifest_events(
             or any(status not in AUDIT_STATUSES for status in raw_statuses)
         ):
             raise ValueError(f"{category} event {event_id} has invalid statuses")
+        has_predicate = min_results is not None or content_sha256 is not None
+        if has_predicate and manifest_version != 2:
+            raise ValueError(
+                f"{category} event {event_id} evidence predicates require version 2"
+            )
+        if has_predicate and category == "forbidden":
+            raise ValueError("forbidden events cannot define evidence predicates")
+        if min_results is not None:
+            if (
+                not isinstance(min_results, int)
+                or isinstance(min_results, bool)
+                or not 0 <= min_results <= 100_000
+            ):
+                raise ValueError(f"{category} event {event_id} has invalid min_results")
+            if tool not in RESULT_COUNT_TOOLS:
+                raise ValueError(
+                    f"{category} event {event_id} uses min_results with {tool}"
+                )
+        if content_sha256 is not None:
+            if not isinstance(content_sha256, str) or not _SHA256_PATTERN.fullmatch(
+                content_sha256
+            ):
+                raise ValueError(
+                    f"{category} event {event_id} has invalid content_sha256"
+                )
+            if tool not in CONTENT_HASH_TOOLS:
+                raise ValueError(
+                    f"{category} event {event_id} uses content_sha256 with {tool}"
+                )
         events.append(
             AcceptanceEvent(
                 event_id=event_id,
@@ -931,6 +1252,8 @@ def _parse_manifest_events(
                 target=target,
                 statuses=tuple(raw_statuses),
                 after=after,
+                min_results=min_results,
+                content_sha256=content_sha256,
             )
         )
     return tuple(events)
@@ -985,9 +1308,15 @@ def evaluate_acceptance_manifest(
         )
         if position is None:
             target = f" target={event.target}" if event.target is not None else ""
+            predicates = []
+            if event.min_results is not None:
+                predicates.append(f"min_results={event.min_results}")
+            if event.content_sha256 is not None:
+                predicates.append("content_sha256=expected")
+            predicate_text = f" and {', '.join(predicates)}" if predicates else ""
             failures.append(
                 f"event {event.event_id}: missing {event.tool}{target} "
-                f"with status in {list(event.statuses)}"
+                f"with status in {list(event.statuses)}{predicate_text}"
             )
             continue
         consumed.add(position)
@@ -1027,12 +1356,19 @@ def _audit_matches_event(entry: ToolAuditEntry, event: AcceptanceEvent) -> bool:
 
     if entry.name != event.tool or entry.status not in event.statuses:
         return False
-    if event.target is None:
-        return True
-    if entry.path is None:
+    if event.target is not None and (
+        entry.path is None
+        or _normalized_audit_target(entry.path)
+        != _normalized_audit_target(event.target)
+    ):
         return False
-    return _normalized_audit_target(entry.path) == _normalized_audit_target(
-        event.target
+    if event.min_results is not None and (
+        entry.result_count is None or entry.result_count < event.min_results
+    ):
+        return False
+    return not (
+        event.content_sha256 is not None
+        and entry.content_sha256 != event.content_sha256
     )
 
 
@@ -1542,7 +1878,7 @@ class AgentRuntime:
             tools=["ls", "read_file", "write_file", "edit_file", "glob", "grep"],
             custom_tool_descriptions=SAFE_FILESYSTEM_TOOL_DESCRIPTIONS,
         )
-        tool_audit_middleware = ToolAuditMiddleware()
+        tool_audit_middleware = ToolAuditMiddleware(self.app_config.workspace)
         self._tool_audit_middleware = tool_audit_middleware
         tool_call_policy_middleware = ToolCallPolicyMiddleware()
         self._tool_call_policy_middleware = tool_call_policy_middleware
@@ -1557,6 +1893,7 @@ class AgentRuntime:
                 filesystem_middleware,
                 SequentialToolCallMiddleware(),
                 AcceptanceCompletionMiddleware(),
+                ExactOnceToolMiddleware(),
                 ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
                 tool_call_policy_middleware,
@@ -1791,8 +2128,13 @@ class AgentRuntime:
             raise AgentError(message) from exc
         self._update_successful_thread_head(clean_thread_id)
         self.last_tool_audit = extract_tool_audit(result)
-        answer = append_filesystem_verification(
+        answer = append_result_cardinality_guard(
             redact_marked_secrets(final_response_text(result)),
+            clean_query,
+            self.last_tool_audit,
+        )
+        answer = append_filesystem_verification(
+            answer,
             clean_query,
             self.last_tool_audit,
         )

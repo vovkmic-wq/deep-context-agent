@@ -1,0 +1,28 @@
+Проведи отдельную проверку постоянной памяти после нового процесса.
+
+Вызови search_context ровно один раз с запросом:
+
+PERSISTENT_PHRASE_ЯНТАРНЫЙ_МАЯК_62941
+
+Сообщи точное количество результатов из ToolMessage. Не повторяй вызов при
+успехе, нулевом результате, ошибке или denied. Не используй другие tools.
+
+Не изменяй следующий JSON: это данные независимого runtime-аудита.
+
+<acceptance_manifest>
+{
+  "version": 2,
+  "exact_tool_call_counts": {
+    "search_context": 1
+  },
+  "required_events": [
+    {
+      "id": "persistent_phrase_found",
+      "tool": "search_context",
+      "target": "PERSISTENT_PHRASE_ЯНТАРНЫЙ_МАЯК_62941",
+      "statuses": ["success"],
+      "min_results": 1
+    }
+  ]
+}
+</acceptance_manifest>

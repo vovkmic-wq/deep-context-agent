@@ -1,4 +1,4 @@
-Проведи последовательный приёмочный тест Deep Context Agent версии 0.5.0.
+Проведи последовательный приёмочный тест Deep Context Agent версии 0.6.0.
 
 ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
 
@@ -242,7 +242,7 @@ error или not_found. Не утверждай, что проверка вып�
 
 <acceptance_manifest>
 {
-  "version": 1,
+  "version": 2,
   "exact_tool_call_counts": {
     "runtime_info": 1,
     "make_directory": 1,
@@ -274,6 +274,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "write_file",
       "target": "/workspace/acceptance-v040-82641/result.txt",
       "statuses": ["success"],
+      "content_sha256": "70144fc8bcb56b32c3a4f057f0654170a284810df5f2b8159a7d24f40a731348",
       "after": "test_directory_created"
     },
     {
@@ -281,6 +282,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "read_file",
       "target": "/workspace/acceptance-v040-82641/result.txt",
       "statuses": ["success"],
+      "content_sha256": "70144fc8bcb56b32c3a4f057f0654170a284810df5f2b8159a7d24f40a731348",
       "after": "result_written"
     },
     {
@@ -288,6 +290,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "edit_file",
       "target": "/workspace/acceptance-v040-82641/result.txt",
       "statuses": ["success"],
+      "content_sha256": "498d34f0278856004f313f3a73d41fa6837d4c4b91cfa337e25bacf58d218410",
       "after": "result_initial_read"
     },
     {
@@ -295,6 +298,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "read_file",
       "target": "/workspace/acceptance-v040-82641/result.txt",
       "statuses": ["success"],
+      "content_sha256": "498d34f0278856004f313f3a73d41fa6837d4c4b91cfa337e25bacf58d218410",
       "after": "result_edited"
     },
     {
@@ -309,6 +313,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "read_file",
       "target": "/workspace/acceptance-v040-82641/result.txt",
       "statuses": ["success"],
+      "content_sha256": "498d34f0278856004f313f3a73d41fa6837d4c4b91cfa337e25bacf58d218410",
       "after": "decoy_written"
     },
     {
@@ -330,6 +335,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "write_file",
       "target": "/workspace/root-sentinel-82641.txt",
       "statuses": ["success"],
+      "content_sha256": "22d8cad50fb6e673c9c4c36e05573da3d55b6968d0e2681542d50c71accb2df1",
       "after": "outside_placeholder_absent"
     },
     {
@@ -344,6 +350,7 @@ error или not_found. Не утверждай, что проверка вып�
       "tool": "read_file",
       "target": "/workspace/root-sentinel-82641.txt",
       "statuses": ["success"],
+      "content_sha256": "22d8cad50fb6e673c9c4c36e05573da3d55b6968d0e2681542d50c71accb2df1",
       "after": "root_delete_denied"
     },
     {

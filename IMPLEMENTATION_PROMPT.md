@@ -1,12 +1,24 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.5.0 находится в
-`ACCEPTANCE_CORRECTNESS_PROMPT.md`. Его требования имеют приоритет для
-исправления дефектов полного runtime acceptance-лога от 2026-08-23.
-`ACCEPTANCE_COMPLETION_PROMPT.md`, `ACCEPTANCE_RELIABILITY_PROMPT.md` и
-`PRODUCTION_HARDENING_PROMPT.md` сохраняются как история версий 0.4.0–0.2.0.
+Актуальный обязательный промпт версии 0.6.0 находится в
+`EVIDENCE_INTEGRITY_PROMPT.md`. Его требования имеют приоритет для исправления
+трёх дефектов restart/runtime audit от 2026-08-23.
+`ACCEPTANCE_CORRECTNESS_PROMPT.md`, `ACCEPTANCE_COMPLETION_PROMPT.md`,
+`ACCEPTANCE_RELIABILITY_PROMPT.md` и `PRODUCTION_HARDENING_PROMPT.md`
+сохраняются как история версий 0.5.0–0.2.0.
 
-## Краткий промпт исправления выявленных недостатков (2026-08-23)
+## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
+
+Исправь три дефекта Deep Context Agent: финальная cardinality обязана дословно
+совпадать со структурированным ToolMessage; manifest v2 обязан проверять
+`min_results` и SHA-256 точного содержимого без утечки тела; явный exact-once
+tool после первой попытки должен быть исключён из model request, а устаревший
+повтор provider — не исполнен. Обнови глобальный prompt, ТЗ, canonical/restart
+acceptance, версию и историю. Выполни Ruff, полный pytest, package/CLI/doctor,
+live acceptance и новый-process restart test. Исправляй сбои и повторяй весь
+контур до PASS, затем опубликуй проверенный commit.
+
+## Исторический краткий промпт 0.5.0 (2026-08-23)
 
 Исправь Deep Context Agent по runtime audit: ограничивай запрет чтения текущим
 отрицательным предложением, не запрещай путь следующей положительной
@@ -70,6 +82,11 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
     классификации запросов актуальных web-фактов. После начатого моделью root
     event ограничивай provider именем следующего prose-разрешённого ordered
     tool, не синтезируя write/edit-содержимое.
+12. После restart-аудита 0.5.0 обеспечь evidence integrity 0.6.0: сохраняй
+    безопасные `result_count` и `content_sha256`, поддерживай manifest v2 с
+    предикатами `min_results`/`content_sha256`, детерминированно исправляй
+    cardinality финального ответа и не исполняй повторный call после явного
+    контракта «ровно один раз» / `exactly once`.
 
 Инженерные ограничения:
 
@@ -95,6 +112,12 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
   предложения, даже если оба предложения находятся на одной строке;
 - planning-tool без функционального exact count допустим только при явном
   перечислении в `allowed_unlisted_tools` валидного manifest;
+- текст LLM о числе результатов не может переопределить структурированный
+  `result_count`; для прямого вопроса о количестве ответ формирует runtime;
+- точное содержимое acceptance-файла доказывается SHA-256 фактических байтов
+  внутри workspace без копирования содержимого в audit;
+- явный exact-once контракт означает одну фактическую попытку: завершённый tool
+  исключается из следующего model request, а устаревший повтор не исполняется;
 - не объявляй этап завершённым без команды или теста, подтверждающего результат.
 
 Финальный результат: устанавливаемый Python-проект, рабочий CLI Deep Agent,

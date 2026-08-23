@@ -3,6 +3,31 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.6.0] — 2026-08-23
+
+### Добавлено
+
+- Структурированные безопасные audit-поля `result_count` и
+  `content_sha256`; тела файлов и найденные фрагменты в audit не копируются.
+- Acceptance manifest v2 с required-предикатами `min_results` и
+  `content_sha256` при сохранении совместимости manifest v1.
+- Детерминированный cardinality guard: прямой ответ о числе результатов
+  формируется из ToolMessage evidence, а не из текста LLM.
+- Exact-once middleware для явных инструкций `ровно один раз`/`exactly once`:
+  завершённый tool исключается из следующего model request, устаревший повтор
+  provider не исполняется.
+- Отдельный `restart-acceptance-prompt.txt` с exact count 1 и
+  `min_results=1` для межпроцессной проверки SQLite-памяти.
+
+### Исправлено
+
+- Финальный ответ больше не может сообщить `0` при фактическом ненулевом
+  результате `search_context`: runtime заменяет count авторитетным значением.
+- Запрос exact-once больше не создаёт второй policy-denied audit event после
+  уже полученного ToolMessage.
+- Canonical acceptance доказывает точные байты result/sentinel через SHA-256,
+  а не только успешный status чтения или записи.
+
 ## [0.5.0] — 2026-08-23
 
 ### Добавлено
