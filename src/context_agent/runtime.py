@@ -27,7 +27,7 @@ from langchain.agents.middleware.types import (
     ToolCallRequest,
 )
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from context_agent.config import AppConfig, ProviderConfig
@@ -295,6 +295,9 @@ class SequentialToolCallMiddleware(AgentMiddleware):
 
     name = "sequential_tool_calls"
 
+    def __init__(self, *, send_parallel_tool_calls: bool = True) -> None:
+        self.send_parallel_tool_calls = send_parallel_tool_calls
+
     def wrap_model_call(
         self,
         request: ModelRequest,
@@ -303,7 +306,7 @@ class SequentialToolCallMiddleware(AgentMiddleware):
         """Disable parallel calls and discard surplus calls defensively."""
 
         model_settings = dict(request.model_settings)
-        if request.tools:
+        if request.tools and self.send_parallel_tool_calls:
             model_settings["parallel_tool_calls"] = False
         else:
             model_settings.pop("parallel_tool_calls", None)
@@ -329,6 +332,141 @@ class SequentialToolCallMiddleware(AgentMiddleware):
             result=messages,
             structured_response=response.structured_response,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderModelTarget:
+    """One non-secret provider configuration paired with its chat model."""
+
+    config: ProviderConfig
+    model: BaseChatModel
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderFailure:
+    """Sanitized record of one failed provider attempt."""
+
+    provider: str
+    model: str
+    error_type: str
+
+
+_ACTIVE_PROVIDER_BLOCK_PATTERN = re.compile(
+    r"\n*<active_llm_provider>.*?</active_llm_provider>",
+    re.DOTALL,
+)
+
+
+class ProviderFailoverMiddleware(AgentMiddleware):
+    """Try configured chat providers in priority order without replaying tools."""
+
+    name = "provider_priority_failover"
+
+    def __init__(self, targets: Sequence[ProviderModelTarget]) -> None:
+        if not targets:
+            raise ValueError("At least one provider target is required")
+        self.targets = tuple(targets)
+        self.reset()
+
+    @property
+    def active_target(self) -> ProviderModelTarget:
+        """Return the provider selected by the latest successful model call."""
+
+        return self.targets[self._active_index]
+
+    def reset(self) -> None:
+        """Restore configured priority at the beginning of a user turn."""
+
+        self._active_index = 0
+        self.failures: list[ProviderFailure] = []
+
+    def runtime_metadata(self) -> dict[str, Any]:
+        """Return dynamic, non-secret provider chain diagnostics."""
+
+        active = self.active_target.config
+        return {
+            "provider": active.name,
+            "model": active.model,
+            "base_url": active.base_url,
+            "provider_priority": [
+                {
+                    "provider": target.config.name,
+                    "model": target.config.model,
+                    "base_url": target.config.base_url,
+                }
+                for target in self.targets
+            ],
+            "failover_count": len(self.failures),
+            "failed_providers": [failure.provider for failure in self.failures],
+        }
+
+    def _request_for_target(
+        self,
+        request: ModelRequest,
+        target_index: int,
+    ) -> ModelRequest:
+        target = self.targets[target_index]
+        model = request.model if target_index == 0 else target.model
+        model_settings = dict(request.model_settings)
+        if target.config.name == "zhipu" or not request.tools:
+            model_settings.pop("parallel_tool_calls", None)
+        else:
+            model_settings["parallel_tool_calls"] = False
+
+        active_block = (
+            "<active_llm_provider>\n"
+            "Trusted identity for this model step:\n"
+            f"- provider: {target.config.name}\n"
+            f"- model: {target.config.model}\n"
+            f"- base_url: {target.config.base_url}\n"
+            "</active_llm_provider>"
+        )
+        original_system = (
+            message_text(request.system_message) if request.system_message else ""
+        )
+        system_content = _ACTIVE_PROVIDER_BLOCK_PATTERN.sub("", original_system)
+        system_message = SystemMessage(
+            content=f"{system_content.rstrip()}\n\n{active_block}".lstrip()
+        )
+        return request.override(
+            model=model,
+            model_settings=model_settings,
+            system_message=system_message,
+        )
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Use sticky per-turn failover and expose only sanitized failures."""
+
+        turn_failures: list[ProviderFailure] = []
+        last_exception: Exception | None = None
+        for target_index in range(self._active_index, len(self.targets)):
+            target = self.targets[target_index]
+            try:
+                response = handler(self._request_for_target(request, target_index))
+            except Exception as exc:
+                last_exception = exc
+                failure = ProviderFailure(
+                    provider=target.config.name,
+                    model=target.config.model,
+                    error_type=type(exc).__name__,
+                )
+                self.failures.append(failure)
+                turn_failures.append(failure)
+                continue
+            self._active_index = target_index
+            return response
+
+        if len(self.targets) == 1 and last_exception is not None:
+            raise last_exception
+        summary = ", ".join(
+            f"{failure.provider}/{failure.model} ({failure.error_type})"
+            for failure in turn_failures
+        )
+        raise AgentError(f"All configured LLM providers failed: {summary}")
 
 
 class ExactOnceToolMiddleware(AgentMiddleware):
@@ -626,15 +764,21 @@ def load_system_prompt() -> str:
 def build_system_prompt(
     provider_config: ProviderConfig,
     current_time: datetime | None = None,
+    provider_configs: Sequence[ProviderConfig] | None = None,
 ) -> str:
     """Add trusted runtime identity to the versioned global prompt."""
 
     trusted_time = current_time or datetime.now().astimezone()
+    priority = tuple(provider_configs or (provider_config,))
+    priority_text = " > ".join(f"{config.name}/{config.model}" for config in priority)
     identity = (
         "Trusted runtime identity (repeat these exact values when asked):\n"
         f"- provider: {provider_config.name}\n"
         f"- model: {provider_config.model}\n"
         f"- base_url: {provider_config.base_url}\n"
+        f"- provider_priority: {priority_text}\n"
+        "- failover_policy: retry each model call, then use the next provider; "
+        "the successful fallback remains active for the current user turn\n"
         f"- current_date: {trusted_time.date().isoformat()}\n"
         f"- local_timezone: {trusted_time.tzname() or 'unknown'}\n"
         "- virtual_workspace: /workspace/\n"
@@ -1965,13 +2109,45 @@ class AgentRuntime:
         app_config: AppConfig,
         provider_config: ProviderConfig,
         *,
+        fallback_provider_configs: Sequence[ProviderConfig] = (),
         model: BaseChatModel | None = None,
+        fallback_models: Sequence[BaseChatModel] | None = None,
         search_client_factory: SearchClientFactory | None = None,
         page_fetcher: PageFetcher | None = None,
         pypi_fetcher: PypiFetcher | None = None,
     ) -> None:
         self.app_config = app_config
         self.provider_config = provider_config
+        self.provider_configs = (provider_config, *fallback_provider_configs)
+        provider_names = [config.name for config in self.provider_configs]
+        if len(provider_names) != len(set(provider_names)):
+            raise ValueError("Provider failover chain contains duplicates")
+        if fallback_models is not None and len(fallback_models) != len(
+            fallback_provider_configs
+        ):
+            raise ValueError(
+                "fallback_models must match fallback_provider_configs in length"
+            )
+        primary_model = model or create_chat_model(provider_config)
+        resolved_fallback_models = (
+            tuple(fallback_models)
+            if fallback_models is not None
+            else tuple(
+                create_chat_model(config) for config in fallback_provider_configs
+            )
+        )
+        provider_models = (primary_model, *resolved_fallback_models)
+        provider_failover_middleware = ProviderFailoverMiddleware(
+            tuple(
+                ProviderModelTarget(config=config, model=chat_model)
+                for config, chat_model in zip(
+                    self.provider_configs,
+                    provider_models,
+                    strict=True,
+                )
+            )
+        )
+        self._provider_failover_middleware = provider_failover_middleware
         self.app_config.prepare_directories()
         self.context_store = ContextStore(
             self.app_config.context_database,
@@ -2011,20 +2187,20 @@ class AgentRuntime:
             tool_kwargs["page_fetcher"] = page_fetcher
         if pypi_fetcher is not None:
             tool_kwargs["pypi_fetcher"] = pypi_fetcher
+        runtime_static_metadata = {
+            "current_date": datetime.now().astimezone().date().isoformat(),
+            "virtual_workspace": "/workspace/",
+            "memory_scope": (
+                "persistent SQLite archive searchable across restarts and thread IDs"
+            ),
+        }
         tools = build_agent_tools(
             self.context_store,
             self.app_config.workspace,
             default_context_limit=self.app_config.context_top_k,
-            runtime_metadata={
-                "provider": self.provider_config.name,
-                "model": self.provider_config.model,
-                "base_url": self.provider_config.base_url,
-                "current_date": datetime.now().astimezone().date().isoformat(),
-                "virtual_workspace": "/workspace/",
-                "memory_scope": (
-                    "persistent SQLite archive searchable across restarts and "
-                    "thread IDs"
-                ),
+            runtime_metadata_factory=lambda: {
+                **provider_failover_middleware.runtime_metadata(),
+                **runtime_static_metadata,
             },
             web_retry_attempts=self.app_config.web_retry_attempts,
             **tool_kwargs,
@@ -2038,11 +2214,13 @@ class AgentRuntime:
         self._tool_audit_middleware = tool_audit_middleware
         tool_call_policy_middleware = ToolCallPolicyMiddleware()
         self._tool_call_policy_middleware = tool_call_policy_middleware
-        chat_model = model or create_chat_model(self.provider_config)
         self.agent = create_deep_agent(
-            model=chat_model,
+            model=primary_model,
             tools=tools,
-            system_prompt=build_system_prompt(self.provider_config),
+            system_prompt=build_system_prompt(
+                self.provider_config,
+                provider_configs=self.provider_configs,
+            ),
             backend=backend,
             checkpointer=checkpointer,
             middleware=[
@@ -2050,11 +2228,14 @@ class AgentRuntime:
                 AcceptanceCompletionMiddleware(),
                 ExactOnceToolMiddleware(),
                 ExplicitToolBudgetMiddleware(),
-                SequentialToolCallMiddleware(),
+                SequentialToolCallMiddleware(
+                    send_parallel_tool_calls=self.provider_config.name != "zhipu"
+                ),
                 ExactDirectoryRemovalMiddleware(),
                 tool_audit_middleware,
                 tool_call_policy_middleware,
                 ExactReadPathMiddleware(),
+                provider_failover_middleware,
                 ModelRetryMiddleware(
                     max_retries=self.app_config.model_call_retries,
                     on_failure="error",
@@ -2198,6 +2379,7 @@ class AgentRuntime:
         self.last_tool_audit = ()
         self._tool_audit_middleware.reset()
         self._tool_call_policy_middleware.reset()
+        self._provider_failover_middleware.reset()
         if is_incomplete_mutation_request(clean_query):
             clarification = (
                 "Команда не выполнена: после двоеточия или указания точного "

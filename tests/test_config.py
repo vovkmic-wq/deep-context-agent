@@ -21,7 +21,7 @@ from context_agent.providers import create_chat_model
         (
             "openai",
             {"OPENAI_API_KEY": "secret-openai"},
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "https://api.openai.com/v1",
         ),
         (
@@ -45,6 +45,18 @@ from context_agent.providers import create_chat_model
             "qwen3.7-plus",
             "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         ),
+        (
+            "zhipu",
+            {"ZAI_API_KEY": "secret-zhipu"},
+            "glm-5.3",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        (
+            "glm",
+            {"ZAI_API_KEY": "secret-glm"},
+            "glm-5.3",
+            "https://api.z.ai/api/paas/v4",
+        ),
     ],
 )
 def test_provider_configuration(
@@ -57,6 +69,46 @@ def test_provider_configuration(
     assert config.model == expected_model
     assert config.base_url == expected_url
     assert "secret" not in repr(config)
+
+
+def test_glm_alias_uses_canonical_provider_name() -> None:
+    config = ProviderConfig.from_env("glm", {"ZAI_API_KEY": "secret"})
+    assert config.name == "zhipu"
+    assert config.extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_openai_gpt_5_6_disables_reasoning_for_chat_tool_calls() -> None:
+    provider = ProviderConfig.from_env(
+        "openai",
+        {"OPENAI_API_KEY": "secret"},
+    )
+    model = create_chat_model(provider)
+    assert provider.reasoning_effort == "none"
+    assert model.reasoning_effort == "none"
+
+
+def test_openai_reasoning_effort_can_be_overridden() -> None:
+    provider = ProviderConfig.from_env(
+        "openai",
+        {
+            "OPENAI_API_KEY": "secret",
+            "OPENAI_REASONING_EFFORT": "low",
+        },
+    )
+    assert provider.reasoning_effort == "low"
+
+
+def test_zhipu_legacy_environment_aliases_are_supported() -> None:
+    config = ProviderConfig.from_env(
+        "zhipu",
+        {
+            "ZHIPU_API_KEY": "secret",
+            "ZHIPU_MODEL": "glm-custom",
+            "ZHIPU_BASE_URL": "https://example.invalid/v4/",
+        },
+    )
+    assert config.model == "glm-custom"
+    assert config.base_url == "https://example.invalid/v4"
 
 
 def test_yandex_explicit_model_uri_takes_precedence() -> None:
@@ -78,6 +130,8 @@ def test_yandex_explicit_model_uri_takes_precedence() -> None:
         ("yandex", {"YANDEX_FOLDER_ID": "folder"}),
         ("deepseek", {}),
         ("qwen", {}),
+        ("zhipu", {}),
+        ("glm", {}),
     ],
 )
 def test_remote_provider_requires_key(
@@ -91,6 +145,87 @@ def test_remote_provider_requires_key(
 def test_unknown_provider_is_rejected() -> None:
     with pytest.raises(ConfigurationError, match="Unknown provider"):
         ProviderConfig.from_env("unknown", {})
+
+
+def test_provider_priority_uses_explicit_order_and_canonical_alias() -> None:
+    providers = ProviderConfig.priority_from_env(
+        providers="openai, glm, deepseek",
+        environ={
+            "OPENAI_API_KEY": "openai-secret",
+            "ZAI_API_KEY": "zhipu-secret",
+            "DEEPSEEK_API_KEY": "deepseek-secret",
+        },
+    )
+    assert [provider.name for provider in providers] == [
+        "openai",
+        "zhipu",
+        "deepseek",
+    ]
+
+
+def test_default_provider_priority_is_glm_then_openai() -> None:
+    providers = ProviderConfig.priority_from_env(
+        environ={
+            "ZAI_API_KEY": "zhipu-secret",
+            "OPENAI_API_KEY": "openai-secret",
+        }
+    )
+    assert [(provider.name, provider.model) for provider in providers] == [
+        ("zhipu", "glm-5.3"),
+        ("openai", "gpt-5.6-sol"),
+    ]
+
+
+def test_provider_priority_environment_precedes_legacy_default() -> None:
+    providers = ProviderConfig.priority_from_env(
+        environ={
+            "AGENT_PROVIDER": "lmstudio",
+            "AGENT_PROVIDER_PRIORITY": "qwen,openai",
+            "DASHSCOPE_API_KEY": "qwen-secret",
+            "OPENAI_API_KEY": "openai-secret",
+        }
+    )
+    assert [provider.name for provider in providers] == ["qwen", "openai"]
+
+
+def test_blank_environment_priority_uses_single_provider() -> None:
+    providers = ProviderConfig.priority_from_env(
+        environ={
+            "AGENT_PROVIDER": "openai",
+            "AGENT_PROVIDER_PRIORITY": "  ",
+            "OPENAI_API_KEY": "openai-secret",
+        }
+    )
+    assert [provider.name for provider in providers] == ["openai"]
+
+
+@pytest.mark.parametrize("priority", ["", ",openai", "openai,", "openai,,glm"])
+def test_provider_priority_rejects_empty_entries(priority: str) -> None:
+    with pytest.raises(ConfigurationError, match="comma-separated"):
+        ProviderConfig.priority_from_env(
+            providers=priority,
+            environ={"OPENAI_API_KEY": "secret", "ZAI_API_KEY": "secret"},
+        )
+
+
+def test_provider_priority_rejects_duplicate_aliases() -> None:
+    with pytest.raises(ConfigurationError, match="repeated"):
+        ProviderConfig.priority_from_env(
+            providers="zhipu,glm",
+            environ={"ZAI_API_KEY": "secret"},
+        )
+
+
+@pytest.mark.parametrize("temperature", ["0", "-0.1", "1.1"])
+def test_zhipu_rejects_unsupported_temperature(temperature: str) -> None:
+    with pytest.raises(ConfigurationError, match="TEMPERATURE"):
+        ProviderConfig.from_env(
+            "zhipu",
+            {
+                "ZAI_API_KEY": "secret",
+                "AGENT_MODEL_TEMPERATURE": temperature,
+            },
+        )
 
 
 def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
@@ -144,4 +279,16 @@ def test_chat_model_factory_preserves_compatible_settings() -> None:
     assert model.model_name == "deepseek-v4-flash"
     assert str(model.openai_api_base) == "https://api.deepseek.com"
     assert model.extra_body == {"thinking": {"type": "disabled"}}
+    assert model.max_retries == 0
+
+
+def test_chat_model_factory_preserves_zhipu_thinking_settings() -> None:
+    provider = ProviderConfig.from_env(
+        "glm",
+        {"ZAI_API_KEY": "secret"},
+    )
+    model = create_chat_model(provider)
+    assert model.model_name == "glm-5.3"
+    assert str(model.openai_api_base) == "https://api.z.ai/api/paas/v4"
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
     assert model.max_retries == 0

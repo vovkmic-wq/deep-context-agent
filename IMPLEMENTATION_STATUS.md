@@ -3,6 +3,15 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Default GLM/OpenAI chain 0.11.0 — 2026-08-24
+
+- Основная модель по умолчанию: `zhipu/glm-5.3`.
+- Резервная модель по умолчанию: `openai/gpt-5.6-sol`.
+- Порядок failover без CLI/env override: `glm,openai`.
+- Default Z.AI endpoint: `https://api.z.ai/api/paas/v4`.
+- GPT-5.6 Sol Chat Completions tool calls используют `reasoning_effort=none`.
+- Локальная `.env.local` синхронизирована без раскрытия ключей.
+
 | Этап | Статус | Проверка | Примечание |
 | --- | --- | --- | --- |
 | 1. ТЗ и промпты | Завершён | `TECHNICAL_SPEC.md`, `IMPLEMENTATION_PROMPT.md`, `EVIDENCE_INTEGRITY_PROMPT.md` | Глобальный prompt и критерии приёмки синхронизированы с дефектами ручных и live-логов |
@@ -267,3 +276,55 @@ events, однако сделал три `search_context`: строка prompt �
 2 `search_context`, temp worktree чист. Внешние проверки Ozon: Ruff lint PASS,
 57 pytest PASS; один `ruff format --check` drift в exporter существовал уже в
 baseline. Исходный Ozon-проект не изменялся.
+
+## GLM-5.2 / Zhipu integration 0.9.0 — 2026-08-24
+
+- Добавлены канонический provider `zhipu` и CLI-алиас `glm`; оба разрешаются в
+  runtime identity как `zhipu` с моделью `glm-5.2`.
+- Поддержаны официальные `ZAI_API_KEY`, `ZAI_MODEL`, `ZAI_BASE_URL` и
+  совместимые `ZHIPU_*` aliases. Стандартный endpoint и Coding Plan endpoint
+  выбираются конфигурацией, секрет не хранится в репозитории.
+- Thinking включён через `extra_body`, а недопустимая для Zhipu температура
+  отклоняется до сетевого запроса.
+- Недокументированный Zhipu-параметр `parallel_tool_calls` не отправляется;
+  defensive response normalization по-прежнему оставляет один tool call.
+- `ruff check --no-cache .` — PASS; `ruff format --check --no-cache .` — 31
+  файл отформатирован; `pytest -ra` — 122 passed, 1 planned Windows symlink
+  skip.
+- CLI `doctor` для `--provider glm` и `--provider zhipu` — PASS с тестовым
+  несекретным ключом; оба показали модель `glm-5.2` и официальный base URL.
+- Изолированно собран `deep_context_agent-0.9.0-py3-none-any.whl`, SHA-256
+  `52C2986B90E7400DB8F9D6E6641241FC81344280B200AD6F6872E437CEFAFDB8`.
+- Реальный `doctor --live` не выполнялся: `ZAI_API_KEY`/`ZHIPU_API_KEY` не
+  настроен ни в процессе, ни в `.env.local`. Это явное внешнее условие, а не
+  дефект кода; live-проверка должна быть выполнена после локальной установки
+  ключа без его вывода.
+
+## Provider priority and failover 0.10.0 — 2026-08-24
+
+- Добавлены взаимоисключающие `--provider` и `--providers`, а также
+  `AGENT_PROVIDER_PRIORITY`; порядок списка задаёт порядок model calls.
+- Конфигурация отклоняет пустые элементы, неизвестные имена и канонические
+  дубликаты aliases. Пустая env-строка означает отключённую цепочку и сохраняет
+  одиночный `AGENT_PROVIDER`.
+- `ProviderFailoverMiddleware` даёт каждому провайдеру настроенные model-call
+  retries, затем безопасно переключается на следующий. Успешный fallback
+  закрепляется на текущий ход и сбрасывается к primary перед следующим ходом.
+- Failover расположен только в model-call middleware: уже выполненные tools не
+  переигрываются. Runtime identity и `runtime_info` отражают активный provider,
+  полный приоритет, число failover и неуспешные имена без API-ответов/ключей.
+- Одиночный provider сохраняет прежнее исключение для обратной совместимости;
+  полная ошибка много-провайдерной цепочки содержит только provider/model и
+  безопасный тип исключения.
+- `ruff check --no-cache .` — PASS; `ruff format --check --no-cache .` — 31
+  файл отформатирован; `pytest -ra` — 135 passed, 1 planned Windows symlink
+  skip.
+- CLI doctor с тестовыми ключами корректно показал приоритет
+  `openai,zhipu,deepseek`. Реальный `doctor --live` на существующем локальном
+  OpenAI key и цепочке `openai,lmstudio` вернул `live_provider=openai` и `OK`.
+- Изолированный runtime live-test с приоритетом `lmstudio,openai`, новой БД и
+  timeout 15 секунд подтвердил настоящий failover:
+  `answer=FAILOVER_RUNTIME_OK`, `active_provider=openai`, `failover_count=1`,
+  `failed_providers=lmstudio`.
+- Собран `deep_context_agent-0.10.0-py3-none-any.whl`, SHA-256
+  `35A0766EF1CFE06D3599649CD1C9F646C077749EFDF8BFEE85731D2D627AA5E8`.

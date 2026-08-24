@@ -67,6 +67,15 @@ def _provider_config() -> ProviderConfig:
     )
 
 
+def _fallback_provider_config() -> ProviderConfig:
+    return ProviderConfig(
+        name="zhipu",
+        model="glm-5.3",
+        base_url="https://open.bigmodel.cn/api/paas/v4",
+        api_key="test-fallback",
+    )
+
+
 def test_message_text_supports_content_blocks() -> None:
     assert message_text(AIMessage(content=[{"type": "text", "text": "hello"}])) == (
         "hello"
@@ -87,6 +96,108 @@ def test_system_prompt_contains_trusted_runtime_identity() -> None:
     assert "model: test-model" in prompt
     assert "persistent SQLite archive" in prompt
     assert "current_date: 2026-08-22" in prompt
+
+
+def test_system_prompt_contains_ordered_provider_priority() -> None:
+    prompt = build_system_prompt(
+        _provider_config(),
+        datetime(2026, 8, 22, tzinfo=UTC),
+        (_provider_config(), _fallback_provider_config()),
+    )
+    assert "provider_priority: lmstudio/test-model > zhipu/glm-5.3" in prompt
+    assert "successful fallback remains active" in prompt
+
+
+def test_runtime_fails_over_and_sticks_to_successful_provider(
+    tmp_path: Path,
+) -> None:
+    primary = SequenceChatModel(
+        responses=[AIMessage(content="primary must not answer")],
+        failures_remaining=1,
+    )
+    fallback = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "runtime_info",
+                        "args": {},
+                        "id": "call-fallback-runtime",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="fallback complete"),
+        ]
+    )
+    app_config = replace(
+        _app_config(tmp_path),
+        model_call_retries=0,
+        model_retry_initial_delay=0,
+        model_retry_max_delay=0,
+    )
+
+    with AgentRuntime(
+        app_config,
+        _provider_config(),
+        fallback_provider_configs=(_fallback_provider_config(),),
+        model=primary,
+        fallback_models=(fallback,),
+    ) as runtime:
+        answer = runtime.ask("Report trusted runtime information")
+        metadata = runtime._provider_failover_middleware.runtime_metadata()
+
+    assert answer.startswith("fallback complete")
+    assert primary.generation_attempts == 1
+    assert fallback.generation_attempts == 2
+    assert metadata["provider"] == "zhipu"
+    assert metadata["failover_count"] == 1
+    assert metadata["failed_providers"] == ["lmstudio"]
+    assert fallback.bound_tool_kwargs_batches
+    assert all(
+        "parallel_tool_calls" not in batch
+        for batch in fallback.bound_tool_kwargs_batches
+    )
+    first_system_message = message_text(fallback.received_message_batches[0][0])
+    assert "<active_llm_provider>" in first_system_message
+    assert "provider: zhipu" in first_system_message
+
+
+def test_runtime_reports_sanitized_error_when_all_providers_fail(
+    tmp_path: Path,
+) -> None:
+    primary = SequenceChatModel(
+        responses=[AIMessage(content="unused")],
+        failures_remaining=1,
+    )
+    fallback = SequenceChatModel(
+        responses=[AIMessage(content="unused")],
+        failures_remaining=1,
+    )
+    app_config = replace(
+        _app_config(tmp_path),
+        model_call_retries=0,
+        model_retry_initial_delay=0,
+        model_retry_max_delay=0,
+    )
+
+    with (
+        AgentRuntime(
+            app_config,
+            _provider_config(),
+            fallback_provider_configs=(_fallback_provider_config(),),
+            model=primary,
+            fallback_models=(fallback,),
+        ) as runtime,
+        pytest.raises(AgentError) as error,
+    ):
+        runtime.ask("ALL_PROVIDERS_FAIL")
+
+    message = str(error.value)
+    assert "lmstudio/test-model (TimeoutError)" in message
+    assert "zhipu/glm-5.3 (TimeoutError)" in message
+    assert "transient model timeout" not in message
 
 
 def test_mutation_answer_without_tool_has_explicit_unverified_report() -> None:
@@ -726,6 +837,28 @@ def test_sequential_middleware_omits_parallel_setting_without_tools() -> None:
         return ModelResponse(result=[AIMessage(content="done")])
 
     response = SequentialToolCallMiddleware().wrap_model_call(request, handler)
+
+    assert response.result[0].content == "done"
+    assert "parallel_tool_calls" not in captured
+
+
+def test_sequential_middleware_omits_unsupported_parallel_setting() -> None:
+    model = SequenceChatModel(responses=[AIMessage(content="done")])
+    request = ModelRequest(
+        model=model,
+        messages=[],
+        tools=[{"name": "runtime_info"}],
+        model_settings={"parallel_tool_calls": False},
+    )
+    captured: dict[str, Any] = {}
+
+    def handler(current: ModelRequest) -> ModelResponse:
+        captured.update(current.model_settings)
+        return ModelResponse(result=[AIMessage(content="done")])
+
+    response = SequentialToolCallMiddleware(
+        send_parallel_tool_calls=False
+    ).wrap_model_call(request, handler)
 
     assert response.result[0].content == "done"
     assert "parallel_tool_calls" not in captured

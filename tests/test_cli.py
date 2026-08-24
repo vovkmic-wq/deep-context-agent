@@ -11,10 +11,24 @@ import pytest
 
 from context_agent.cli import (
     MAX_PROMPT_FILE_BYTES,
+    build_parser,
     read_chat_query,
     read_prompt_file,
     resolve_ask_query,
 )
+
+
+def test_cli_accepts_ordered_provider_chain() -> None:
+    args = build_parser().parse_args(["--providers", "openai,glm,deepseek", "doctor"])
+    assert args.provider is None
+    assert args.providers == "openai,glm,deepseek"
+
+
+def test_cli_rejects_single_and_priority_provider_together() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["--provider", "openai", "--providers", "glm,qwen", "doctor"]
+        )
 
 
 def test_chat_paste_mode_returns_one_multiline_query(

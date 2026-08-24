@@ -200,7 +200,7 @@ def fetch_public_web_page(
         safe_url,
         headers={
             "Accept": "text/html,text/plain,application/json,application/xml",
-            "User-Agent": "DeepContextAgent/0.8.4 (+public-page-reader)",
+            "User-Agent": "DeepContextAgent/0.11.0 (+public-page-reader)",
         },
     )
     try:
@@ -275,7 +275,7 @@ def fetch_pypi_package_info(
         api_url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "DeepContextAgent/0.8.4 (+pypi-metadata-reader)",
+            "User-Agent": "DeepContextAgent/0.11.0 (+pypi-metadata-reader)",
         },
     )
     try:
@@ -424,7 +424,8 @@ def build_agent_tools(
     search_client_factory: SearchClientFactory = DDGS,
     page_fetcher: PageFetcher = fetch_public_web_page,
     pypi_fetcher: PypiFetcher = fetch_pypi_package_info,
-    runtime_metadata: Mapping[str, str] | None = None,
+    runtime_metadata: Mapping[str, Any] | None = None,
+    runtime_metadata_factory: Callable[[], Mapping[str, Any]] | None = None,
     web_retry_attempts: int = 3,
 ) -> list[StructuredTool]:
     """Build tools bound to one private context store and filesystem root."""
@@ -434,7 +435,12 @@ def build_agent_tools(
     def runtime_info() -> str:
         """Return trusted, non-secret runtime identity and memory metadata."""
 
-        return json.dumps(safe_runtime_metadata, ensure_ascii=False, sort_keys=True)
+        metadata = (
+            dict(runtime_metadata_factory())
+            if runtime_metadata_factory is not None
+            else safe_runtime_metadata
+        )
+        return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
 
     def search_context(
         query: str,

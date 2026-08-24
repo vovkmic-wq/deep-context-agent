@@ -2,8 +2,8 @@
 
 CLI-агент на Python и Deep Agents с долговременным SQLite-контекстом,
 поиском и безопасным чтением публичных веб-страниц, а также ограниченной
-файловой системой. Поддерживаются LM Studio,
-OpenAI, YandexGPT, DeepSeek и Qwen через OpenAI-compatible API.
+файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
+Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
 ## Как устроен большой контекст
 
@@ -47,7 +47,8 @@ Copy-Item .env.example .env.local
 Общий выбор:
 
 ```dotenv
-AGENT_PROVIDER=lmstudio
+# Цепочка по умолчанию: GLM-5.3, затем GPT-5.6 Sol:
+AGENT_PROVIDER_PRIORITY=glm,openai
 AGENT_WORKSPACE=./agent_workspace
 AGENT_CONTEXT_ROOT=./agent_workspace
 AGENT_DATA_DIR=./.agent_data
@@ -62,6 +63,16 @@ AGENT_WEB_RETRY_ATTEMPTS=3
 
 Для совместимости также принимается старое имя `AGENT_RETRIEVAL_LIMIT`, но при
 одновременном задании приоритет имеет `AGENT_CONTEXT_TOP_K`.
+
+Без явных настроек используется цепочка `glm,openai`: основная модель
+`glm-5.3`, резервная — `gpt-5.6-sol`. `AGENT_PROVIDER` выбирает один провайдер.
+`AGENT_PROVIDER_PRIORITY` включает
+автоматический failover и имеет приоритет над `AGENT_PROVIDER`. Все удалённые
+провайдеры из цепочки должны иметь настроенные ключи. Повторы одного model call
+сначала исчерпываются у текущего провайдера; затем используется следующий.
+Успешный fallback остаётся активным до конца текущего пользовательского хода,
+а новый ход снова начинается с первого провайдера. Выполненные tools при
+переключении модели не запускаются повторно.
 
 ### LM Studio
 
@@ -80,9 +91,15 @@ LM_STUDIO_API_KEY=
 
 ```dotenv
 OPENAI_API_KEY=<секрет>
-OPENAI_MODEL=gpt-5.5
+OPENAI_MODEL=gpt-5.6-sol
+OPENAI_REASONING_EFFORT=none
 OPENAI_BASE_URL=https://api.openai.com/v1
 ```
+
+Для `gpt-5.6-sol` используется `reasoning_effort=none`, потому что резервный
+маршрут работает через Chat Completions с function tools. Значение можно
+переопределить, но ненулевой effort несовместим с этой комбинацией endpoint и
+tools; для reasoning с tools требуется отдельная миграция на Responses API.
 
 ### Yandex AI Studio / YandexGPT
 
@@ -119,6 +136,22 @@ QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 Для новых workspace-specific endpoint замените `QWEN_BASE_URL` значением из
 консоли Model Studio. Thinking по умолчанию отключён для tool calling.
 
+### Zhipu AI / GLM-5.3
+
+Провайдер можно выбрать как `zhipu` или коротким алиасом `glm`. В runtime
+используется каноническое имя `zhipu`.
+
+```dotenv
+ZAI_API_KEY=<секрет>
+ZAI_MODEL=glm-5.3
+ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+```
+
+Поддерживаются также прежние имена `ZHIPU_API_KEY`, `ZHIPU_MODEL` и
+`ZHIPU_BASE_URL`, но приоритет имеют `ZAI_*`. Для ключа GLM Coding Plan задайте
+`ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4`. Thinking включён;
+`AGENT_MODEL_TEMPERATURE` должен быть больше `0` и не больше `1`.
+
 ## Использование
 
 ```powershell
@@ -127,6 +160,19 @@ QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
 # Небольшой реальный запрос к модели
 .\.venv\Scripts\context-agent.exe --provider openai doctor --live
+
+# Цепочка по умолчанию: GLM-5.3 -> GPT-5.6 Sol
+.\.venv\Scripts\context-agent.exe `
+  --providers "glm,openai" `
+  doctor --live
+.\.venv\Scripts\context-agent.exe `
+  --providers "glm,openai" `
+  --thread priority-main `
+  chat
+
+# Проверка GLM-5.3 и запуск интерактивного чата
+.\.venv\Scripts\context-agent.exe --provider glm doctor --live
+.\.venv\Scripts\context-agent.exe --provider glm --thread glm-main chat
 
 # Индексировать всю разрешённую директорию или отдельный файл
 .\.venv\Scripts\context-agent.exe index .
@@ -213,7 +259,7 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 - Явно оборванная изменяющая команда отклоняется до модели и tools; отсутствующее
   содержимое не угадывается.
 
-Версия 0.8.4 готова для production-эксплуатации как локальный однопользовательский
+Версия 0.11.0 готова для production-эксплуатации как локальный однопользовательский
 CLI в границах `AGENT_WORKSPACE`. Для многопользовательского сервиса добавьте
 процессную изоляцию workspace, аутентификацию, лимиты запросов, централизованные
 логи и human-in-the-loop для необратимых действий.

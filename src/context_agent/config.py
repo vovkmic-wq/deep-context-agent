@@ -10,7 +10,17 @@ from typing import Any
 
 from context_agent.errors import ConfigurationError
 
-SUPPORTED_PROVIDERS = ("lmstudio", "openai", "yandex", "deepseek", "qwen")
+CANONICAL_PROVIDERS = (
+    "lmstudio",
+    "openai",
+    "yandex",
+    "deepseek",
+    "qwen",
+    "zhipu",
+)
+PROVIDER_ALIASES = {"glm": "zhipu"}
+SUPPORTED_PROVIDERS = (*CANONICAL_PROVIDERS, *PROVIDER_ALIASES)
+DEFAULT_PROVIDER_PRIORITY = ("glm", "openai")
 
 
 def _absolute_path(value: str, base_dir: Path) -> Path:
@@ -62,9 +72,10 @@ class ProviderConfig:
     temperature: float = 0.1
     timeout: float = 120.0
     extra_body: dict[str, Any] = field(default_factory=dict)
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
-        if self.name not in SUPPORTED_PROVIDERS:
+        if self.name not in CANONICAL_PROVIDERS:
             supported = ", ".join(SUPPORTED_PROVIDERS)
             raise ConfigurationError(
                 f"Unknown provider '{self.name}'. Supported: {supported}"
@@ -75,6 +86,11 @@ class ProviderConfig:
             raise ConfigurationError("Provider base URL must use HTTP or HTTPS")
         if self.timeout <= 0:
             raise ConfigurationError("Request timeout must be positive")
+        if self.name == "zhipu" and not 0 < self.temperature <= 1:
+            raise ConfigurationError(
+                "AGENT_MODEL_TEMPERATURE must be greater than 0 and at most 1 "
+                "for Zhipu GLM"
+            )
 
     @classmethod
     def from_env(
@@ -84,7 +100,10 @@ class ProviderConfig:
     ) -> ProviderConfig:
         """Build provider settings without exposing secret values."""
         values = os.environ if environ is None else environ
-        name = (provider or values.get("AGENT_PROVIDER", "lmstudio")).casefold()
+        requested_name = (
+            provider or values.get("AGENT_PROVIDER") or DEFAULT_PROVIDER_PRIORITY[0]
+        ).casefold()
+        name = PROVIDER_ALIASES.get(requested_name, requested_name)
         temperature = _float_setting(
             values,
             "AGENT_MODEL_TEMPERATURE",
@@ -106,9 +125,14 @@ class ProviderConfig:
             )
 
         if name == "openai":
+            model = values.get("OPENAI_MODEL", "gpt-5.6-sol")
+            configured_effort = values.get("OPENAI_REASONING_EFFORT", "").strip()
+            reasoning_effort = configured_effort or (
+                "none" if model.casefold().startswith("gpt-5.6") else None
+            )
             return cls(
                 name=name,
-                model=values.get("OPENAI_MODEL", "gpt-5.5"),
+                model=model,
                 base_url=values.get(
                     "OPENAI_BASE_URL",
                     "https://api.openai.com/v1",
@@ -116,6 +140,7 @@ class ProviderConfig:
                 api_key=_required_key(values, "OPENAI_API_KEY", name),
                 temperature=temperature,
                 timeout=timeout,
+                reasoning_effort=reasoning_effort,
             )
 
         if name == "yandex":
@@ -167,8 +192,75 @@ class ProviderConfig:
                 extra_body={"enable_thinking": False},
             )
 
+        if name == "zhipu":
+            return cls(
+                name=name,
+                model=(
+                    values.get("ZAI_MODEL") or values.get("ZHIPU_MODEL") or "glm-5.3"
+                ),
+                base_url=(
+                    values.get("ZAI_BASE_URL")
+                    or values.get("ZHIPU_BASE_URL")
+                    or "https://api.z.ai/api/paas/v4"
+                ).rstrip("/"),
+                api_key=_required_key_with_alias(
+                    values,
+                    "ZAI_API_KEY",
+                    "ZHIPU_API_KEY",
+                    name,
+                ),
+                temperature=temperature,
+                timeout=timeout,
+                extra_body={"thinking": {"type": "enabled"}},
+            )
+
         supported = ", ".join(SUPPORTED_PROVIDERS)
         raise ConfigurationError(f"Unknown provider '{name}'. Supported: {supported}")
+
+    @classmethod
+    def priority_from_env(
+        cls,
+        provider: str | None = None,
+        providers: str | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> tuple[ProviderConfig, ...]:
+        """Resolve an ordered, duplicate-free provider failover chain."""
+
+        if provider is not None and providers is not None:
+            raise ConfigurationError("Use either --provider or --providers, not both")
+        values = os.environ if environ is None else environ
+        raw_priority = providers
+        if raw_priority is None and provider is None:
+            environment_priority = values.get("AGENT_PROVIDER_PRIORITY", "").strip()
+            raw_priority = environment_priority or None
+        if raw_priority is not None:
+            requested = [item.strip() for item in raw_priority.split(",")]
+            if not requested or any(not item for item in requested):
+                raise ConfigurationError(
+                    "Provider priority must be a comma-separated list without "
+                    "empty entries"
+                )
+        elif provider is not None:
+            requested = [provider]
+        else:
+            legacy_provider = values.get("AGENT_PROVIDER", "").strip()
+            requested = (
+                [legacy_provider]
+                if legacy_provider
+                else list(DEFAULT_PROVIDER_PRIORITY)
+            )
+
+        resolved: list[ProviderConfig] = []
+        seen: set[str] = set()
+        for requested_name in requested:
+            config = cls.from_env(requested_name, values)
+            if config.name in seen:
+                raise ConfigurationError(
+                    f"Provider '{config.name}' is repeated in the priority chain"
+                )
+            seen.add(config.name)
+            resolved.append(config)
+        return tuple(resolved)
 
 
 def _required_key(
@@ -180,6 +272,20 @@ def _required_key(
     if not value:
         raise ConfigurationError(
             f"{variable_name} is required for provider '{provider}'"
+        )
+    return value
+
+
+def _required_key_with_alias(
+    environ: Mapping[str, str],
+    variable_name: str,
+    alias: str,
+    provider: str,
+) -> str:
+    value = (environ.get(variable_name) or environ.get(alias) or "").strip()
+    if not value:
+        raise ConfigurationError(
+            f"{variable_name} or {alias} is required for provider '{provider}'"
         )
     return value
 

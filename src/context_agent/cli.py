@@ -26,10 +26,22 @@ def build_parser() -> argparse.ArgumentParser:
         prog="context-agent",
         description="Persistent searchable Deep Agent with multiple LLM providers.",
     )
-    parser.add_argument(
+    provider_group = parser.add_mutually_exclusive_group()
+    provider_group.add_argument(
         "--provider",
         choices=SUPPORTED_PROVIDERS,
-        help="LLM provider; defaults to AGENT_PROVIDER or lmstudio.",
+        help=(
+            "Single LLM provider; the default chain is glm,openai unless "
+            "AGENT_PROVIDER or AGENT_PROVIDER_PRIORITY overrides it."
+        ),
+    )
+    provider_group.add_argument(
+        "--providers",
+        metavar="PROVIDER1,PROVIDER2",
+        help=(
+            "Ordered provider failover chain; defaults to "
+            "AGENT_PROVIDER_PRIORITY when configured."
+        ),
     )
     parser.add_argument(
         "--thread",
@@ -130,31 +142,50 @@ def _run_search(args: argparse.Namespace, base_dir: Path) -> int:
 
 def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     app_config = _app_config(base_dir)
-    provider = ProviderConfig.from_env(args.provider)
+    providers = ProviderConfig.priority_from_env(args.provider, args.providers)
+    provider = providers[0]
     print(f"provider={provider.name}")
     print(f"model={provider.model}")
     print(f"base_url={provider.base_url}")
     print("api_key=configured")
+    print("provider_priority=" + ",".join(config.name for config in providers))
+    for index, fallback in enumerate(providers[1:], start=1):
+        print(f"fallback_{index}_provider={fallback.name}")
+        print(f"fallback_{index}_model={fallback.model}")
+        print(f"fallback_{index}_base_url={fallback.base_url}")
+        print(f"fallback_{index}_api_key=configured")
     print(f"workspace={app_config.workspace}")
     print(f"context_database={app_config.context_database}")
     if args.live:
-        try:
-            response = create_chat_model(provider).invoke(
-                "Reply with exactly: OK",
-            )
-        except Exception as exc:
-            raise AgentError(
-                f"Live model check failed ({type(exc).__name__}): {exc}"
-            ) from exc
-        text = message_text(response).strip()
-        print(f"live_response={text}")
+        failures: list[str] = []
+        for candidate in providers:
+            try:
+                response = create_chat_model(candidate).invoke(
+                    "Reply with exactly: OK",
+                )
+            except Exception as exc:
+                error_type = type(exc).__name__
+                failures.append(f"{candidate.name} ({error_type})")
+                print(
+                    f"live_attempt_provider={candidate.name} "
+                    f"status=error error_type={error_type}"
+                )
+                continue
+            text = message_text(response).strip()
+            print(f"live_provider={candidate.name}")
+            print(f"live_response={text}")
+            break
+        else:
+            raise AgentError("All live provider checks failed: " + ", ".join(failures))
     return 0
 
 
 def _runtime(args: argparse.Namespace, base_dir: Path) -> AgentRuntime:
+    providers = ProviderConfig.priority_from_env(args.provider, args.providers)
     return AgentRuntime(
         _app_config(base_dir),
-        ProviderConfig.from_env(args.provider),
+        providers[0],
+        fallback_provider_configs=providers[1:],
     )
 
 

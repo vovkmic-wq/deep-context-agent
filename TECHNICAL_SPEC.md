@@ -6,8 +6,8 @@
 
 - сохраняет историю и большой внешний контекст между запусками;
 - ищет релевантные фрагменты контекста перед ответом и по запросу модели;
-- работает через LM Studio, OpenAI, Yandex AI Studio (YandexGPT), DeepSeek и
-  Alibaba Model Studio (Qwen);
+- работает через LM Studio, OpenAI, Yandex AI Studio (YandexGPT), DeepSeek,
+  Alibaba Model Studio (Qwen) и Zhipu AI (GLM);
 - ищет актуальную информацию в интернете;
 - читает, создаёт, изменяет и удаляет файлы и каталоги только внутри заданной
   директории;
@@ -22,8 +22,9 @@
 1. `deepagents.create_deep_agent` выполняет агентный цикл, делегирование,
    управление растущим контекстом и работу с виртуальной файловой системой.
 2. Все LLM-провайдеры подключаются через `langchain-openai.ChatOpenAI` и
-   OpenAI-compatible Chat Completions API. Провайдер выбирается аргументом CLI
-   или переменной `AGENT_PROVIDER`.
+   OpenAI-compatible Chat Completions API. Один провайдер выбирается
+   `--provider`/`AGENT_PROVIDER`, а упорядоченная failover-цепочка —
+   `--providers`/`AGENT_PROVIDER_PRIORITY`.
 3. `CompositeBackend` направляет `/workspace/` в `FilesystemBackend` с
    `virtual_mode=True`. Директория задаётся `AGENT_WORKSPACE`; доступ к файлам
    вне неё не предоставляется. Встроенный filesystem middleware создаётся с
@@ -195,20 +196,53 @@
     актуальности и точного существительного version/release/price/date либо его
     русского словоформенного эквивалента. Подстроки в словах `совпадать` и
     `полноценный`, а также аудит предоставленного кода не создают web FAIL.
+53. Список провайдеров канонизируется до сетевого вызова, не допускает пустых
+    элементов и дубликатов, включая пару alias/canonical `glm,zhipu`.
+54. Каждый model call сначала получает настроенные retries текущего провайдера,
+    затем переключается на следующего. Успешный fallback закрепляется до конца
+    пользовательского хода; следующий ход восстанавливает исходный приоритет.
+55. Failover оборачивает только model call и не повторяет уже завершённые tools.
+    Если вся цепочка недоступна, наружу выводятся только provider/model и типы
+    исключений без ответов API, ключей и иных потенциальных секретов.
+56. `runtime_info` динамически сообщает активный provider, полную приоритетную
+    цепочку, число переключений и имена неуспешных провайдеров. Каждый model
+    request получает доверенный блок точной активной identity.
 
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |
 | --- | --- | --- |
 | LM Studio | `LM_STUDIO_API_KEY` (необязательно) | `LM_STUDIO_MODEL`, `LM_STUDIO_BASE_URL` |
-| OpenAI | `OPENAI_API_KEY` | `OPENAI_MODEL`, `OPENAI_BASE_URL` |
+| OpenAI | `OPENAI_API_KEY` | `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_REASONING_EFFORT` |
 | YandexGPT | `YANDEX_API_KEY` | `YANDEX_MODEL_URI` или `YANDEX_FOLDER_ID`, `YANDEX_BASE_URL` |
 | DeepSeek | `DEEPSEEK_API_KEY` | `DEEPSEEK_MODEL`, `DEEPSEEK_BASE_URL` |
 | Qwen | `DASHSCOPE_API_KEY` | `QWEN_MODEL`, `QWEN_BASE_URL` |
+| Zhipu GLM | `ZAI_API_KEY` (`ZHIPU_API_KEY` — alias) | `ZAI_MODEL`, `ZAI_BASE_URL` (`ZHIPU_*` — aliases) |
 
 Значения endpoint и моделей должны переопределяться без изменения кода.
 Модель обязана поддерживать tool calling; это особенно важно для локальной
 модели LM Studio.
+
+Для резервной `openai/gpt-5.6-sol` в текущем Chat Completions tool-calling
+контуре устанавливается `OPENAI_REASONING_EFFORT=none`. Ненулевой effort с
+function tools требует Responses API и не должен включаться неявно.
+
+Zhipu выбирается как `--provider zhipu` или `--provider glm`; алиас
+канонизируется в `zhipu`. Значения по умолчанию: модель `glm-5.3`, стандартный
+endpoint `https://api.z.ai/api/paas/v4`, включённый thinking. Для GLM
+Coding Plan пользователь явно задаёт
+`https://api.z.ai/api/coding/paas/v4`. Температура GLM ограничена
+диапазоном `0 < temperature <= 1` и проверяется до сетевого запроса.
+Поскольку Zhipu API не документирует OpenAI-параметр `parallel_tool_calls`,
+этот параметр для Zhipu не передаётся; runtime всё равно программно оставляет
+не более одного tool call из ответа модели.
+
+Цепочка по умолчанию — `AGENT_PROVIDER_PRIORITY=glm,openai`: сначала
+`glm-5.3`, затем `gpt-5.6-sol`. Общая приоритизация переопределяется переменной
+`AGENT_PROVIDER_PRIORITY` или CLI `--providers`. Явный `--provider` и `--providers`
+взаимоисключающие. Если указана цепочка, конфигурация и ключ каждого её элемента
+валидируются до запуска агента. Одиночный режим сохраняет прежнее поведение и
+формат основных строк `doctor`.
 
 ## 4. CLI
 
@@ -221,6 +255,8 @@
 - `context-agent search "..."` — проверка поиска по локальному контексту;
 - `context-agent doctor` — безопасная диагностика конфигурации без вывода
   ключей.
+- `context-agent --providers "glm,openai" doctor --live` — проверить
+  цепочку по приоритету и остановиться на первом успешном провайдере.
 
 В интерактивном режиме `/paste` и `/paste ПЕРВАЯ_СТРОКА` читают продолжение до
 `/end` и передают весь текст одним turn; `/cancel` отменяет ввод.
@@ -397,3 +433,6 @@
 - https://yandex.cloud/en/docs/tutorials/ml-ai/ai-model-ide-integration
 - https://api-docs.deepseek.com/guides/tool_calls/
 - https://www.alibabacloud.com/help/en/model-studio/qwen-function-calling
+- https://docs.z.ai/api-reference/llm/chat-completion
+- https://developers.openai.com/api/docs/models/gpt-5.6-sol
+- https://docs.bigmodel.cn/cn/guide/develop/openai/introduction

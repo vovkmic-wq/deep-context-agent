@@ -22,4 +22,6 @@ def create_chat_model(config: ProviderConfig) -> ChatOpenAI:
     }
     if config.extra_body:
         kwargs["extra_body"] = config.extra_body
+    if config.reasoning_effort is not None:
+        kwargs["reasoning_effort"] = config.reasoning_effort
     return ChatOpenAI(**kwargs)
