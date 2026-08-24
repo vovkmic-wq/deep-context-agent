@@ -5,6 +5,7 @@ from pathlib import Path
 from context_agent.runtime import (
     ToolAuditEntry,
     evaluate_acceptance_manifest,
+    explicit_tool_call_budget,
     parse_acceptance_manifest,
 )
 
@@ -177,3 +178,37 @@ def test_restart_acceptance_requires_one_non_empty_search() -> None:
     assert empty.failed == 1
     assert found.failed == 0
     assert found.passed == 2
+
+
+def test_ozon_strict_prompt_enforces_read_only_tool_contract() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    query = (project_root / "ozon-strict-compliance-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    manifest = parse_acceptance_manifest(query)
+    budget = explicit_tool_call_budget(query)
+
+    assert manifest is not None
+    assert manifest.exact_tool_call_counts == {
+        "list_context_sources": 1,
+        "ls": 1,
+        "search_context": 2,
+        "read_context_window": 2,
+        "read_file": 14,
+    }
+    assert len(manifest.required_events) == 20
+    assert budget.total == 20
+    assert budget.per_tool["read_file"] == 14
+    for tool_name in {
+        "web_search",
+        "fetch_web_page",
+        "get_pypi_package_info",
+        "write_todos",
+        "write_file",
+        "edit_file",
+        "make_directory",
+        "remove_path",
+        "glob",
+        "grep",
+    }:
+        assert budget.per_tool[tool_name] == 0

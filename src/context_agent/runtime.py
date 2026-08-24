@@ -104,10 +104,19 @@ _OVERALL_PASS_CLAIM_PATTERN = re.compile(
     r"overall\s+(?:result\s*)?:?\s*(?:pass|fail|partial)|"
     r"все\s+обязательные\s+пункты\s+выполнены)"
 )
+_CURRENT_WEB_MARKER = (
+    r"(?:\bcurrent\b|\blatest\b|\bактуальн\w*|\bтекущ\w*|\bпоследн\w*)"  # noqa: RUF001
+)
+_WEB_FACT_NOUN = (
+    r"(?:\bversion\b|\brelease\b|\bprice\b|\bdate\b|"
+    r"\bверси(?:я|и|ю|ей|ями|ях)\b|"  # noqa: RUF001
+    r"\bрелиз(?:а|ы|е|у|ом|ами|ах)?\b|"  # noqa: RUF001
+    r"\bцен(?:а|ы|е|у|ой|ою|ам|ами|ах)\b|"  # noqa: RUF001
+    r"\bдат(?:а|ы|е|у|ой|ою|ам|ами|ах)\b)"  # noqa: RUF001
+)
 _CURRENT_WEB_FACT_PATTERN = re.compile(
-    r"(?isu)(?=.*(?:\bcurrent\b|\blatest\b|актуальн|текущ|последн))"
-    r"(?=.*(?:\bversion\b|\brelease\b|\bprice\b|\bdate\b|"
-    r"верси|релиз|цен|дат))"
+    rf"(?isu)(?:{_CURRENT_WEB_MARKER}[^\n.!?]{{0,100}}{_WEB_FACT_NOUN}|"
+    rf"{_WEB_FACT_NOUN}[^\n.!?]{{0,100}}{_CURRENT_WEB_MARKER})"
 )
 _INCOMPLETE_MUTATION_TAIL_PATTERN = re.compile(
     r"(?iu)(?:\u0441\s+точн(?:ым|ым\s+следующим)\s+текстом|"
@@ -252,12 +261,13 @@ class ExactReadPathMiddleware(AgentMiddleware):
         if request.tool_call["name"] != "read_file":
             return handler(request)
         query = current_user_query(request.state)
+        prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
         raw_args = request.tool_call.get("args", {})
         requested = raw_args.get("file_path") if isinstance(raw_args, Mapping) else None
         normalized_requested = (
             normalize_virtual_path(requested) if isinstance(requested, str) else None
         )
-        if normalized_requested in forbidden_read_paths(query):
+        if normalized_requested in forbidden_read_paths(prose_query):
             return denied_tool_message(
                 request,
                 "Read denied: the user explicitly forbade reading this path.",
@@ -265,7 +275,7 @@ class ExactReadPathMiddleware(AgentMiddleware):
             )
         allowed_paths = {
             normalize_virtual_path(path)
-            for path in explicit_filesystem_paths(query)
+            for path in explicit_filesystem_paths(prose_query)
             if is_virtual_workspace_path(path)
             and normalize_virtual_path(path) != "/workspace"
         }

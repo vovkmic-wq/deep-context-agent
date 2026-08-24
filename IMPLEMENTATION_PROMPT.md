@@ -1,8 +1,8 @@
 # Управляющий промпт реализации
 
-Актуальный обязательный промпт версии 0.8.3 находится в
-`OZON_EXPERIMENT_HARDENING_PROMPT.md`. Его требования имеют приоритет для
-исправления scope/index/token дефектов Ozon-эксперимента от 2026-08-23.
+Актуальный обязательный промпт версии 0.8.4 находится в
+`ozon-strict-compliance-prompt.txt`. Его требования имеют приоритет для
+доказательного read-only аудита Ozon с runtime-enforced tool contract.
 `EVIDENCE_INTEGRITY_PROMPT.md`, `ACCEPTANCE_CORRECTNESS_PROMPT.md`,
 `ACCEPTANCE_COMPLETION_PROMPT.md`, `ACCEPTANCE_RELIABILITY_PROMPT.md` и
 `PRODUCTION_HARDENING_PROMPT.md` сохраняются как история версий 0.6.0–0.2.0.
@@ -37,6 +37,13 @@ Patch 0.8.2: budget/exact middleware должны оборачивать sequent
 Patch 0.8.3: разреши безопасный перенос строки между maximum-фразой и именем
 tool в пределах одного предложения. Добавь regression из реального Ozon-
 промпта, выполни контур, публикацию и финальный clean-DB run.
+
+Patch 0.8.4: не используй evaluator-пути manifest как exact-read allowlist;
+нулевыми per-tool budgets исключай web/planning/mutating tools до первого
+model call; распознавай актуальный web-факт только по близким точным терминам.
+Закрепи строгий Ozon prompt manifest-тестом, выполни Ruff/pytest/doctor live,
+изолированный clean-DB аудит, проверку неизменности workspace и внешние тесты
+Ozon.
 
 ## Краткий промпт evidence integrity 0.6.0 (2026-08-23)
 
@@ -124,6 +131,9 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
 14. После clean Ozon-аудита 0.7.1 обеспечь hardening 0.8.0: исполняй явные
     total/per-tool tool-call budgets программно и не полагайся на дисциплину
     LLM при ограничении токенов и числа инструментов.
+15. После live-аудита 0.8.3 обеспечь patch 0.8.4: отделяй evaluator JSON от
+    prose filesystem scope, поддерживай запрет tool через нулевой budget и не
+    включай web verification guard для локального аудита кода.
 
 Инженерные ограничения:
 

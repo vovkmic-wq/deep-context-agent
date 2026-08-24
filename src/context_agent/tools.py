@@ -54,9 +54,9 @@ SAFE_FILESYSTEM_TOOL_DESCRIPTIONS = {
         "reading an exact path supplied by the user."
     ),
     "read_file": (
-        "Read exactly the /workspace/ file requested by the user. Do not read, "
-        "list, or mention unrelated files. If the exact file is missing, report "
-        "that fact without guessing another path."
+        "For an exact-file request, read only that /workspace/ file and do not "
+        "guess a substitute. For an explicit project audit or discovery request, "
+        "read only relevant files found inside /workspace/."
     ),
     "write_file": (
         "Create or overwrite only the exact /workspace/ path explicitly requested "
@@ -200,7 +200,7 @@ def fetch_public_web_page(
         safe_url,
         headers={
             "Accept": "text/html,text/plain,application/json,application/xml",
-            "User-Agent": "DeepContextAgent/0.8.3 (+public-page-reader)",
+            "User-Agent": "DeepContextAgent/0.8.4 (+public-page-reader)",
         },
     )
     try:
@@ -275,7 +275,7 @@ def fetch_pypi_package_info(
         api_url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "DeepContextAgent/0.8.3 (+pypi-metadata-reader)",
+            "User-Agent": "DeepContextAgent/0.8.4 (+pypi-metadata-reader)",
         },
     )
     try:

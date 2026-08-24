@@ -1535,6 +1535,51 @@ def test_workspace_root_reference_does_not_block_project_file_reads(
     assert "read_file /workspace/pyproject.toml: success" in answer
 
 
+def test_manifest_paths_do_not_narrow_broad_project_audit_reads(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/src/module.py"},
+                        "id": "call-read-project-source",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Project source inspected."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    source = app_config.workspace / "src" / "module.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    query = """Audit the Python project available inside /workspace/.
+    The manifest below is runtime evaluation data, not a filesystem instruction.
+    <acceptance_manifest>
+    {
+      "version": 1,
+      "allowed_unlisted_tools": ["read_file"],
+      "required_events": [
+        {"id": "spec", "tool": "read_file",
+         "target": "/workspace/TECHNICAL_SPECIFICATION.md",
+         "statuses": ["success"]}
+      ]
+    }
+    </acceptance_manifest>"""
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(query)
+
+    assert runtime.last_tool_audit[0].status == "success"
+    assert "read_file /workspace/src/module.py: success" in answer
+
+
 def test_successful_exact_read_is_audited_without_leaking_content(
     tmp_path: Path,
 ) -> None:
@@ -1685,6 +1730,35 @@ def test_explicit_tool_call_budget_parses_ozon_prompt_limits() -> None:
 
     assert budget.total == 15
     assert budget.per_tool == {"search_context": 2}
+
+
+def test_zero_per_tool_budget_hides_tool_before_first_model_call(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "must not execute"},
+                        "id": "call-zero-budget-web",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask("web_search: no more than 0 calls. Answer locally.")
+
+    assert runtime.last_tool_audit == ()
+    assert "web_search" not in model.bound_tool_name_batches[0]
+    assert "tool-call budget is exhausted" in answer
 
 
 def test_explicit_per_tool_budget_suppresses_stale_provider_call(
@@ -2114,6 +2188,17 @@ def test_failed_web_search_cannot_confirm_a_stale_current_version(
 
     assert "web_search latest package version: error" in answer
     assert "Runtime web verification: FAIL" in answer
+
+
+def test_project_audit_terms_do_not_trigger_current_web_fact_guard() -> None:
+    query = (
+        "Проведи аудит текущего кода. Сумма статусов должна совпадать с числом "  # noqa: RUF001
+        "строк, а полноценный вывод должен опираться на schema_version."  # noqa: RUF001
+    )
+
+    answer = append_current_web_verification_guard("Audit complete.", query, ())
+
+    assert answer == "Audit complete."
 
 
 def test_exact_private_url_is_rejected_by_current_fetch_tool(tmp_path: Path) -> None:
