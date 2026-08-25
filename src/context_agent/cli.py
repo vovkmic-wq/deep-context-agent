@@ -20,6 +20,24 @@ from context_agent.runtime import AgentRuntime, message_text
 MAX_PROMPT_FILE_BYTES = 2 * 1024 * 1024
 
 
+def configure_standard_streams(
+    streams: Sequence[TextIO] | None = None,
+) -> None:
+    """Use deterministic UTF-8 output for Windows pipes and redirected logs."""
+
+    selected_streams = (
+        tuple(streams) if streams is not None else (sys.stdout, sys.stderr)
+    )
+    for stream in selected_streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the complete CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -70,6 +88,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--file",
         type=Path,
         help="Read one UTF-8 multi-line request from a file (max 2 MiB).",
+    )
+
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Run or resume a manifest-backed batched project audit.",
+    )
+    audit_parser.add_argument(
+        "query",
+        nargs="?",
+        help="Audit objective, or '-' to read it from stdin.",
+    )
+    audit_parser.add_argument(
+        "--file",
+        type=Path,
+        help="Read one UTF-8 audit objective from a file (max 2 MiB).",
+    )
+    audit_parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help=(
+            "Maximum batches in this process (1-100); defaults to "
+            "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST."
+        ),
     )
 
     index_parser = subparsers.add_parser(
@@ -156,6 +198,10 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
         print(f"fallback_{index}_api_key=configured")
     print(f"workspace={app_config.workspace}")
     print(f"context_database={app_config.context_database}")
+    print(f"project_audit_database={app_config.project_audit_database}")
+    print(f"recursion_limit={app_config.recursion_limit}")
+    print(f"audit_batch_size={app_config.audit_batch_size}")
+    print(f"audit_max_reads_per_file={app_config.audit_max_reads_per_file}")
     if args.live:
         failures: list[str] = []
         for candidate in providers:
@@ -278,6 +324,18 @@ def _run_ask(args: argparse.Namespace, base_dir: Path) -> int:
     return 0
 
 
+def _run_audit(args: argparse.Namespace, base_dir: Path) -> int:
+    with _runtime(args, base_dir) as runtime:
+        print(
+            runtime.run_project_audit(
+                resolve_ask_query(args),
+                thread_id=args.thread,
+                max_batches=args.max_batches,
+            )
+        )
+    return 0
+
+
 def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
     print("Deep Context Agent. Enter /paste for multi-line input, /exit to stop.")
     with _runtime(args, base_dir) as runtime:
@@ -305,11 +363,13 @@ def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and convert expected failures to concise exit messages."""
+    configure_standard_streams()
     base_dir = Path.cwd().resolve()
     _load_environment(base_dir)
     parser = build_parser()
     args = parser.parse_args(argv)
     commands = {
+        "audit": _run_audit,
         "ask": _run_ask,
         "chat": _run_chat,
         "doctor": _run_doctor,

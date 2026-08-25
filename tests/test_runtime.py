@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from conftest import SequenceChatModel
@@ -36,10 +36,13 @@ from context_agent.runtime import (
     forbidden_mutation_paths,
     forbidden_read_paths,
     format_acceptance_evaluation,
+    is_broad_project_audit_request,
     is_incomplete_mutation_request,
     limit_retrieved_hits,
     message_text,
     parse_acceptance_manifest,
+    project_audit_batch_allows_mutation,
+    project_audit_batch_paths,
     redact_marked_secrets,
     should_preflight_deny_mutation,
     should_skip_automatic_retrieval,
@@ -85,6 +88,432 @@ def test_message_text_supports_content_blocks() -> None:
 
 def test_retrieved_request_labels_untrusted_context() -> None:
     assert build_retrieved_request("question", []) == "question"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Проведи полный аудит всего проекта.",
+        "Проверь все файлы проекта и найди проблемы.",
+        "Perform a full audit of the entire repository.",
+    ],
+)
+def test_broad_project_audit_detection_requires_project_scope(query: str) -> None:
+    assert is_broad_project_audit_request(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Полностью проверь файл /workspace/main.py.",
+        "Review this exact file completely.",
+        "Объясни архитектуру проекта кратко.",
+    ],
+)
+def test_exact_file_or_non_audit_request_is_not_routed_to_project_audit(
+    query: str,
+) -> None:
+    assert not is_broad_project_audit_request(query)
+
+
+def test_project_audit_manifest_paths_are_strict_and_bounded() -> None:
+    query = (
+        '<project_audit_batch>{"paths":['
+        '"/workspace/a.py","/workspace/B.py"]}</project_audit_batch>'
+    )
+    assert project_audit_batch_paths(query) == frozenset(
+        {"/workspace/a.py", "/workspace/b.py"}
+    )
+    assert not project_audit_batch_allows_mutation(query)
+    assert project_audit_batch_allows_mutation(
+        '<project_audit_batch>{"paths":[],"mutation_authorized":true}'
+        "</project_audit_batch>"
+    )
+    assert project_audit_batch_paths("ordinary request") is None
+    assert (
+        project_audit_batch_paths(
+            '<project_audit_batch>{"paths":["C:/outside.py"]}</project_audit_batch>'
+        )
+        == frozenset()
+    )
+
+
+def test_broad_project_audit_is_split_into_independent_resumable_batches(
+    tmp_path: Path,
+) -> None:
+    app_config = replace(
+        _app_config(tmp_path),
+        audit_batch_size=2,
+        audit_max_batches_per_request=2,
+    )
+    app_config.prepare_directories()
+    for name in ("a.py", "b.py", "c.py"):
+        (app_config.workspace / name).write_text(
+            f"NAME = {name!r}\n",
+            encoding="utf-8",
+        )
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/a.py"},
+                        "id": "read-a",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/b.py"},
+                        "id": "read-b",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="batch one complete"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/c.py"},
+                        "id": "read-c",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="batch two complete"),
+        ]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            "Проведи полный аудит всего проекта без изменения файлов.",
+            thread_id="batched",
+        )
+        runs = runtime.project_audit_store.list_runs(workspace=app_config.workspace)
+        progress = runtime.project_audit_store.progress(str(runs[0]["id"]))
+
+    assert progress.complete
+    assert progress.reviewed == 3
+    assert progress.batches == 2
+    assert progress.file_reads == 3
+    assert "статус=complete" in answer
+    assert model.generation_attempts == 5
+
+
+def test_read_only_project_audit_denies_mutation_before_model_read(
+    tmp_path: Path,
+) -> None:
+    app_config = replace(
+        _app_config(tmp_path),
+        audit_batch_size=1,
+        audit_max_batches_per_request=1,
+    )
+    app_config.prepare_directories()
+    target = app_config.workspace / "main.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/main.py",
+                            "content": "VALUE = 999\n",
+                        },
+                        "id": "unauthorized-write",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/main.py"},
+                        "id": "required-read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="read-only audit complete"),
+        ]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            "Проведи полный аудит всего проекта без изменения файлов.",
+            thread_id="read-only",
+        )
+
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "denied",
+        "success",
+    ]
+    assert "статус=complete" in answer
+
+
+def test_project_audit_marks_file_partial_when_page_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    app_config = replace(
+        _app_config(tmp_path),
+        audit_batch_size=1,
+        audit_max_batches_per_request=1,
+        audit_max_reads_per_file=4,
+    )
+    app_config.prepare_directories()
+    (app_config.workspace / "large.txt").write_text(
+        "".join(f"line-{index}\n" for index in range(20)),
+        encoding="utf-8",
+    )
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "file_path": "/workspace/large.txt",
+                            "offset": index,
+                            "limit": 1,
+                        },
+                        "id": f"page-{index}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+            for index in range(5)
+        ]
+        + [AIMessage(content="page budget reached")]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            "Проведи полный аудит всего проекта без изменения файлов.",
+            thread_id="partial-coverage",
+        )
+        run = runtime.project_audit_store.list_runs(workspace=app_config.workspace)[0]
+        progress = runtime.project_audit_store.progress(str(run["id"]))
+
+    assert progress.status == "complete_with_partial"
+    assert progress.reviewed == 0
+    assert progress.partial == 1
+    assert progress.file_reads == 4
+    assert "частично=1" in answer
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "success",
+        "success",
+        "success",
+        "denied",
+    ]
+
+
+def test_project_audit_denies_duplicate_page_but_allows_new_offset(
+    tmp_path: Path,
+) -> None:
+    app_config = replace(
+        _app_config(tmp_path),
+        audit_batch_size=1,
+        audit_max_batches_per_request=1,
+        audit_max_reads_per_file=4,
+    )
+    app_config.prepare_directories()
+    (app_config.workspace / "paged.txt").write_text(
+        "first\nsecond\n",
+        encoding="utf-8",
+    )
+    first_page = {
+        "name": "read_file",
+        "args": {
+            "file_path": "/workspace/paged.txt",
+            "offset": 0,
+            "limit": 1,
+        },
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{**first_page, "id": "page-first"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**first_page, "id": "page-duplicate"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        **first_page,
+                        "args": {
+                            "file_path": "/workspace/paged.txt",
+                            "offset": 1,
+                            "limit": 1,
+                        },
+                        "id": "page-second",
+                    }
+                ],
+            ),
+            AIMessage(content="both unique pages covered"),
+        ]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask(
+            "Проведи полный аудит всего проекта без изменения файлов.",
+            thread_id="page-deduplication",
+        )
+        run = runtime.project_audit_store.list_runs(workspace=app_config.workspace)[0]
+        progress = runtime.project_audit_store.progress(str(run["id"]))
+
+    assert progress.status == "complete"
+    assert progress.reviewed == 1
+    assert progress.file_reads == 2
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "denied",
+        "success",
+    ]
+
+
+def test_mutating_project_audit_requires_read_before_write(tmp_path: Path) -> None:
+    app_config = replace(
+        _app_config(tmp_path),
+        audit_batch_size=1,
+        audit_max_batches_per_request=1,
+    )
+    app_config.prepare_directories()
+    target = app_config.workspace / "main.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    write_call = {
+        "name": "write_file",
+        "args": {
+            "file_path": "/workspace/main.py",
+            "content": "VALUE = 2\n",
+        },
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        **write_call,
+                        "args": {
+                            "file_path": "/workspace/main.py",
+                            "content": "VALUE = 999\n",
+                        },
+                        "id": "write-before-read",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/main.py"},
+                        "id": "read-before-fix",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**write_call, "id": "write-after-read"}],
+            ),
+            AIMessage(content="fixed after inspection"),
+        ]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask(
+            "Perform a full audit and fix all confirmed project issues.",
+            thread_id="read-before-write",
+        )
+
+    assert target.read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "denied",
+        "success",
+        "success",
+    ]
+
+
+def test_project_checks_can_repeat_only_after_a_verified_mutation(
+    tmp_path: Path,
+) -> None:
+    check_call = {
+        "name": "run_project_checks",
+        "args": {"checks": "compileall"},
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{**check_call, "id": "check-before"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**check_call, "id": "check-duplicate"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/main.py",
+                            "content": "VALUE = 2\n",
+                        },
+                        "id": "write-fix",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**check_call, "id": "check-after"}],
+            ),
+            AIMessage(content="validation complete"),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    (app_config.workspace / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask(
+            "Run compileall for /workspace/main.py, apply exact content "
+            "VALUE = 2, then validate again."
+        )
+
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "denied",
+        "success",
+        "success",
+    ]
+    assert (app_config.workspace / "main.py").read_text(encoding="utf-8") == (
+        "VALUE = 2\n"
+    )
 
 
 def test_system_prompt_contains_trusted_runtime_identity() -> None:
@@ -899,7 +1328,7 @@ def test_budget_precedes_sequential_normalization_for_empty_toolset() -> None:
         model=model,
         messages=[],
         tools=[{"name": "runtime_info"}, {"name": "search_context"}],
-        state=state,
+        state=cast(Any, state),
         model_settings={"parallel_tool_calls": False},
     )
     captured: dict[str, Any] = {}

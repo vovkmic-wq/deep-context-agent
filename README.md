@@ -25,6 +25,14 @@ Qwen и Zhipu AI GLM через OpenAI-compatible API.
 5. Полные пользовательские запросы и ответы также индексируются как
    долговременная память.
 
+Для аудита исходного кода используется второй уровень, а не попытка отправить
+миллион строк модели. Runtime создаёт SQLite-манифест всех текстовых файлов,
+SHA-256-reестр, краткие сводки и Python AST-индекс. Затем он выдаёт LLM пачки по
+8 файлов в независимых graph turns. Успешно прочитанные файлы фиксируются по
+`ToolMessage`, непрочитанные остаются в очереди, а изменившийся SHA-256 повторно
+открывает только соответствующий файл. Поэтому размер проекта влияет на число
+пачек и объём БД, но не раздувает один prompt или recursion depth.
+
 FTS5 — лексический поиск: он не требует embedding API и хорошо масштабируется,
 но для терминов без общих слов может понадобиться несколько формулировок.
 Системный промпт явно требует от агента повторять поиск при необходимости.
@@ -59,6 +67,12 @@ AGENT_MODEL_CALL_RETRIES=3
 AGENT_MODEL_RETRY_INITIAL_DELAY=1
 AGENT_MODEL_RETRY_MAX_DELAY=15
 AGENT_WEB_RETRY_ATTEMPTS=3
+AGENT_RECURSION_LIMIT=100
+AGENT_AUDIT_BATCH_SIZE=8
+AGENT_AUDIT_MAX_BATCHES_PER_REQUEST=4
+AGENT_AUDIT_MAX_READS_PER_FILE=4
+AGENT_PROJECT_CHECK_TIMEOUT_SECONDS=300
+AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS=20000
 ```
 
 Для совместимости также принимается старое имя `AGENT_RETRIEVAL_LIMIT`, но при
@@ -191,6 +205,10 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 
 # Не добавлять автоматический retrieval (search_context остаётся доступен)
 .\.venv\Scripts\context-agent.exe --provider openai --no-auto-context ask "..."
+
+# Полный пакетный аудит/исправление проекта с SQLite-resume
+.\.venv\Scripts\context-agent.exe --thread ozon-audit audit `
+  --file .\ozon-project-improvement-prompt.txt --max-batches 100
 ```
 
 Путь команды `index` обязан находиться внутри `AGENT_CONTEXT_ROOT`.
@@ -199,6 +217,20 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 первую строку как `/paste ПЕРВАЯ_СТРОКА`. Обычная многострочная вставка без
 `/paste` по-прежнему является несколькими интерактивными turns. Файл, stdin и
 `/paste` ограничены 2 МиБ.
+
+Обычный широкий запрос `ask` автоматически переводится в пакетный режим и
+обрабатывает не более `AGENT_AUDIT_MAX_BATCHES_PER_REQUEST` за процесс. Команда
+`audit` предназначена для явного продолжительного запуска; повтор с тем же
+`thread ID`, workspace и неизменной целью продолжает сохранённый manifest.
+`--max-batches 100` — жёсткий предел, а не обещание модели. Текущий прогресс
+доступен LLM через `project_audit_status` и физически хранится в
+`AGENT_DATA_DIR/project_audit.sqlite3`.
+Manifest отдельно показывает число уникальных `reviewed` файлов и фактических
+успешных страниц `file_reads`; многостраничное чтение не маскируется как один
+tool call. Для слишком большого отдельного файла агент обязан указать покрытие
+и использовать точечный FTS/AST-поиск, а не заявлять построчное чтение целиком.
+После исчерпания `AGENT_AUDIT_MAX_READS_PER_FILE` такой файл получает отдельный
+статус `partial`, а итог всего запуска — `complete_with_partial`.
 
 ## Безопасность файлов
 
@@ -236,7 +268,11 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
   запрошенном файле, но заменяются на `[REDACTED]` в assistant-ответе и audit.
 - Текущие provider/model доступны модели через доверенный системный блок и
   `runtime_info`; API-ключ в них не включается.
-- Shell execution агенту не предоставляется.
+- Произвольный shell execution агенту не предоставляется. Инструмент
+  `run_project_checks` допускает только фиксированные `ruff_check`,
+  `ruff_format_check`, `pytest`, `mypy`, `compileall`, всегда использует
+  `shell=False`, удаляет секреты из окружения дочернего процесса и ограничивает
+  время/размер вывода.
 - Веб-загрузчик принимает только HTTP(S) на стандартных портах, блокирует
   loopback/private/non-public адреса, повторно проверяет перенаправления и читает
   не более 1 МБ текста за запрос.
@@ -259,7 +295,7 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 - Явно оборванная изменяющая команда отклоняется до модели и tools; отсутствующее
   содержимое не угадывается.
 
-Версия 0.11.0 готова для production-эксплуатации как локальный однопользовательский
+Версия 0.12.0 готова для production-эксплуатации как локальный однопользовательский
 CLI в границах `AGENT_WORKSPACE`. Для многопользовательского сервиса добавьте
 процессную изоляцию workspace, аутентификацию, лимиты запросов, централизованные
 логи и human-in-the-loop для необратимых действий.

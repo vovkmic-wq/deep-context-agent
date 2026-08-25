@@ -1,7 +1,46 @@
 # Управляющий промпт реализации
 
-Актуальный управляющий промпт версии 0.11.0 находится в этом файле. Реализуй
-одновременную доступность нескольких LLM через строгую приоритетную failover-
+Актуальный управляющий промпт версии 0.12.0 находится в этом файле.
+
+## Production large-project audit 0.12.0 (2026-08-25)
+
+Устрани переполнение agent graph при аудите проектов с 1 000 000+ строк и
+сотнями документов. Не увеличивай prompt до размера корпуса: полный текст
+остаётся в SQLite FTS5, а model call получает только найденные фрагменты либо
+ограниченную файловую пачку. Замени hardcoded recursion limit валидируемой
+настройкой. Создай отдельный SQLite audit manifest со стабильным run ID,
+pending/in-progress/reviewed статусами, SHA-256 ledger и crash-safe resume.
+Обрабатывай по 5–10 файлов в независимых graph invocations; отмечай файл
+проверенным только по успешному текущему ToolMessage. При изменении SHA открывай
+повторно только изменённый файл.
+Считай фактические страницы отдельно от уникальных файлов. Ограничивай страницы
+на файл; при исчерпании budget сохраняй `partial` и точное покрытие вместо
+ложного полного review.
+
+Создай кеш кратких SHA-bound summaries и безопасный Python AST-индекс имён,
+qualified names, сигнатур, строк и docstrings без импорта кода. Добавь tools для
+статуса manifest, summaries и symbol search. Доверенный batch manifest обязан
+программно ограничивать filesystem exact paths и запрещать discovery/выход из
+пачки. Добавь явную CLI-команду `audit` и автоматическую маршрутизацию широкого
+`ask` в bounded batches.
+
+Добавь `run_project_checks` без произвольного shell: только фиксированные Ruff,
+pytest, mypy и compileall команды, argv-list с `shell=False`, timeout, output
+limit, удаление ключей из child environment и redaction. Разрешай повтор одной
+проверки только после подтверждённой мутации, ограничивай число циклов и
+выполняй analyze → fix → test → repeat до успеха либо доказанного bounded stop.
+Не меняй файлы вне workspace и не считай текст LLM доказательством чтения,
+изменения или успешного теста.
+
+Обнови global system prompt, ТЗ, README, env-пример, статус, changelog и версию.
+Добавь регрессии на сотни файлов, существующий million-line corpus, resume,
+SHA invalidation, AST, batch confinement, recursion setting, отсутствие shell и
+утечки секретов. Выполни Ruff check/format, полный pytest, package/CLI/doctor,
+live provider smoke и только после успешного контура публикуй commit/tag/main.
+
+## Provider failover 0.11.0 (история)
+
+Реализуй одновременную доступность нескольких LLM через строгую приоритетную failover-
 цепочку. Сохрани `--provider`/`AGENT_PROVIDER` и добавь взаимоисключающий
 `--providers`/`AGENT_PROVIDER_PRIORITY`. Канонизируй aliases, запрещай пустые
 элементы и дубликаты, валидируй все ключи до запуска. Сначала повторяй только
@@ -128,7 +167,7 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
 5. Создай Deep Agent с `CompositeBackend`, `FilesystemBackend(...,
    virtual_mode=True)`, checkpointer и системным промптом. Перед вызовом модели
    автоматически добавляй найденный контекст; после ответа архивируй диалог.
-6. Добавь CLI-команды `chat`, `ask`, `index`, `search`, `doctor` и понятные
+6. Добавь CLI-команды `chat`, `ask`, `audit`, `index`, `search`, `doctor` и понятные
    сообщения об ошибках конфигурации.
 7. Напиши README с настройкой всех провайдеров, LM Studio tool calling,
    командами запуска, моделью безопасности и ограничениями FTS5.
@@ -163,13 +202,17 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
 15. После live-аудита 0.8.3 обеспечь patch 0.8.4: отделяй evaluator JSON от
     prose filesystem scope, поддерживай запрет tool через нулевой budget и не
     включай web verification guard для локального аудита кода.
+16. После Ozon `GraphRecursionError` реализуй 0.12.0: manifest-backed batches,
+    SHA resume, summaries/AST, безопасные project checks, настраиваемую recursion
+    depth и отдельные короткие graph turns; повтори corpus и live-регрессии.
 
 Инженерные ограничения:
 
 - Python 3.11+, PEP 8, Ruff line length 88;
 - зависимости закрепляй совместимыми диапазонами, Deep Agents — ветка 0.7;
 - секреты — только окружение/`.env.local`, пример содержит лишь пустые значения;
-- не добавляй shell execution;
+- не добавляй произвольный shell execution; project checks разрешены только
+  через фиксированный runtime allowlist без пользовательских argv;
 - внешние вызовы должны иметь timeout и понятные исключения;
 - нельзя имитировать «миллион строк в окне модели»: полный корпус хранится в
   индексе, а агент обязан выполнять retrieval и при необходимости расширять

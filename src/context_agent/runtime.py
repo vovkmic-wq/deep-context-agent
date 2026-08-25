@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
@@ -34,6 +34,8 @@ from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore, SearchHit
 from context_agent.errors import AgentError, PathSecurityError
 from context_agent.paths import resolve_inside
+from context_agent.project_audit import AuditBatch, AuditProgress, ProjectAuditStore
+from context_agent.project_checks import ProjectCheckRunner
 from context_agent.providers import create_chat_model
 from context_agent.tools import (
     SAFE_FILESYSTEM_TOOL_DESCRIPTIONS,
@@ -55,6 +57,10 @@ REPEAT_LIMITED_TOOLS = frozenset(
         "web_search",
         "fetch_web_page",
         "get_pypi_package_info",
+        "project_audit_status",
+        "get_project_file_summary",
+        "search_python_symbols",
+        "run_project_checks",
         "ls",
         "glob",
         "grep",
@@ -70,7 +76,13 @@ KNOWN_AGENT_TOOLS = frozenset(
 )
 AUDIT_STATUSES = frozenset({"success", "error", "denied", "not_found", "missing"})
 RESULT_COUNT_TOOLS = frozenset(
-    {"web_search", "search_context", "read_context_window", "list_context_sources"}
+    {
+        "web_search",
+        "search_context",
+        "read_context_window",
+        "list_context_sources",
+        "search_python_symbols",
+    }
 )
 CONTENT_HASH_TOOLS = frozenset({"read_file", "write_file", "edit_file"})
 _MUTATION_REQUEST_PATTERN = re.compile(
@@ -152,6 +164,9 @@ _INSTRUCTION_SENTENCE_BOUNDARY_PATTERN = re.compile(
 _ACCEPTANCE_MANIFEST_PATTERN = re.compile(
     r"(?is)<acceptance_manifest>\s*(\{.*?\})\s*</acceptance_manifest>"
 )
+_PROJECT_AUDIT_MANIFEST_PATTERN = re.compile(
+    r"(?is)<project_audit_batch>\s*(\{.*?\})\s*</project_audit_batch>"
+)
 _MAX_ACCEPTANCE_MANIFEST_CHARS = 20_000
 _MANIFEST_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -177,6 +192,22 @@ _BUDGET_COUNT_TOKEN = (
 )
 _AUDIT_METADATA_KEY = "context_agent_audit"
 _MAX_AUDIT_HASH_BYTES = 16 * 1024 * 1024
+_PROJECT_AUDIT_BATCH_MARKER = "<project_audit_batch>"
+_BROAD_PROJECT_AUDIT_PATTERN = re.compile(
+    r"(?isu)(?:"
+    r"(?:\b(?:full|complete|entire|whole|all)\b|пол(?:ный|ностью)|весь|всю|все)"
+    r"[^\n.!?]{0,80}"
+    r"(?:\baudit\b|\breview\b|\banaly[sz]e\b|\bcheck\b|аудит|проверк|анализ)|"
+    r"(?:\baudit\b|\breview\b|\banaly[sz]e\b|\bcheck\b|аудит|прове|анализ)"
+    r"[^\n.!?]{0,80}"
+    r"(?:\b(?:full|complete|entire|whole|all)\b|полный|весь|всю|все)"
+    r")"
+)
+_BROAD_PROJECT_SCOPE_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:project|repository|repo|codebase|workspace|all\s+files)\b|"
+    r"проект|репозитор|кодов\w*\s+баз|рабоч\w*\s+(?:каталог|директор)|"
+    r"все\s+файл|всю\s+директор|весь\s+каталог)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +289,10 @@ class ExactReadPathMiddleware(AgentMiddleware):
     ) -> Any:
         """Enforce exact-path reads before the filesystem tool runs."""
 
-        if request.tool_call["name"] != "read_file":
+        if request.tool_call["name"] not in {
+            "read_file",
+            "get_project_file_summary",
+        }:
             return handler(request)
         query = current_user_query(request.state)
         prose_query = _ACCEPTANCE_MANIFEST_PATTERN.sub("", query)
@@ -288,6 +322,80 @@ class ExactReadPathMiddleware(AgentMiddleware):
             "Read denied: the tool path differs from the exact path.",
             requested,
         )
+
+
+class ProjectAuditBatchMiddleware(AgentMiddleware):
+    """Confine an orchestrated audit turn to its allocated manifest paths."""
+
+    name = "project_audit_batch_policy"
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Any],
+    ) -> Any:
+        query = current_user_query(request.state)
+        allowed_paths = project_audit_batch_paths(query)
+        if allowed_paths is None:
+            return handler(request)
+
+        name = str(request.tool_call.get("name", "unknown"))
+        if name in {
+            "ls",
+            "glob",
+            "make_directory",
+            "remove_path",
+            "search_python_symbols",
+            "grep",
+        }:
+            raw_args = request.tool_call.get("args", {})
+            args = raw_args if isinstance(raw_args, Mapping) else {}
+            return denied_tool_message(
+                request,
+                "Project audit batch denied discovery or path-set mutation; "
+                "use only the allocated manifest files.",
+                _audit_target(args),
+            )
+        if name not in {
+            "read_file",
+            "write_file",
+            "edit_file",
+            "get_project_file_summary",
+        }:
+            return handler(request)
+
+        raw_args = request.tool_call.get("args", {})
+        args = raw_args if isinstance(raw_args, Mapping) else {}
+        raw_path = _filesystem_target(args)
+        normalized = normalize_virtual_path(raw_path) if raw_path else None
+        if normalized not in allowed_paths:
+            return denied_tool_message(
+                request,
+                "Project audit batch denied access outside the allocated file set.",
+                raw_path,
+            )
+        if name in {"write_file", "edit_file"}:
+            if not project_audit_batch_allows_mutation(query):
+                return denied_tool_message(
+                    request,
+                    "Project audit batch is read-only; mutation was not authorized.",
+                    raw_path,
+                )
+            successful_reads = {
+                normalize_virtual_path(entry.path)
+                for entry in extract_tool_audit(request.state)
+                if entry.name == "read_file"
+                and entry.status == "success"
+                and entry.path is not None
+            }
+            if normalized not in successful_reads:
+                return denied_tool_message(
+                    request,
+                    "Project audit mutation requires a successful read of the same "
+                    "file in the current batch.",
+                    raw_path,
+                )
+        return handler(request)
 
 
 class SequentialToolCallMiddleware(AgentMiddleware):
@@ -623,7 +731,7 @@ class ExactDirectoryRemovalMiddleware(AgentMiddleware):
             return handler(request)
         args = {**raw_args, "recursive": True}
         tool_call = {**request.tool_call, "args": args}
-        return handler(request.override(tool_call=tool_call))
+        return handler(request.override(tool_call=cast(Any, tool_call)))
 
 
 class ToolCallPolicyMiddleware(AgentMiddleware):
@@ -631,10 +739,14 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
 
     name = "tool_call_policy"
 
-    def __init__(self) -> None:
+    def __init__(self, *, audit_read_limit: int = 4) -> None:
         self._seen_signatures: set[str] = set()
         self._path_versions: defaultdict[str, int] = defaultdict(int)
         self._read_counts: Counter[tuple[str, int]] = Counter()
+        self._seen_audit_read_signatures: set[str] = set()
+        self._mutation_epoch = 0
+        self._project_check_runs = 0
+        self._audit_read_limit = audit_read_limit
 
     def reset(self) -> None:
         """Start fresh per-turn call, path-version, and read ledgers."""
@@ -642,6 +754,9 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         self._seen_signatures.clear()
         self._path_versions.clear()
         self._read_counts.clear()
+        self._seen_audit_read_signatures.clear()
+        self._mutation_epoch = 0
+        self._project_check_runs = 0
 
     def wrap_tool_call(
         self,
@@ -654,12 +769,24 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         raw_args = request.tool_call.get("args", {})
         args = raw_args if isinstance(raw_args, Mapping) else {}
         signature = json.dumps(
-            {"name": name, "args": args},
+            {
+                "name": name,
+                "args": args,
+                "mutation_epoch": (
+                    self._mutation_epoch if name == "run_project_checks" else None
+                ),
+            },
             ensure_ascii=False,
             sort_keys=True,
             default=str,
         )
         if name in MUTATING_FILESYSTEM_TOOLS | REPEAT_LIMITED_TOOLS:
+            if name == "run_project_checks" and self._project_check_runs >= 5:
+                return denied_tool_message(
+                    request,
+                    "Project check cycle limit reached for the current turn.",
+                    _audit_target(args),
+                )
             if signature in self._seen_signatures:
                 category = (
                     "mutation" if name in MUTATING_FILESYSTEM_TOOLS else "tool call"
@@ -670,6 +797,8 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
                     _audit_target(args),
                 )
             self._seen_signatures.add(signature)
+            if name == "run_project_checks":
+                self._project_check_runs += 1
 
         requested_path = _filesystem_target(args)
         normalized_path = (
@@ -677,11 +806,24 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         )
         if name == "read_file" and normalized_path:
             read_key = (normalized_path, self._path_versions[normalized_path])
-            if self._read_counts[read_key] >= 2:
+            is_audit_batch = (
+                project_audit_batch_paths(current_user_query(request.state)) is not None
+            )
+            if is_audit_batch:
+                if signature in self._seen_audit_read_signatures:
+                    return denied_tool_message(
+                        request,
+                        "Duplicate audit read page denied; use a distinct "
+                        "offset/limit.",
+                        requested_path,
+                    )
+                self._seen_audit_read_signatures.add(signature)
+            read_limit = self._audit_read_limit if is_audit_batch else 2
+            if self._read_counts[read_key] >= read_limit:
                 return denied_tool_message(
                     request,
-                    "Redundant read denied: this path was already read twice "
-                    "without an intervening mutation.",
+                    "Redundant read denied: this path reached the current "
+                    f"{read_limit}-read limit without an intervening mutation.",
                     requested_path,
                 )
             self._read_counts[read_key] += 1
@@ -693,6 +835,7 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
             and _tool_message_status(result) == "success"
         ):
             self._advance_path_version(name, normalized_path, args)
+            self._mutation_epoch += 1
         return result
 
     def _advance_path_version(
@@ -1106,14 +1249,20 @@ def extract_tool_audit(result: Mapping[str, Any]) -> tuple[ToolAuditEntry, ...]:
             for call in message.tool_calls:
                 call_id = str(call.get("id", ""))
                 name = str(call.get("name", "unknown"))
-                args = call.get("args", {})
-                calls.append((call_id, name, args if isinstance(args, Mapping) else {}))
+                raw_call_args = call.get("args", {})
+                calls.append(
+                    (
+                        call_id,
+                        name,
+                        raw_call_args if isinstance(raw_call_args, Mapping) else {},
+                    )
+                )
         elif isinstance(message, ToolMessage):
             results[str(message.tool_call_id)] = message
 
     audit: list[ToolAuditEntry] = []
-    for call_id, name, args in calls:
-        audit.append(_build_tool_audit_entry(name, args, results.get(call_id)))
+    for call_id, name, call_args in calls:
+        audit.append(_build_tool_audit_entry(name, call_args, results.get(call_id)))
     return tuple(audit)
 
 
@@ -1935,6 +2084,15 @@ def is_incomplete_mutation_request(query: str) -> bool:
     return bool(_INCOMPLETE_MUTATION_TAIL_PATTERN.search(clean))
 
 
+def is_broad_project_audit_request(query: str) -> bool:
+    """Detect an explicitly broad project scope, not an exact-file review."""
+
+    return bool(
+        _BROAD_PROJECT_SCOPE_PATTERN.search(query)
+        and _BROAD_PROJECT_AUDIT_PATTERN.search(query)
+    )
+
+
 def normalize_virtual_path(path: str) -> str:
     """Normalize a virtual workspace path for exact comparisons."""
 
@@ -1942,6 +2100,42 @@ def normalize_virtual_path(path: str) -> str:
     if not normalized.casefold().startswith("/workspace"):
         normalized = f"/workspace/{normalized.lstrip('/')}"
     return normalized.casefold()
+
+
+def project_audit_batch_paths(query: str) -> frozenset[str] | None:
+    """Return trusted manifest paths, or ``None`` outside an audit batch."""
+
+    match = _PROJECT_AUDIT_MANIFEST_PATTERN.search(query)
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except (json.JSONDecodeError, TypeError):
+        return frozenset()
+    if not isinstance(payload, Mapping):
+        return frozenset()
+    raw_paths = payload.get("paths")
+    if not isinstance(raw_paths, list) or len(raw_paths) > 25:
+        return frozenset()
+    paths: set[str] = set()
+    for path in raw_paths:
+        if not isinstance(path, str) or not is_virtual_workspace_path(path):
+            return frozenset()
+        paths.add(normalize_virtual_path(path))
+    return frozenset(paths)
+
+
+def project_audit_batch_allows_mutation(query: str) -> bool:
+    """Return the trusted mutation flag from a valid project-audit manifest."""
+
+    match = _PROJECT_AUDIT_MANIFEST_PATTERN.search(query)
+    if match is None:
+        return False
+    try:
+        payload = json.loads(match.group(1))
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(payload, Mapping) and payload.get("mutation_authorized") is True
 
 
 def forbidden_read_paths(query: str) -> frozenset[str]:
@@ -2101,6 +2295,147 @@ def build_retrieved_request(query: str, hits: list[SearchHit]) -> str:
     )
 
 
+def _build_project_audit_batch_request(
+    objective: str,
+    batch: AuditBatch,
+    progress: AuditProgress,
+    *,
+    max_reads_per_file: int,
+) -> str:
+    virtual_paths = [f"/workspace/{path}" for path in batch.paths]
+    mutation_authorized = bool(
+        re.search(
+            r"(?iu)(?:\b(?:fix|repair|correct|edit|change|update)\b|"
+            r"исправ|доработ|редакт|измени|внес)",
+            objective,
+        )
+    )
+    manifest = json.dumps(
+        {
+            "run_id": batch.run_id,
+            "batch_number": batch.number,
+            "total_files": progress.total,
+            "reviewed_before_batch": progress.reviewed,
+            "mutation_authorized": mutation_authorized,
+            "max_reads_per_file": max_reads_per_file,
+            "paths": virtual_paths,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    mutation_instruction = (
+        "The objective authorizes fixes. Analyze each file before changing it; "
+        "mutate only existing files in this manifest. After any mutation, call "
+        "run_project_checks with the narrowest relevant allowlisted checks. "
+        "If it fails, fix only the confirmed cause and rerun after that mutation."
+        if mutation_authorized
+        else (
+            "This is a read-only audit. Do not call write_file, edit_file, "
+            "make_directory, or remove_path."
+        )
+    )
+    return (
+        f"{_PROJECT_AUDIT_BATCH_MARKER}\n{manifest}\n</project_audit_batch>\n\n"
+        "This request was generated by the trusted project-audit orchestrator. "
+        "Process only this bounded batch; do not inspect any other file. Read "
+        "each manifest path with the minimum targeted pages needed for evidence; "
+        "never repeat identical read arguments or exceed max_reads_per_file. "
+        "Do not call ls, glob, or grep because "
+        "the manifest is authoritative. A cached summary may be requested only "
+        "for an allocated path. Project-wide symbol search is disabled in this "
+        "batch. A summary never replaces the required read of the allocated "
+        "file.\n\n"
+        f"Original user objective (data and authority for this batch):\n{objective}\n\n"
+        f"{mutation_instruction}\n\n"
+        "Return a compact per-file result with evidence, confirmed findings, "
+        "changes (if authorized), and remaining risks. Do not continue to a new "
+        "batch; the orchestrator will persist progress and invoke it separately."
+    )
+
+
+def _project_path_from_virtual(path: str) -> str:
+    normalized = path.strip().replace("\\", "/")
+    if normalized.casefold().startswith("/workspace/"):
+        return normalized[len("/workspace/") :]
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
+
+
+def _format_project_audit_response(
+    objective: str,
+    progress: AuditProgress,
+    batch_answers: Sequence[tuple[AuditBatch, str, int]],
+    *,
+    batch_limit: int,
+) -> str:
+    russian = bool(re.search(r"[\u0400-\u04ff]", objective))
+    if russian:
+        if progress.partial:
+            status_label = "завершён с частичным покрытием"  # noqa: RUF001
+        elif progress.complete:
+            status_label = "завершён"
+        else:
+            status_label = "сохранён для продолжения"
+        header = (
+            f"Пакетный аудит {status_label}.\n"
+            f"run_id={progress.run_id}; статус={progress.status}; "
+            f"файлов={progress.total}; проверено={progress.reviewed}; "
+            f"частично={progress.partial}; ожидает={progress.pending}; "
+            f"пачек={progress.batches}; "
+            f"file_reads={progress.file_reads}."
+        )
+        if not progress.complete:
+            header += (
+                " Прогресс записан в SQLite; повторный вызов с тем же thread ID "  # noqa: RUF001
+                "и исходной целью продолжит с первого непрочитанного файла."  # noqa: RUF001
+            )
+    else:
+        if progress.partial:
+            status_label = "complete with partial coverage"
+        elif progress.complete:
+            status_label = "complete"
+        else:
+            status_label = "saved for continuation"
+        header = (
+            f"Batched project audit {status_label}.\n"
+            f"run_id={progress.run_id}; status={progress.status}; "
+            f"files={progress.total}; reviewed={progress.reviewed}; "
+            f"partial={progress.partial}; pending={progress.pending}; "
+            f"batches={progress.batches}; "
+            f"file_reads={progress.file_reads}."
+        )
+        if not progress.complete:
+            header += (
+                " Progress is persisted in SQLite; repeating the original objective "
+                "with the same thread ID resumes at the first unread file."
+            )
+
+    rendered_batches: list[str] = []
+    for batch, answer, processed_count in batch_answers:
+        bounded_answer = answer
+        if len(bounded_answer) > 8_000:
+            omitted = len(bounded_answer) - 8_000
+            prefix = bounded_answer[:8_000]
+            bounded_answer = f"{prefix}\n...[batch output truncated by {omitted} chars]"
+        rendered_batches.append(
+            f"Batch {batch.number}: processed={processed_count}/{len(batch.paths)}\n"
+            f"{bounded_answer}"
+        )
+    if not rendered_batches:
+        rendered_batches.append(
+            "No batch invocation was required; the stored manifest was already "
+            "complete."
+        )
+    elif all(processed_count == 0 for _, _, processed_count in batch_answers):
+        rendered_batches.append(
+            "Audit paused because the latest batch produced no verified file read or "
+            "mutation; no unread file was incorrectly marked complete."
+        )
+    rendered_batches.append(f"Per-request batch limit: {batch_limit}.")
+    return f"{header}\n\n" + "\n\n".join(rendered_batches)
+
+
 class AgentRuntime:
     """Own the Deep Agent graph, persistent search index, and checkpointer."""
 
@@ -2155,6 +2490,14 @@ class AgentRuntime:
             chunk_overlap=self.app_config.chunk_overlap,
             max_file_bytes=self.app_config.max_file_bytes,
         )
+        self.project_audit_store = ProjectAuditStore(
+            self.app_config.project_audit_database
+        )
+        self.project_check_runner = ProjectCheckRunner(
+            workspace=self.app_config.workspace,
+            timeout_seconds=self.app_config.project_check_timeout_seconds,
+            output_max_chars=self.app_config.project_check_output_max_chars,
+        )
         self._checkpoint_connection = sqlite3.connect(
             self.app_config.checkpoint_database,
             check_same_thread=False,
@@ -2193,6 +2536,12 @@ class AgentRuntime:
             "memory_scope": (
                 "persistent SQLite archive searchable across restarts and thread IDs"
             ),
+            "recursion_limit": self.app_config.recursion_limit,
+            "audit_batch_size": self.app_config.audit_batch_size,
+            "audit_max_batches_per_request": (
+                self.app_config.audit_max_batches_per_request
+            ),
+            "audit_max_reads_per_file": self.app_config.audit_max_reads_per_file,
         }
         tools = build_agent_tools(
             self.context_store,
@@ -2203,6 +2552,8 @@ class AgentRuntime:
                 **runtime_static_metadata,
             },
             web_retry_attempts=self.app_config.web_retry_attempts,
+            project_audit_store=self.project_audit_store,
+            project_check_runner=self.project_check_runner,
             **tool_kwargs,
         )
         filesystem_middleware = FilesystemMiddleware(
@@ -2212,7 +2563,9 @@ class AgentRuntime:
         )
         tool_audit_middleware = ToolAuditMiddleware(self.app_config.workspace)
         self._tool_audit_middleware = tool_audit_middleware
-        tool_call_policy_middleware = ToolCallPolicyMiddleware()
+        tool_call_policy_middleware = ToolCallPolicyMiddleware(
+            audit_read_limit=self.app_config.audit_max_reads_per_file
+        )
         self._tool_call_policy_middleware = tool_call_policy_middleware
         self.agent = create_deep_agent(
             model=primary_model,
@@ -2223,27 +2576,31 @@ class AgentRuntime:
             ),
             backend=backend,
             checkpointer=checkpointer,
-            middleware=[
-                filesystem_middleware,
-                AcceptanceCompletionMiddleware(),
-                ExactOnceToolMiddleware(),
-                ExplicitToolBudgetMiddleware(),
-                SequentialToolCallMiddleware(
-                    send_parallel_tool_calls=self.provider_config.name != "zhipu"
-                ),
-                ExactDirectoryRemovalMiddleware(),
-                tool_audit_middleware,
-                tool_call_policy_middleware,
-                ExactReadPathMiddleware(),
-                provider_failover_middleware,
-                ModelRetryMiddleware(
-                    max_retries=self.app_config.model_call_retries,
-                    on_failure="error",
-                    initial_delay=self.app_config.model_retry_initial_delay,
-                    max_delay=self.app_config.model_retry_max_delay,
-                ),
-                TodoListMiddleware(),
-            ],
+            middleware=cast(
+                Any,
+                [
+                    filesystem_middleware,
+                    AcceptanceCompletionMiddleware(),
+                    ExactOnceToolMiddleware(),
+                    ExplicitToolBudgetMiddleware(),
+                    SequentialToolCallMiddleware(
+                        send_parallel_tool_calls=(self.provider_config.name != "zhipu")
+                    ),
+                    ExactDirectoryRemovalMiddleware(),
+                    tool_audit_middleware,
+                    tool_call_policy_middleware,
+                    ExactReadPathMiddleware(),
+                    ProjectAuditBatchMiddleware(),
+                    provider_failover_middleware,
+                    ModelRetryMiddleware(
+                        max_retries=self.app_config.model_call_retries,
+                        on_failure="error",
+                        initial_delay=self.app_config.model_retry_initial_delay,
+                        max_delay=self.app_config.model_retry_max_delay,
+                    ),
+                    TodoListMiddleware(),
+                ],
+            ),
         )
         self.last_tool_audit: tuple[ToolAuditEntry, ...] = ()
         self._closed = False
@@ -2362,6 +2719,106 @@ class AgentRuntime:
             checkpoint_id = str(checkpoint.config["configurable"]["checkpoint_id"])
             self._record_thread_head(thread_id, checkpoint_id)
 
+    def run_project_audit(
+        self,
+        objective: str,
+        *,
+        thread_id: str = "default",
+        max_batches: int | None = None,
+    ) -> str:
+        """Run or resume a bounded, evidence-backed project audit."""
+
+        clean_objective = objective.strip()
+        clean_thread_id = thread_id.strip()
+        if not clean_objective:
+            raise ValueError("Audit objective cannot be empty")
+        if not clean_thread_id:
+            raise ValueError("thread_id cannot be empty")
+        batch_limit = (
+            self.app_config.audit_max_batches_per_request
+            if max_batches is None
+            else max_batches
+        )
+        if not 1 <= batch_limit <= 100:
+            raise ValueError("max_batches must be between 1 and 100")
+
+        progress = self.project_audit_store.start_or_resume(
+            thread_id=clean_thread_id,
+            objective=clean_objective,
+            workspace=self.app_config.workspace,
+            batch_size=self.app_config.audit_batch_size,
+        )
+        batch_answers: list[tuple[AuditBatch, str, int]] = []
+
+        for _ in range(batch_limit):
+            batch = self.project_audit_store.next_batch(progress.run_id)
+            if batch is None:
+                progress = self.project_audit_store.progress(progress.run_id)
+                break
+            batch_thread_id = (
+                f"{clean_thread_id}:audit:{progress.run_id}:{batch.number}"
+            )
+            request = _build_project_audit_batch_request(
+                clean_objective,
+                batch,
+                progress,
+                max_reads_per_file=self.app_config.audit_max_reads_per_file,
+            )
+            try:
+                answer = self.ask(
+                    request,
+                    thread_id=batch_thread_id,
+                    auto_context=False,
+                )
+            except Exception:
+                self.project_audit_store.release_batch(batch)
+                raise
+
+            processed_paths = {
+                entry.path
+                for entry in self.last_tool_audit
+                if entry.name in {"read_file", "write_file", "edit_file"}
+                and entry.status == "success"
+                and entry.path is not None
+            }
+            partial_paths = {
+                entry.path
+                for entry in self.last_tool_audit
+                if entry.name == "read_file"
+                and entry.status == "denied"
+                and "read limit" in entry.result
+                and entry.path is not None
+            }
+            read_counts = Counter(
+                entry.path
+                for entry in self.last_tool_audit
+                if entry.name == "read_file"
+                and entry.status == "success"
+                and entry.path is not None
+            )
+            progress = self.project_audit_store.complete_batch(
+                batch,
+                processed_paths=processed_paths,
+                read_counts=read_counts,
+                partial_paths=partial_paths,
+                answer=answer,
+            )
+            processed_count = sum(
+                _project_path_from_virtual(path).casefold()
+                in {item.casefold() for item in batch.paths}
+                for path in processed_paths
+            )
+            batch_answers.append((batch, answer, processed_count))
+            if processed_count == 0 or progress.complete:
+                break
+
+        return _format_project_audit_response(
+            clean_objective,
+            progress,
+            batch_answers,
+            batch_limit=batch_limit,
+        )
+
     def ask(
         self,
         query: str,
@@ -2413,6 +2870,14 @@ class AgentRuntime:
             self.context_store.archive_message(clean_thread_id, "user", clean_query)
             self.context_store.archive_message(clean_thread_id, "assistant", answer)
             return answer
+        if (
+            _PROJECT_AUDIT_BATCH_MARKER not in clean_query
+            and is_broad_project_audit_request(clean_query)
+        ):
+            return self.run_project_audit(
+                clean_query,
+                thread_id=clean_thread_id,
+            )
         hits = []
         if auto_context and not should_skip_automatic_retrieval(
             clean_query,
@@ -2439,7 +2904,7 @@ class AgentRuntime:
                 {"messages": [{"role": "user", "content": request}]},
                 config={
                     "configurable": configurable,
-                    "recursion_limit": 100,
+                    "recursion_limit": self.app_config.recursion_limit,
                 },
             )
         except Exception as exc:
@@ -2490,6 +2955,7 @@ class AgentRuntime:
     def close(self) -> None:
         """Close persistent resources owned by this runtime."""
         if not self._closed:
+            self.project_audit_store.close()
             self.context_store.close()
             self._checkpoint_connection.close()
             self._closed = True

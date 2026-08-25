@@ -308,6 +308,12 @@ class AppConfig:
     model_retry_initial_delay: float = 1.0
     model_retry_max_delay: float = 15.0
     web_retry_attempts: int = 3
+    recursion_limit: int = 100
+    audit_batch_size: int = 8
+    audit_max_batches_per_request: int = 4
+    audit_max_reads_per_file: int = 4
+    project_check_timeout_seconds: int = 300
+    project_check_output_max_chars: int = 20_000
 
     def __post_init__(self) -> None:
         if self.context_top_k <= 0:
@@ -338,6 +344,26 @@ class AppConfig:
             )
         if self.web_retry_attempts <= 0:
             raise ConfigurationError("AGENT_WEB_RETRY_ATTEMPTS must be positive")
+        if not 25 <= self.recursion_limit <= 500:
+            raise ConfigurationError("AGENT_RECURSION_LIMIT must be between 25 and 500")
+        if not 1 <= self.audit_batch_size <= 25:
+            raise ConfigurationError("AGENT_AUDIT_BATCH_SIZE must be between 1 and 25")
+        if not 1 <= self.audit_max_batches_per_request <= 100:
+            raise ConfigurationError(
+                "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST must be between 1 and 100"
+            )
+        if not 2 <= self.audit_max_reads_per_file <= 12:
+            raise ConfigurationError(
+                "AGENT_AUDIT_MAX_READS_PER_FILE must be between 2 and 12"
+            )
+        if not 10 <= self.project_check_timeout_seconds <= 3_600:
+            raise ConfigurationError(
+                "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS must be between 10 and 3600"
+            )
+        if not 1_000 <= self.project_check_output_max_chars <= 100_000:
+            raise ConfigurationError(
+                "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS must be between 1000 and 100000"
+            )
 
     @property
     def context_database(self) -> Path:
@@ -348,6 +374,11 @@ class AppConfig:
     def checkpoint_database(self) -> Path:
         """Return the path of the LangGraph checkpoint database."""
         return self.data_dir / "checkpoints.sqlite3"
+
+    @property
+    def project_audit_database(self) -> Path:
+        """Return the persistent project-audit manifest database path."""
+        return self.data_dir / "project_audit.sqlite3"
 
     @classmethod
     def from_env(
@@ -416,6 +447,36 @@ class AppConfig:
                 values,
                 "AGENT_WEB_RETRY_ATTEMPTS",
                 3,
+            ),
+            recursion_limit=_int_setting(
+                values,
+                "AGENT_RECURSION_LIMIT",
+                100,
+            ),
+            audit_batch_size=_int_setting(
+                values,
+                "AGENT_AUDIT_BATCH_SIZE",
+                8,
+            ),
+            audit_max_batches_per_request=_int_setting(
+                values,
+                "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST",
+                4,
+            ),
+            audit_max_reads_per_file=_int_setting(
+                values,
+                "AGENT_AUDIT_MAX_READS_PER_FILE",
+                4,
+            ),
+            project_check_timeout_seconds=_int_setting(
+                values,
+                "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS",
+                300,
+            ),
+            project_check_output_max_chars=_int_setting(
+                values,
+                "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS",
+                20_000,
             ),
         )
 

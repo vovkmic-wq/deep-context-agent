@@ -12,10 +12,20 @@ import pytest
 from context_agent.cli import (
     MAX_PROMPT_FILE_BYTES,
     build_parser,
+    configure_standard_streams,
     read_chat_query,
     read_prompt_file,
     resolve_ask_query,
 )
+
+
+class _ConfigurableTextStream(StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.configuration: dict[str, str] = {}
+
+    def reconfigure(self, **kwargs: str) -> None:
+        self.configuration = kwargs
 
 
 def test_cli_accepts_ordered_provider_chain() -> None:
@@ -24,11 +34,37 @@ def test_cli_accepts_ordered_provider_chain() -> None:
     assert args.providers == "openai,glm,deepseek"
 
 
+def test_cli_configures_utf8_output_for_windows_pipes() -> None:
+    stream = _ConfigurableTextStream()
+    configure_standard_streams((stream,))
+    assert stream.configuration == {"encoding": "utf-8", "errors": "replace"}
+    stream.write("аудит → завершён")
+    assert "→" in stream.getvalue()
+
+
 def test_cli_rejects_single_and_priority_provider_together() -> None:
     with pytest.raises(SystemExit):
         build_parser().parse_args(
             ["--provider", "openai", "--providers", "glm,qwen", "doctor"]
         )
+
+
+def test_cli_accepts_resumable_audit_command() -> None:
+    args = build_parser().parse_args(
+        [
+            "--thread",
+            "production-audit",
+            "audit",
+            "--file",
+            "audit-prompt.txt",
+            "--max-batches",
+            "25",
+        ]
+    )
+    assert args.command == "audit"
+    assert args.thread == "production-audit"
+    assert args.file == Path("audit-prompt.txt")
+    assert args.max_batches == 25
 
 
 def test_chat_paste_mode_returns_one_multiline_query(

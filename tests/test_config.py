@@ -243,6 +243,12 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_MODEL_RETRY_INITIAL_DELAY": "0.5",
             "AGENT_MODEL_RETRY_MAX_DELAY": "5",
             "AGENT_WEB_RETRY_ATTEMPTS": "2",
+            "AGENT_RECURSION_LIMIT": "140",
+            "AGENT_AUDIT_BATCH_SIZE": "6",
+            "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST": "9",
+            "AGENT_AUDIT_MAX_READS_PER_FILE": "5",
+            "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "600",
+            "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "30000",
         },
     )
     config.prepare_directories()
@@ -255,6 +261,13 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.model_retry_initial_delay == 0.5
     assert config.model_retry_max_delay == 5
     assert config.web_retry_attempts == 2
+    assert config.recursion_limit == 140
+    assert config.audit_batch_size == 6
+    assert config.audit_max_batches_per_request == 9
+    assert config.audit_max_reads_per_file == 5
+    assert config.project_check_timeout_seconds == 600
+    assert config.project_check_output_max_chars == 30_000
+    assert config.project_audit_database == (tmp_path / "data/project_audit.sqlite3")
     assert config.workspace.is_dir()
     assert config.data_dir.is_dir()
     assert config.context_root.is_dir()
@@ -268,6 +281,26 @@ def test_legacy_retrieval_limit_alias_is_supported(tmp_path: Path) -> None:
     )
     assert legacy.context_top_k == 4
     assert canonical.context_top_k == 7
+
+
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [
+        ({"AGENT_RECURSION_LIMIT": "24"}, "RECURSION_LIMIT"),
+        ({"AGENT_AUDIT_BATCH_SIZE": "26"}, "AUDIT_BATCH_SIZE"),
+        ({"AGENT_AUDIT_MAX_BATCHES_PER_REQUEST": "0"}, "MAX_BATCHES"),
+        ({"AGENT_AUDIT_MAX_READS_PER_FILE": "1"}, "MAX_READS"),
+        ({"AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "9"}, "CHECK_TIMEOUT"),
+        ({"AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "999"}, "OUTPUT_MAX"),
+    ],
+)
+def test_app_config_rejects_unsafe_or_unbounded_operational_limits(
+    tmp_path: Path,
+    environment: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ConfigurationError, match=message):
+        AppConfig.from_env(tmp_path, environment)
 
 
 def test_chat_model_factory_preserves_compatible_settings() -> None:

@@ -3,6 +3,41 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Large-project audit orchestration 0.12.0 — 2026-08-25
+
+- Wide project requests route to a persistent SQLite manifest and independent
+  batches instead of one ever-growing graph turn.
+- Manifest completion is evidence-backed; unread files remain pending and a
+  changed SHA-256 reopens only the changed file.
+- Unique reviewed-file counts are separate from actual paginated `file_reads`;
+  the final report cannot hide a second page call as one read.
+- Per-file page exhaustion is represented by `partial` and
+  `complete_with_partial`; uncovered lines are never reported as reviewed.
+- Cached summaries and a Python AST index provide a compact project map without
+  importing target code or placing the corpus in an LLM prompt.
+- `run_project_checks` exposes only a fixed no-shell allowlist with timeout,
+  bounded/redacted output and secret-free child environment.
+- Operational limits are configurable and validated; `recursion_limit` is no
+  longer hardcoded in the graph call.
+
+| Этап 0.12.0 | Статус | Проверка | Результат |
+| --- | --- | --- | --- |
+| Prompt/ТЗ/документация | Завершён | System prompt, `IMPLEMENTATION_PROMPT.md`, `TECHNICAL_SPEC.md`, README, env, changelog | Two-level large-context model and batch rules synchronized |
+| Manifest/SHA/resume | Завершён | Unit: partial batch, restart, changed file | Only verified/current files become reviewed |
+| Summary/AST | Завершён | Unit: cache reuse and qualified nested symbol | No import/execution of target code |
+| Safe checks | Завершён | Unit: injection denial, `shell=False`, env redaction, repeat after mutation | Fixed allowlist only; bounded cycle |
+| Scale | Завершён | Existing 1,000,001-line FTS5 test plus 300-file manifest | Beginning/end searchable; corpus never placed in one prompt |
+| Финальный контур | Завершён | Ruff check/format, mypy `src tests`, compileall, wheel, CLI/doctor/live | 168 passed, 1 Windows symlink skip; wheel 0.12.0; GLM-5.3 doctor/agent/batch live OK |
+
+Live evidence на чистых временных workspace/data/thread:
+
+- `doctor --live`: `zhipu/glm-5.3`, `live_response=OK`;
+- полный `AgentRuntime.ask`: точный ответ `DEEP_CONTEXT_012_OK`;
+- batch audit: 2/2 файла, `partial=0`, `file_reads=4`, README 368/368
+  строк, UTF-8 stdout без `charmap` exception;
+- первый live-прогон обнаружил Windows stdout codec и page-budget дефекты;
+  исправления выполнены и подтверждены повторными clean-DB live-прогонами.
+
 ## Default GLM/OpenAI chain 0.11.0 — 2026-08-24
 
 - Основная модель по умолчанию: `zhipu/glm-5.3`.

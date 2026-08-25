@@ -282,7 +282,11 @@ class ContextStore:
                             datetime.now(UTC).isoformat(),
                         ),
                     )
-                    document_id = int(cursor.lastrowid)
+                    if cursor.lastrowid is None:
+                        raise sqlite3.DatabaseError(
+                            "SQLite did not return an inserted document ID"
+                        )
+                    document_id = cursor.lastrowid
                     self._connection.executemany(
                         """
                         INSERT INTO chunks(document_id, chunk_index, content)
@@ -368,7 +372,11 @@ class ContextStore:
                             datetime.now(UTC).isoformat(),
                         ),
                     )
-                    document_id = int(cursor.lastrowid)
+                    if cursor.lastrowid is None:
+                        raise sqlite3.DatabaseError(
+                            "SQLite did not return an inserted document ID"
+                        )
+                    document_id = cursor.lastrowid
                     batch: list[tuple[int, int, str]] = []
                     for chunk_index, chunk in enumerate(
                         _iter_file_chunks(

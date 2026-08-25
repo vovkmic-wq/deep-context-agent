@@ -3,6 +3,60 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.12.0] — 2026-08-25
+
+### Добавлено
+
+- Постоянный SQLite-манифест широкого аудита со стабильным run ID,
+  crash-safe resume, bounded batches и статусами каждого файла.
+- SHA-256 file ledger, кеш кратких сводок и Python AST-индекс определений без
+  импорта или исполнения кода проекта.
+- Автоматическая маршрутизация полного project audit в независимые graph turns
+  и CLI-команда `audit` с жёстким `--max-batches`.
+- Tools `project_audit_status`, `get_project_file_summary`,
+  `search_python_symbols` и фиксированный `run_project_checks`.
+- Настройки recursion limit, размера/числа пачек, timeout и output limit
+  проверок с программной валидацией границ.
+
+### Изменено
+
+- Hardcoded `recursion_limit=100` заменён `AGENT_RECURSION_LIMIT`.
+- Широкий аудит читает только 1–25 manifest-файлов (по умолчанию 8) за graph invocation и
+  фиксирует completion исключительно по успешным file ToolMessages.
+- Повтор project checks разрешён после подтверждённой filesystem mutation;
+  идентичный повтор без изменения и шестой цикл в одном ходе блокируются.
+- Manifest раздельно считает уникальные reviewed-файлы и все успешные
+  `file_reads`, включая разные страницы длинного файла.
+- Bounded page budget на файл (по умолчанию 4) позволяет пагинацию внутри
+  batch; исчерпание даёт `partial`/`complete_with_partial`, а не ложный review.
+- Идентичный audit page-read блокируется по точным args; новый offset/limit
+  остаётся доступен и отдельно учитывается в `file_reads`.
+- Global prompt, управляющий prompt, ТЗ, README, env-пример и runtime metadata
+  синхронизированы с двухуровневой моделью большого контекста.
+
+### Безопасность
+
+- Batch middleware запрещает доступ за пределы выделенных manifest paths,
+  discovery tools и изменение набора путей во время пачки.
+- Project checks не принимают shell/argv, используют `shell=False`, очищают
+  child environment от ключей/токенов/паролей, редактируют и ограничивают вывод.
+- CLI принудительно использует UTF-8 для stdout/stderr, поэтому Unicode-ответы
+  провайдера не падают с Windows `charmap` при pipe/redirect.
+- Audit index пропускает secret env-файлы, binary/NUL-файлы, symlinks,
+  виртуальные окружения, generated и cache directories.
+
+### Тесты
+
+- Добавлены регрессии manifest resume, SHA invalidation, summary cache,
+  AST-qualified symbols, 300 документов, fixed check allowlist, redaction,
+  batch routing и повтор проверки только после мутации.
+- Сохранены регрессии поиска начала и конца файла из 1 000 001 строк и
+  пагинации сотен документов в FTS5.
+- Финальный контур: Ruff check/format, mypy по 22 source/test files, compileall,
+  168 passed и 1 ожидаемый Windows symlink skip; wheel 0.12.0 собран.
+- GLM-5.3 live: doctor, полный agent turn и clean-DB batch audit 2/2 прошли;
+  `file_reads=4`, `partial=0`, Unicode stdout подтверждён.
+
 ## [0.11.0] — 2026-08-24
 
 ### Изменено
