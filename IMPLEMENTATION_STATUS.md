@@ -3,6 +3,38 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Production audit and Web UI 0.13.0 — 2026-08-27
+
+| Этап 0.13.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Baseline | Завершён | Ruff lint/format, mypy, 168 passed + 1 planned symlink skip до изменений |
+| Explicit audit mode | Завершён | Read-only default; только `--allow-write`; mode в identity/SQLite/status/report; regression против inference по `fix` |
+| File selection | Завершён | Built-in generated/dependency/report filters, env include/exclude, selected/excluded/reasons |
+| Requirements/findings | Завершён | Устойчивые REQ IDs, bounded batch subset, candidate evidence matrix, validated/deduplicated findings |
+| Output/resume | Завершён | Compact console, direct UTF-8 text/JSON, flush progress, model-free status, pause/cancel/resume |
+| Web backend/UI | Завершён | FastAPI/Uvicorn extra, local static UI, REST/SSE, shared runtime/SQLite, files/providers/settings |
+| Web security | Завершён | Same-origin, CSRF, CSP, remote bearer gate, path/secret guards, optimistic hash, delete off |
+| Large corpus | Завершён | Автотест реального файла 1 000 000 строк и 500 отдельных документов |
+| Документация/version | Завершён | Global prompt, implementation prompt, ТЗ, Web-ТЗ, README, env, changelog, 0.13.0 |
+| Финальный контур | Завершён | Ruff check/format, mypy, compileall, 181 passed + 1 planned symlink skip; wheel/static, CLI/doctor, HTTP Web smoke и GLM-5.3 live audit OK |
+
+Финальные evidence 0.13.0:
+
+- `ruff check --no-cache .` — PASS; `ruff format --check --no-cache .` — 40
+  файлов уже отформатированы; `mypy src/context_agent` — PASS для 13 modules;
+- `pytest -ra` — 181 passed, 1 planned Windows symlink skip;
+- `compileall`, `pip check` — PASS; wheel 0.13.0 содержит 22 файла и локальный
+  static bundle, SHA-256
+  `D0573D286BE9C458B6FF1ACF3CCAC0F6E4C166DA096A507A56F09DC808594B6E`;
+- TypeScript `tsc --noEmit`, reproducible esbuild и bundle test — PASS,
+  production JS+CSS 11 690 bytes;
+- реальный Uvicorn HTTP smoke на чистых workspace/data — health, version,
+  static page и CSP PASS;
+- `doctor --live` выбрал primary `zhipu/glm-5.3` и получил `OK`;
+- clean-DB live audit `aba479946ef46a305c72fa7c` обработал 2/2 файла,
+  `file_reads=2`, `partial=0`, `mode=read-only`, сохранил UTF-8 text/JSON и не
+  изменил fixture.
+
 ## Large-project audit orchestration 0.12.0 — 2026-08-25
 
 - Wide project requests route to a persistent SQLite manifest and independent

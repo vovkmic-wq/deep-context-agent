@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import socket
 import sys
+import webbrowser
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
@@ -14,6 +17,7 @@ from dotenv import load_dotenv
 from context_agent.config import SUPPORTED_PROVIDERS, AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
 from context_agent.errors import AgentError
+from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
 from context_agent.runtime import AgentRuntime, message_text
 
@@ -100,6 +104,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit objective, or '-' to read it from stdin.",
     )
     audit_parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help=(
+            "Explicitly permit audited changes to existing allocated files. "
+            "Without this flag every audit is read-only."
+        ),
+    )
+    audit_parser.add_argument(
+        "--report-file",
+        type=Path,
+        help="Write the complete UTF-8 report directly to this path.",
+    )
+    audit_parser.add_argument(
+        "--report-format",
+        choices=("text", "json", "both"),
+        default="text",
+        help="Detailed report format (default: text).",
+    )
+
+    status_parser = subparsers.add_parser(
+        "audit-status",
+        help="Read persisted audit progress without invoking an LLM.",
+    )
+    status_parser.add_argument("--run-id", required=True)
+    status_parser.add_argument("--json", action="store_true")
+    audit_parser.add_argument(
         "--file",
         type=Path,
         help="Read one UTF-8 audit objective from a file (max 2 MiB).",
@@ -135,6 +165,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--live",
         action="store_true",
         help="Also make one small model request.",
+    )
+
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Start the secure local web interface.",
+    )
+    web_parser.add_argument("--host", default="127.0.0.1")
+    web_parser.add_argument("--port", type=int, default=8765)
+    web_parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Permit a non-loopback bind; requires AGENT_WEB_AUTH_TOKEN.",
+    )
+    web_parser.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Open the UI in the default browser after startup.",
     )
     return parser
 
@@ -202,6 +249,35 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"recursion_limit={app_config.recursion_limit}")
     print(f"audit_batch_size={app_config.audit_batch_size}")
     print(f"audit_max_reads_per_file={app_config.audit_max_reads_per_file}")
+    print("audit_mode_default=read-only")
+    print(
+        "audit_include="
+        + (",".join(app_config.audit_include) if app_config.audit_include else "<all>")
+    )
+    print(
+        "audit_exclude="
+        + (",".join(app_config.audit_exclude) if app_config.audit_exclude else "<none>")
+    )
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError:
+        print("web_dependencies=missing (install .[web])")
+    else:
+        print("web_dependencies=available")
+    static_root = Path(__file__).parent / "static"
+    static_ok = all(
+        (static_root / name).is_file()
+        for name in ("index.html", "app.js", "styles.css")
+    )
+    print(f"web_static_bundle={'ok' if static_ok else 'missing'}")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 8765))
+    except OSError:
+        print("web_port_8765=in_use")
+    else:
+        print("web_port_8765=available")
     if args.live:
         failures: list[str] = []
         for candidate in providers:
@@ -325,14 +401,104 @@ def _run_ask(args: argparse.Namespace, base_dir: Path) -> int:
 
 
 def _run_audit(args: argparse.Namespace, base_dir: Path) -> int:
+    def report_progress(
+        progress: AuditProgress,
+        batch_number: int,
+        processed_count: int,
+    ) -> None:
+        payload = {
+            "event": "audit_progress",
+            "batch_number": batch_number,
+            "processed_count": processed_count,
+            **progress.as_dict(),
+        }
+        print(
+            "AUDIT_PROGRESS " + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            flush=True,
+        )
+
     with _runtime(args, base_dir) as runtime:
         print(
             runtime.run_project_audit(
                 resolve_ask_query(args),
                 thread_id=args.thread,
                 max_batches=args.max_batches,
+                allow_write=args.allow_write,
+                report_file=args.report_file,
+                report_format=args.report_format,
+                progress_callback=report_progress,
             )
         )
+    return 0
+
+
+def _run_audit_status(args: argparse.Namespace, base_dir: Path) -> int:
+    config = _app_config(base_dir)
+    with ProjectAuditStore(config.project_audit_database) as store:
+        details = store.run_details(args.run_id)
+    if args.json:
+        print(json.dumps(details, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        progress = details["progress"]
+        if not isinstance(progress, dict):
+            raise ValueError("Stored audit progress is invalid")
+        print(
+            f"run_id={details['id']} status={details['status']} "
+            f"mode={details['mode']} reviewed={progress['reviewed']}/"
+            f"{progress['total']} pending={progress['pending']} "
+            f"excluded={progress['excluded']} batches={progress['batches']}"
+        )
+    return 0
+
+
+def _run_web(args: argparse.Namespace, base_dir: Path) -> int:
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    if not 1 <= args.port <= 65_535:
+        raise ValueError("port must be between 1 and 65535")
+    remote = args.host.casefold() not in loopback_hosts
+    if remote and not args.allow_remote:
+        raise ValueError("Non-loopback host requires --allow-remote")
+    auth_token = os.getenv("AGENT_WEB_AUTH_TOKEN")
+    if remote and not auth_token:
+        raise ValueError("Remote mode requires AGENT_WEB_AUTH_TOKEN")
+    trusted_proxy = os.getenv("AGENT_WEB_TRUSTED_HTTPS_PROXY", "").casefold() in {
+        "1",
+        "true",
+    }
+    if remote and not trusted_proxy:
+        raise ValueError(
+            "Remote mode requires AGENT_WEB_TRUSTED_HTTPS_PROXY=1 and an HTTPS proxy"
+        )
+    try:
+        import uvicorn
+
+        from context_agent.web import create_app
+    except ImportError as exc:
+        raise AgentError(
+            "Web dependencies are missing; install with pip install -e '.[web]'"
+        ) from exc
+
+    config = _app_config(base_dir)
+    providers = ProviderConfig.priority_from_env(args.provider, args.providers)
+    app = create_app(
+        config,
+        providers,
+        allow_remote=remote,
+        auth_token=auth_token,
+        trusted_https_proxy=trusted_proxy,
+    )
+    display_host = "127.0.0.1" if args.host == "localhost" else args.host
+    url = f"http://{display_host}:{args.port}/"
+    print(f"Deep Context Agent Web: {url}", flush=True)
+    if remote:
+        print(
+            "WARNING: remote mode requires an HTTPS reverse proxy in production.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if args.open_browser:
+        webbrowser.open(url)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
 
@@ -370,11 +536,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     commands = {
         "audit": _run_audit,
+        "audit-status": _run_audit_status,
         "ask": _run_ask,
         "chat": _run_chat,
         "doctor": _run_doctor,
         "index": _run_index,
         "search": _run_search,
+        "web": _run_web,
     }
     try:
         return commands[args.command](args, base_dir)

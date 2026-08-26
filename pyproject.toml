@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deep-context-agent"
-version = "0.12.0"
-description = "A persistent, searchable Deep Agents CLI with multiple LLM providers."
+version = "0.13.0"
+description = "A persistent, searchable Deep Agents CLI and secure local web UI."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 license = { text = "MIT" }
@@ -20,11 +20,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+web = [
+  "fastapi>=0.116,<1",
+  "uvicorn>=0.35,<1",
+]
 dev = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
   "mypy>=1.17,<2",
   "pytest>=8.4,<10",
   "pytest-cov>=6.2,<8",
   "ruff>=0.12,<1",
+  "uvicorn>=0.35,<1",
 ]
 
 [project.scripts]
@@ -32,6 +39,9 @@ context-agent = "context_agent.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context_agent"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/webui", "/README.md", "/pyproject.toml"]
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers -p no:cacheprovider"

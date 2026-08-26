@@ -443,15 +443,69 @@ def test_mutating_project_audit_requires_read_before_write(tmp_path: Path) -> No
     )
 
     with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
-        runtime.ask(
+        runtime.run_project_audit(
             "Perform a full audit and fix all confirmed project issues.",
             thread_id="read-before-write",
+            allow_write=True,
         )
 
     assert target.read_text(encoding="utf-8") == "VALUE = 2\n"
     assert [entry.status for entry in runtime.last_tool_audit] == [
         "denied",
         "success",
+        "success",
+    ]
+
+
+def test_fix_wording_never_infers_audit_write_permission(tmp_path: Path) -> None:
+    app_config = replace(
+        _app_config(tmp_path),
+        audit_batch_size=1,
+        audit_max_batches_per_request=1,
+    )
+    app_config.prepare_directories()
+    target = app_config.workspace / "main.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/main.py",
+                            "content": "VALUE = 2\n",
+                        },
+                        "id": "implicit-write",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/main.py"},
+                        "id": "read-only-proof",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="read-only complete"),
+        ]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.run_project_audit(
+            "Perform a full audit and fix every issue.",
+            thread_id="explicit-mode",
+        )
+
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "denied",
         "success",
     ]
 

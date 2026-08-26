@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Deep Context Agent</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Перейти к содержимому</a>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Локальная рабочая среда</p>
+        <h1>Deep Context Agent</h1>
+      </div>
+      <div id="runtime-badge" class="badge" aria-live="polite">Подключение…</div>
+    </header>
+    <nav aria-label="Разделы">
+      <button data-panel="overview" aria-current="page">Обзор</button>
+      <button data-panel="chat">Чат</button>
+      <button data-panel="context">Контекст</button>
+      <button data-panel="audits">Аудиты</button>
+      <button data-panel="files">Файлы</button>
+      <button data-panel="providers">Провайдеры</button>
+      <button data-panel="settings">Настройки</button>
+    </nav>
+    <main id="main">
+      <section id="overview" class="panel active" aria-labelledby="overview-title">
+        <h2 id="overview-title">Состояние</h2>
+        <div id="overview-grid" class="metric-grid"></div>
+        <pre id="health" class="output" aria-live="polite"></pre>
+      </section>
+
+      <section id="chat" class="panel" aria-labelledby="chat-title">
+        <h2 id="chat-title">Чат</h2>
+        <form id="chat-form">
+          <label>Thread ID <input id="thread-id" value="web" maxlength="100"></label>
+          <label>Сообщение <textarea id="chat-query" rows="7" required></textarea></label>
+          <label class="check"><input id="auto-context" type="checkbox" checked> Автопоиск контекста</label>
+          <button type="submit">Отправить</button>
+          <button id="cancel-chat" type="button" class="secondary">Отменить</button>
+        </form>
+        <div id="chat-output" class="output conversation" aria-live="polite"></div>
+      </section>
+
+      <section id="context" class="panel" aria-labelledby="context-title">
+        <h2 id="context-title">Большой контекст</h2>
+        <form id="context-form" class="inline-form">
+          <label>Поиск <input id="context-query" required></label>
+          <label>Top-k <input id="context-limit" type="number" value="8" min="1" max="100"></label>
+          <button type="submit">Найти</button>
+        </form>
+        <button id="index-workspace" type="button" class="secondary">Индексировать /workspace</button>
+        <div id="context-output" class="cards" aria-live="polite"></div>
+      </section>
+
+      <section id="audits" class="panel" aria-labelledby="audits-title">
+        <h2 id="audits-title">Пакетный аудит</h2>
+        <form id="audit-form">
+          <label>Thread ID <input id="audit-thread" value="web-audit" maxlength="100"></label>
+          <label>Цель и ТЗ <textarea id="audit-objective" rows="8" required></textarea></label>
+          <div class="inline-form">
+            <label>Include glob <input id="audit-include" placeholder="src/**,tests/**"></label>
+            <label>Exclude glob <input id="audit-exclude" placeholder="docs/generated/**"></label>
+            <label>Размер пачки <input id="audit-batch-size" type="number" min="1" max="25" value="8"></label>
+          </div>
+          <label class="check warning"><input id="audit-write" type="checkbox"> Разрешить изменение выделенных файлов</label>
+          <button type="submit">Запустить аудит</button>
+          <button id="refresh-audits" type="button" class="secondary">Обновить список</button>
+        </form>
+        <div id="audit-progress" class="output" aria-live="polite"></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Run ID</th><th>Режим</th><th>Статус</th><th>Обновлён</th></tr></thead>
+          <tbody id="audit-rows"></tbody>
+        </table></div>
+      </section>
+
+      <section id="files" class="panel" aria-labelledby="files-title">
+        <h2 id="files-title">Файлы workspace</h2>
+        <form id="files-form" class="inline-form">
+          <label>Каталог <input id="files-path" value=""></label>
+          <button type="submit">Открыть</button>
+        </form>
+        <div id="files-output" class="cards" aria-live="polite"></div>
+      </section>
+
+      <section id="providers" class="panel" aria-labelledby="providers-title">
+        <h2 id="providers-title">Провайдеры</h2>
+        <button id="load-providers" type="button">Проверить конфигурацию</button>
+        <button id="live-doctor" type="button" class="danger">Платный live-check</button>
+        <div id="providers-output" class="cards" aria-live="polite"></div>
+      </section>
+
+      <section id="settings" class="panel" aria-labelledby="settings-title">
+        <h2 id="settings-title">Безопасные настройки</h2>
+        <p>Секреты и API-ключи никогда не передаются браузеру.</p>
+        <pre id="settings-output" class="output"></pre>
+      </section>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

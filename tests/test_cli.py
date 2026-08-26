@@ -59,12 +59,29 @@ def test_cli_accepts_resumable_audit_command() -> None:
             "audit-prompt.txt",
             "--max-batches",
             "25",
+            "--allow-write",
+            "--report-file",
+            "audit-report.txt",
+            "--report-format",
+            "both",
         ]
     )
     assert args.command == "audit"
     assert args.thread == "production-audit"
     assert args.file == Path("audit-prompt.txt")
     assert args.max_batches == 25
+    assert args.allow_write is True
+    assert args.report_file == Path("audit-report.txt")
+    assert args.report_format == "both"
+
+
+def test_cli_accepts_model_free_audit_status_and_local_web() -> None:
+    status = build_parser().parse_args(["audit-status", "--run-id", "abc123", "--json"])
+    web = build_parser().parse_args(["web", "--port", "9000"])
+    assert status.command == "audit-status"
+    assert status.json is True
+    assert web.host == "127.0.0.1"
+    assert web.port == 9000
 
 
 def test_chat_paste_mode_returns_one_multiline_query(

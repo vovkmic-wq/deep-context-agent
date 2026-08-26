@@ -3,6 +3,50 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.13.0] — 2026-08-27
+
+### Добавлено
+
+- Явный безопасный режим пакетного аудита: read-only по умолчанию,
+  `--allow-write` как единственная CLI-авторизация, persisted mode в identity,
+  status, prompt и report.
+- Детерминированный file selection с фильтрацией dependency,
+  pytest/browser/report/cache/build/coverage и `*.egg-info`, env include/exclude
+  и статистикой причин исключения.
+- Межпакетный registry требований с устойчивыми `REQ-*`, source hash,
+  релевантной batch-выборкой и evidence matrix; структурированные,
+  валидируемые и дедуплицированные findings.
+- Прямой UTF-8 export полного text/JSON report, компактный console summary,
+  flush `AUDIT_PROGRESS` и model-free `audit-status --json`.
+- Optional FastAPI/Uvicorn Web UI: overview, chat/SSE, context, audits,
+  workspace files, providers и safe settings поверх общих runtime/SQLite.
+- Web security boundary: same-origin, CSRF, CSP, bearer gate для remote,
+  secret path filtering, optimistic SHA-256 writes и disabled-by-default delete.
+- Offline regressions корпуса 1 000 000 строк + 500 документов, режима записи,
+  отбора artifacts, requirements/findings/reports и Web API/security.
+
+### Исправлено
+
+- Слова `fix`, `исправь`, `update` в цели больше не повышают права аудита.
+- Большие LLM batch-ответы больше не создают мегабайтный PowerShell output;
+  полный результат сохраняется в файл без перекодирования через pipeline.
+- Interrupted/paused/cancelled run сохраняет manifest и pending-файлы для
+  безопасного resume.
+
+### Документация
+
+- Синхронизированы глобальный system prompt, управляющий prompt, основное ТЗ,
+  Web-ТЗ, README, env-пример, статус реализации и версия пакета.
+
+### Проверено
+
+- Ruff lint/format, mypy, compileall, `pip check`: PASS; pytest — 181 passed,
+  1 planned Windows symlink skip.
+- TypeScript check/build/bundle test, wheel static inspection и реальный local
+  Uvicorn HTTP smoke: PASS.
+- Primary `zhipu/glm-5.3` `doctor --live`: OK; clean-DB read-only live audit
+  проверил 2/2 файла, сохранил text/JSON report и не изменил workspace.
+
 ## [0.12.0] — 2026-08-25
 
 ### Добавлено

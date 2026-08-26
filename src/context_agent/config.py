@@ -61,6 +61,18 @@ def _int_setting_with_alias(
         raise ConfigurationError(f"{name} must be an integer") from exc
 
 
+def _pattern_setting(environ: Mapping[str, str], name: str) -> tuple[str, ...]:
+    """Read comma/newline-separated non-empty glob patterns."""
+
+    raw = environ.get(name, "")
+    return tuple(
+        item.strip()
+        for line in raw.splitlines()
+        for item in line.split(",")
+        if item.strip()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
     """Resolved settings for one OpenAI-compatible chat model."""
@@ -312,6 +324,8 @@ class AppConfig:
     audit_batch_size: int = 8
     audit_max_batches_per_request: int = 4
     audit_max_reads_per_file: int = 4
+    audit_include: tuple[str, ...] = ()
+    audit_exclude: tuple[str, ...] = ()
     project_check_timeout_seconds: int = 300
     project_check_output_max_chars: int = 20_000
 
@@ -356,6 +370,14 @@ class AppConfig:
             raise ConfigurationError(
                 "AGENT_AUDIT_MAX_READS_PER_FILE must be between 2 and 12"
             )
+        for name, patterns in (
+            ("AGENT_AUDIT_INCLUDE", self.audit_include),
+            ("AGENT_AUDIT_EXCLUDE", self.audit_exclude),
+        ):
+            if len(patterns) > 100 or any(len(pattern) > 500 for pattern in patterns):
+                raise ConfigurationError(
+                    f"{name} supports at most 100 patterns of 500 characters"
+                )
         if not 10 <= self.project_check_timeout_seconds <= 3_600:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS must be between 10 and 3600"
@@ -468,6 +490,8 @@ class AppConfig:
                 "AGENT_AUDIT_MAX_READS_PER_FILE",
                 4,
             ),
+            audit_include=_pattern_setting(values, "AGENT_AUDIT_INCLUDE"),
+            audit_exclude=_pattern_setting(values, "AGENT_AUDIT_EXCLUDE"),
             project_check_timeout_seconds=_int_setting(
                 values,
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS",

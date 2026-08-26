@@ -1,6 +1,43 @@
 # Управляющий промпт реализации
 
-Актуальный управляющий промпт версии 0.12.0 находится в этом файле.
+Актуальный управляющий промпт версии 0.13.0 находится в этом файле.
+
+## Production audit and Web UI 0.13.0 (2026-08-27)
+
+Работай по `DEEP_CONTEXT_AGENT_0_13_PRODUCTION_PROMPT.md`, основному
+`TECHNICAL_SPEC.md` и нормативному `WEB_INTERFACE_TECHNICAL_SPECIFICATION.md`.
+Сначала зафиксируй baseline Ruff/mypy/pytest, затем выполняй изменения малыми
+проверяемыми шагами и не объявляй production без фактических логов.
+
+Удали любое определение write-authority по словам цели. Audit read-only по
+умолчанию; мутации разрешены только доверенным `--allow-write` или эквивалентным
+подтверждённым Web-полем. Сохраняй mode в identity/manifest/status/report и
+блокируй все mutating tools в read-only независимо от текста модели.
+
+До пачек создай точный file ledger с обязательным исключением dependency,
+pytest/browser/report/cache/build/egg-info artifacts и поддержкой env include /
+exclude. Сохраняй selected/excluded/reasons. До аудита извлеки устойчивые
+requirement IDs из релевантного ТЗ, передавай пачке только подходящее
+подмножество, сохраняй evidence matrix. Принимай findings только в ограниченной
+структуре, проверяй пути и дедуплицируй.
+
+Ограничь console summary 20 000 символами. Полный UTF-8 text/JSON report пиши
+напрямую Python. После каждой пачки печатай flush progress; добавь model-free
+`audit-status`, устойчивые pause/resume/cancel и сохранение pending после сбоя.
+
+Реализуй optional FastAPI/Uvicorn Web UI с локальным TypeScript/static bundle,
+REST/SSE для chat/context/audits/files/providers/settings. Используй те же
+runtime и SQLite. Обязательны same-origin/CSRF/CSP, безопасные error DTO,
+отсутствие ключей в клиенте, workspace path boundary, secret filtering,
+optimistic hash concurrency и disabled-by-default delete. Remote bind допускай
+только при explicit flag и auth token.
+
+Обнови system prompt, ТЗ, README, env, changelog, version/status. Добавь offline
+регрессии для 1 000 000 строк + 500 документов, режима записи, file selection,
+requirements/findings/reports и Web security/API. Выполни Ruff check/format,
+mypy, pytest, compileall, wheel/install/pip check, CLI/doctor, локальный Web
+smoke и opt-in live provider smoke при настроенном ключе. После успешного
+контура опубликуй только проверенные release-файлы без секретов.
 
 ## Production large-project audit 0.12.0 (2026-08-25)
 

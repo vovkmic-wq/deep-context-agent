@@ -21,6 +21,7 @@ _TOKEN_PATTERN = re.compile(r"[^\W_]{2,}", flags=re.UNICODE)
 _SKIPPED_DIRECTORIES = {
     ".agent_data",
     ".cache",
+    ".deps",
     ".git",
     ".hg",
     ".hypothesis",
@@ -37,6 +38,8 @@ _SKIPPED_DIRECTORIES = {
     "htmlcov",
     "node_modules",
     "playwright-report",
+    "reports",
+    "site-packages",
     "test-results",
 }
 _SKIPPED_DIRECTORY_PREFIXES = (
@@ -46,6 +49,7 @@ _SKIPPED_DIRECTORY_PREFIXES = (
     "chrome-profile",
     "edge-profile",
 )
+_SKIPPED_DIRECTORY_SUFFIXES = (".egg-info",)
 _SKIPPED_FILENAMES = {".coverage", ".env", ".env.local"}
 _SKIPPED_FILENAME_PREFIXES = (".coverage.",)
 _TEXT_EXTENSIONS = {
@@ -534,6 +538,85 @@ class ContextStore:
             for row in rows
         ]
 
+    def list_threads(self, *, limit: int = 100) -> list[dict[str, object]]:
+        """List archived thread identifiers without returning message bodies."""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT source, indexed_at
+                FROM documents
+                WHERE kind = 'conversation' AND source LIKE 'conversation://%'
+                ORDER BY indexed_at DESC
+                LIMIT 10000
+                """
+            ).fetchall()
+        threads: dict[str, dict[str, object]] = {}
+        for row in rows:
+            source = str(row["source"])
+            tail = source.removeprefix("conversation://")
+            thread_id = tail.split("/", 1)[0]
+            current = threads.setdefault(
+                thread_id,
+                {
+                    "thread_id": thread_id,
+                    "message_count": 0,
+                    "updated_at": str(row["indexed_at"]),
+                },
+            )
+            current["message_count"] = int(str(current["message_count"])) + 1
+        return list(threads.values())[:limit]
+
+    def thread_messages(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, object]]:
+        """Return one bounded page of archived messages for a safe thread ID."""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        safe_thread = re.sub(r"[^a-zA-Z0-9_.-]", "_", thread_id)[:100]
+        pattern = f"conversation://{safe_thread}/%"
+        with self._lock:
+            documents = self._connection.execute(
+                """
+                SELECT id, source, indexed_at
+                FROM documents
+                WHERE kind = 'conversation' AND source LIKE ?
+                ORDER BY indexed_at
+                LIMIT ? OFFSET ?
+                """,
+                (pattern, limit, offset),
+            ).fetchall()
+            messages: list[dict[str, object]] = []
+            for document in documents:
+                chunks = self._connection.execute(
+                    """
+                    SELECT content FROM chunks
+                    WHERE document_id = ? ORDER BY chunk_index
+                    """,
+                    (document["id"],),
+                ).fetchall()
+                source = str(document["source"])
+                messages.append(
+                    {
+                        "role": source.rsplit("/", 1)[-1],
+                        "content": _merge_overlapping_chunks(
+                            [str(chunk["content"]) for chunk in chunks],
+                            self.chunk_overlap,
+                        ),
+                        "indexed_at": str(document["indexed_at"]),
+                    }
+                )
+        return messages
+
     def index_path(self, requested: str | Path, allowed_root: Path) -> IndexReport:
         """Index a text file or tree while enforcing an allowed source root."""
         try:
@@ -621,8 +704,10 @@ def _should_skip_directory(path: Path, allowed_root: Path) -> bool:
         return True
     for part in relative.parts:
         normalized = part.casefold()
-        if normalized in _SKIPPED_DIRECTORIES or normalized.startswith(
-            _SKIPPED_DIRECTORY_PREFIXES
+        if (
+            normalized in _SKIPPED_DIRECTORIES
+            or normalized.startswith(_SKIPPED_DIRECTORY_PREFIXES)
+            or normalized.endswith(_SKIPPED_DIRECTORY_SUFFIXES)
         ):
             return True
     return False
@@ -636,6 +721,7 @@ def _should_skip(path: Path, allowed_root: Path) -> bool:
     if any(
         part.casefold() in _SKIPPED_DIRECTORIES
         or part.casefold().startswith(_SKIPPED_DIRECTORY_PREFIXES)
+        or part.casefold().endswith(_SKIPPED_DIRECTORY_SUFFIXES)
         for part in relative.parts[:-1]
     ):
         return True
@@ -655,6 +741,20 @@ def _file_sha256(path: Path) -> str:
         while block := stream.read(1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _merge_overlapping_chunks(chunks: list[str], overlap: int) -> str:
+    """Reconstruct archived text without duplicating configured overlap."""
+
+    if not chunks:
+        return ""
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        shared = min(overlap, len(merged), len(chunk))
+        while shared and not merged.endswith(chunk[:shared]):
+            shared -= 1
+        merged += chunk[shared:]
+    return merged
 
 
 def _detect_encoding(path: Path) -> str:

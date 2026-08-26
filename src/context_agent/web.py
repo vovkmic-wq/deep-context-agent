@@ -1,0 +1,930 @@
+"""Secure local FastAPI interface backed by the CLI runtime and SQLite stores."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import queue
+import secrets
+import sys
+import threading
+import time
+from collections import defaultdict, deque
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
+from fastapi.responses import Response as FastAPIResponse
+from pydantic import BaseModel, Field
+
+from context_agent import __version__
+from context_agent.config import AppConfig, ProviderConfig
+from context_agent.context_store import ContextStore
+from context_agent.errors import AgentError, PathSecurityError
+from context_agent.paths import resolve_inside
+from context_agent.project_audit import AuditProgress, ProjectAuditStore
+from context_agent.providers import create_chat_model
+from context_agent.runtime import AgentRuntime, message_text
+
+_STATIC_ROOT = Path(__file__).parent / "static"
+_STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_SECRET_NAMES = frozenset(
+    {".env", ".env.local", ".env.production", ".env.test", "credentials.json"}
+)
+_SETTINGS_ENV = {
+    "context_top_k": "AGENT_CONTEXT_TOP_K",
+    "auto_context_max_chars": "AGENT_AUTO_CONTEXT_MAX_CHARS",
+    "audit_batch_size": "AGENT_AUDIT_BATCH_SIZE",
+    "audit_max_batches_per_request": "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST",
+    "audit_max_reads_per_file": "AGENT_AUDIT_MAX_READS_PER_FILE",
+}
+
+
+class ChatRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+    thread_id: str = Field(default="web", min_length=1, max_length=100)
+    auto_context: bool = True
+
+
+class AuditRequest(BaseModel):
+    objective: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+    thread_id: str = Field(default="web-audit", min_length=1, max_length=100)
+    allow_write: bool = False
+    max_batches: int | None = Field(default=None, ge=1, le=100)
+    batch_size: int | None = Field(default=None, ge=1, le=25)
+    include_patterns: list[str] = Field(default_factory=list, max_length=100)
+    exclude_patterns: list[str] = Field(default_factory=list, max_length=100)
+
+
+class IndexRequest(BaseModel):
+    path: str = Field(default="/workspace", max_length=2_000)
+
+
+class ThreadRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=100)
+
+
+class FileWriteRequest(BaseModel):
+    content: str = Field(max_length=2 * 1024 * 1024)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class FileDeleteRequest(BaseModel):
+    confirm_path: str = Field(min_length=1, max_length=2_000)
+
+
+class ProviderDoctorRequest(BaseModel):
+    live: bool = False
+
+
+class SettingsRequest(BaseModel):
+    values: dict[str, int | float] = Field(default_factory=dict)
+
+
+class _TaskCancelledError(Exception):
+    pass
+
+
+@dataclass(slots=True)
+class _Task:
+    task_id: str
+    kind: str
+    events: queue.Queue[dict[str, object]] = field(default_factory=queue.Queue)
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+
+
+class TaskRegistry:
+    """Run bounded background jobs and expose sanitized event streams."""
+
+    def __init__(self, max_workers: int = 4) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="context-agent-web",
+        )
+        self._tasks: dict[str, _Task] = {}
+        self._lock = threading.RLock()
+
+    def submit(
+        self,
+        kind: str,
+        operation: Callable[
+            [Callable[[str, Mapping[str, object]], None], threading.Event], object
+        ],
+    ) -> str:
+        task = _Task(task_id=uuid4().hex, kind=kind)
+        with self._lock:
+            if len(self._tasks) >= 1_000:
+                completed = [
+                    task_id
+                    for task_id, existing in self._tasks.items()
+                    if existing.done.is_set()
+                ]
+                for task_id in completed[:500]:
+                    self._tasks.pop(task_id, None)
+            self._tasks[task.task_id] = task
+
+        def emit(event: str, data: Mapping[str, object]) -> None:
+            task.events.put({"event": event, "data": dict(data)})
+
+        def runner() -> None:
+            emit("started", {"task_id": task.task_id, "kind": kind})
+            try:
+                if task.cancel.is_set():
+                    raise _TaskCancelledError
+                result = operation(emit, task.cancel)
+                if task.cancel.is_set():
+                    raise _TaskCancelledError
+                emit("result", {"result": result})
+                emit("completed", {"task_id": task.task_id})
+            except _TaskCancelledError:
+                emit("cancelled", {"task_id": task.task_id})
+            except Exception as exc:  # backend boundary: never expose raw details
+                emit(
+                    "failed",
+                    {
+                        "task_id": task.task_id,
+                        "error_type": type(exc).__name__,
+                        "message": (
+                            "Операция завершилась ошибкой. Проверьте журнал сервера."
+                        ),
+                    },
+                )
+            finally:
+                task.done.set()
+
+        self._executor.submit(runner)
+        return task.task_id
+
+    def get(self, task_id: str) -> _Task:
+        with self._lock:
+            task = self._tasks.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        return task
+
+    def cancel(self, task_id: str) -> None:
+        self.get(task_id).cancel.set()
+
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(not task.done.is_set() for task in self._tasks.values())
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+class _RemoteRateLimiter:
+    """Small in-memory fixed-window guard for explicitly enabled remote mode."""
+
+    def __init__(self, limit: int = 60, window_seconds: float = 60.0) -> None:
+        self._limit = limit
+        self._window_seconds = window_seconds
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allows(self, client: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self._window_seconds
+        with self._lock:
+            requests = self._requests[client]
+            while requests and requests[0] < cutoff:
+                requests.popleft()
+            if len(requests) >= self._limit:
+                return False
+            requests.append(now)
+            return True
+
+
+def _request_payload(request: Request, **values: object) -> dict[str, object]:
+    return {"request_id": request.state.request_id, **values}
+
+
+def _error_response(
+    request: Request,
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request.state.request_id,
+                "retryable": retryable,
+            }
+        },
+    )
+
+
+def _is_secret_path(path: Path) -> bool:
+    return any(
+        part.casefold() in _SECRET_NAMES
+        or part.casefold().startswith((".env.", "id_rsa", "id_ed25519"))
+        for part in path.parts
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runtime_factory(
+    config: AppConfig,
+    providers: tuple[ProviderConfig, ...],
+) -> AgentRuntime:
+    return AgentRuntime(
+        config,
+        providers[0],
+        fallback_provider_configs=providers[1:],
+    )
+
+
+def create_app(
+    config: AppConfig,
+    providers: tuple[ProviderConfig, ...],
+    *,
+    allow_remote: bool = False,
+    auth_token: str | None = None,
+    trusted_https_proxy: bool = False,
+) -> FastAPI:
+    """Create the local web application with same-origin security defaults."""
+
+    config.prepare_directories()
+    if allow_remote and not auth_token:
+        raise ValueError("Remote web mode requires AGENT_WEB_AUTH_TOKEN")
+    if allow_remote and not trusted_https_proxy:
+        raise ValueError("Remote web mode requires a trusted HTTPS reverse proxy")
+    if not _STATIC_ROOT.joinpath("index.html").is_file():
+        raise RuntimeError("Web static bundle is missing")
+
+    tasks = TaskRegistry()
+    rate_limiter = _RemoteRateLimiter()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+        tasks.close()
+
+    app = FastAPI(
+        title="Deep Context Agent",
+        version=__version__,
+        docs_url="/api/docs",
+        redoc_url=None,
+        lifespan=lifespan,
+    )
+    app.state.tasks = tasks
+    app.state.config = config
+    app.state.providers = providers
+
+    @app.middleware("http")
+    async def security_boundary(request: Request, call_next: Callable[..., Any]):
+        request.state.request_id = uuid4().hex
+        csrf_token = request.cookies.get("dca_csrf") or secrets.token_urlsafe(32)
+        request.state.csrf_token = csrf_token
+        if allow_remote:
+            client = request.client.host if request.client else "unknown"
+            if not rate_limiter.allows(client):
+                return _error_response(
+                    request,
+                    429,
+                    "rate_limit_exceeded",
+                    "Слишком много запросов. Повторите позже.",
+                    retryable=True,
+                )
+            authorization = request.headers.get("authorization", "")
+            expected = f"Bearer {auth_token}"
+            if not secrets.compare_digest(authorization, expected):
+                return _error_response(
+                    request,
+                    401,
+                    "authentication_required",
+                    "Требуется корректный bearer token.",
+                )
+        if request.method in _STATE_METHODS:
+            origin = request.headers.get("origin")
+            host = request.headers.get("host", "")
+            if origin and origin not in {f"http://{host}", f"https://{host}"}:
+                return _error_response(
+                    request,
+                    403,
+                    "origin_denied",
+                    "Источник запроса не разрешён.",
+                )
+            submitted = request.headers.get("x-csrf-token", "")
+            if not submitted or not secrets.compare_digest(submitted, csrf_token):
+                return _error_response(
+                    request,
+                    403,
+                    "csrf_failed",
+                    "CSRF token отсутствует или недействителен.",
+                )
+        response = await call_next(request)
+        if "dca_csrf" not in request.cookies:
+            response.set_cookie(
+                "dca_csrf",
+                csrf_token,
+                httponly=True,
+                samesite="strict",
+                secure=request.url.scheme == "https",
+            )
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
+        detail = exc.detail if isinstance(exc.detail, str) else "Request rejected"
+        return _error_response(
+            request,
+            exc.status_code,
+            f"http_{exc.status_code}",
+            detail,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(
+        request: Request,
+        _exc: RequestValidationError,
+    ) -> JSONResponse:
+        return _error_response(
+            request,
+            422,
+            "validation_error",
+            "Параметры запроса не прошли проверку.",
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+        print(
+            f"web request {request.state.request_id} failed: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return _error_response(
+            request,
+            500,
+            "internal_error",
+            "Внутренняя ошибка сервера.",
+            retryable=True,
+        )
+
+    @app.get("/api/health")
+    def health(request: Request) -> dict[str, object]:
+        database_ok = True
+        try:
+            with ContextStore(config.context_database) as store:
+                store.list_sources(limit=1)
+            with ProjectAuditStore(config.project_audit_database) as store:
+                store.list_runs(workspace=config.workspace, limit=1)
+        except Exception:
+            database_ok = False
+        return _request_payload(
+            request,
+            status="ok" if database_ok else "degraded",
+            version=__version__,
+            database=database_ok,
+            static_bundle=True,
+        )
+
+    @app.get("/api/runtime")
+    def runtime_info(request: Request) -> dict[str, object]:
+        return _request_payload(
+            request,
+            version=__version__,
+            csrf_token=request.state.csrf_token,
+            provider=providers[0].name,
+            model=providers[0].model,
+            provider_priority=[item.name for item in providers],
+            workspace="/workspace",
+            active_tasks=tasks.active_count(),
+            audit_mode_default="read-only",
+        )
+
+    @app.get("/api/threads")
+    def list_threads(request: Request, limit: int = Query(100, ge=1, le=500)):
+        with ContextStore(config.context_database) as store:
+            items = store.list_threads(limit=limit)
+        return _request_payload(request, items=items)
+
+    @app.post("/api/threads")
+    def create_thread(request: Request, body: ThreadRequest):
+        safe = body.thread_id.strip()
+        if not safe:
+            raise HTTPException(422, "Thread ID cannot be empty")
+        return _request_payload(request, thread_id=safe)
+
+    @app.get("/api/threads/{thread_id}/messages")
+    def thread_messages(
+        request: Request,
+        thread_id: str,
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ):
+        with ContextStore(config.context_database) as store:
+            items = store.thread_messages(thread_id, limit=limit, offset=offset)
+        return _request_payload(request, items=items, limit=limit, offset=offset)
+
+    @app.post("/api/chat", status_code=202)
+    def chat(request: Request, body: ChatRequest):
+        def operation(
+            emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            with _runtime_factory(config, providers) as runtime:
+                if cancelled.is_set():
+                    raise _TaskCancelledError
+                answer = runtime.ask(
+                    body.query,
+                    thread_id=body.thread_id,
+                    auto_context=body.auto_context,
+                )
+                metadata = runtime._provider_failover_middleware.runtime_metadata()
+                emit("message", {"text": answer, "runtime": metadata})
+                return {"answer": answer, "runtime": metadata}
+
+        task_id = tasks.submit("chat", operation)
+        return _request_payload(request, task_id=task_id)
+
+    @app.post("/api/chat/{task_id}/cancel")
+    def cancel_chat(request: Request, task_id: str):
+        try:
+            tasks.cancel(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Task not found") from exc
+        return _request_payload(request, task_id=task_id, status="cancelling")
+
+    @app.get("/api/events/{task_id}")
+    def task_events(request: Request, task_id: str):
+        try:
+            task = tasks.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Task not found") from exc
+
+        def stream() -> Iterator[str]:
+            while True:
+                try:
+                    event = task.events.get(timeout=10)
+                except queue.Empty:
+                    if task.done.is_set():
+                        break
+                    yield ": heartbeat\n\n"
+                    continue
+                event_name = str(event["event"])
+                data = json.dumps(event["data"], ensure_ascii=False)
+                yield f"event: {event_name}\ndata: {data}\n\n"
+                if event_name in {"completed", "cancelled", "failed"}:
+                    break
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.post("/api/context/index", status_code=202)
+    def index_context(request: Request, body: IndexRequest):
+        def operation(
+            _emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            if cancelled.is_set():
+                raise _TaskCancelledError
+            with ContextStore(
+                config.context_database,
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+                max_file_bytes=config.max_file_bytes,
+            ) as store:
+                report = store.index_path(body.path, config.context_root)
+            return {
+                "files_indexed": report.files_indexed,
+                "files_unchanged": report.files_unchanged,
+                "files_skipped": report.files_skipped,
+                "chunks_written": report.chunks_written,
+                "errors": report.errors,
+            }
+
+        task_id = tasks.submit("context_index", operation)
+        return _request_payload(request, task_id=task_id)
+
+    @app.get("/api/context/sources")
+    def context_sources(
+        request: Request,
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        kind: str | None = None,
+    ):
+        with ContextStore(config.context_database) as store:
+            sources = store.list_sources(limit=limit, offset=offset, kind=kind)
+        return _request_payload(
+            request,
+            items=[
+                {
+                    "source": item.source,
+                    "kind": item.kind,
+                    "byte_size": item.byte_size,
+                    "chunk_count": item.chunk_count,
+                    "indexed_at": item.indexed_at,
+                }
+                for item in sources
+            ],
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/api/context/search")
+    def context_search(
+        request: Request,
+        query: str = Query(min_length=1, max_length=2_000),
+        limit: int = Query(8, ge=1, le=100),
+        source: str | None = None,
+    ):
+        with ContextStore(config.context_database) as store:
+            hits = store.search(query, limit=limit, source=source)
+        return _request_payload(
+            request,
+            items=[
+                {
+                    "source": hit.source,
+                    "kind": hit.kind,
+                    "content": hit.content,
+                    "chunk_index": hit.chunk_index,
+                    "score": hit.score,
+                }
+                for hit in hits
+            ],
+            result_count=len(hits),
+        )
+
+    @app.get("/api/context/window")
+    def context_window(
+        request: Request,
+        source: str,
+        chunk_index: int = Query(ge=0),
+        radius: int = Query(2, ge=0, le=20),
+    ):
+        with ContextStore(config.context_database) as store:
+            hits = store.context_window(source, chunk_index, radius=radius)
+        return _request_payload(
+            request,
+            items=[
+                {"chunk_index": hit.chunk_index, "content": hit.content} for hit in hits
+            ],
+        )
+
+    def submit_audit(body: AuditRequest) -> str:
+        def operation(
+            emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            def progress_callback(
+                progress: AuditProgress,
+                batch_number: int,
+                processed_count: int,
+            ) -> None:
+                emit(
+                    "audit_progress",
+                    {
+                        **progress.as_dict(),
+                        "batch_number": batch_number,
+                        "processed_count": processed_count,
+                    },
+                )
+                if cancelled.is_set():
+                    raise _TaskCancelledError
+
+            with _runtime_factory(config, providers) as runtime:
+                return runtime.run_project_audit(
+                    body.objective,
+                    thread_id=body.thread_id,
+                    max_batches=body.max_batches,
+                    allow_write=body.allow_write,
+                    include_patterns=body.include_patterns,
+                    exclude_patterns=body.exclude_patterns,
+                    batch_size=body.batch_size,
+                    progress_callback=progress_callback,
+                )
+
+        return tasks.submit("audit", operation)
+
+    @app.get("/api/audits")
+    def audits(request: Request, limit: int = Query(50, ge=1, le=100)):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            items = store.list_runs(workspace=config.workspace, limit=limit)
+        return _request_payload(request, items=items)
+
+    @app.post("/api/audits", status_code=202)
+    def create_audit(request: Request, body: AuditRequest):
+        task_id = submit_audit(body)
+        return _request_payload(
+            request,
+            task_id=task_id,
+            mode=("allow-write" if body.allow_write else "read-only"),
+        )
+
+    @app.get("/api/audits/{run_id}")
+    def audit_details(request: Request, run_id: str):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            try:
+                details = store.run_details(run_id)
+            except ValueError as exc:
+                raise HTTPException(404, "Audit run not found") from exc
+        return _request_payload(request, audit=details)
+
+    @app.post("/api/audits/{run_id}/pause")
+    def pause_audit(request: Request, run_id: str):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            try:
+                progress = store.set_run_status(run_id, "paused")
+            except ValueError as exc:
+                raise HTTPException(404, "Audit run not found") from exc
+        return _request_payload(request, progress=progress.as_dict())
+
+    @app.post("/api/audits/{run_id}/cancel")
+    def cancel_audit(request: Request, run_id: str):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            try:
+                progress = store.set_run_status(run_id, "cancelled")
+            except ValueError as exc:
+                raise HTTPException(404, "Audit run not found") from exc
+        return _request_payload(request, progress=progress.as_dict())
+
+    @app.post("/api/audits/{run_id}/resume", status_code=202)
+    def resume_audit(request: Request, run_id: str):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            try:
+                details = store.run_details(run_id)
+            except ValueError as exc:
+                raise HTTPException(404, "Audit run not found") from exc
+        raw_include = details.get("include_patterns")
+        raw_exclude = details.get("exclude_patterns")
+        include = raw_include if isinstance(raw_include, list) else []
+        exclude = raw_exclude if isinstance(raw_exclude, list) else []
+        body = AuditRequest(
+            objective=str(details["objective"]),
+            thread_id=str(details["thread_id"]),
+            allow_write=details["mode"] == "allow-write",
+            batch_size=int(str(details["batch_size"])),
+            include_patterns=[str(item) for item in include],
+            exclude_patterns=[str(item) for item in exclude],
+        )
+        return _request_payload(request, task_id=submit_audit(body))
+
+    @app.get("/api/audits/{run_id}/findings")
+    def audit_findings(
+        request: Request,
+        run_id: str,
+        limit: int = Query(100, ge=1, le=2_000),
+    ):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            items = store.list_findings(run_id, limit=limit)
+        return _request_payload(request, items=items)
+
+    @app.get("/api/audits/{run_id}/requirements")
+    def audit_requirements(request: Request, run_id: str):
+        with ProjectAuditStore(config.project_audit_database) as store:
+            items = store.list_requirements(run_id)
+        return _request_payload(request, items=items)
+
+    @app.get("/api/audits/{run_id}/report")
+    def audit_report(
+        request: Request,
+        run_id: str,
+        report_format: str = Query("text", alias="format"),
+    ):
+        if report_format not in {"text", "json"}:
+            raise HTTPException(422, "Report format must be text or json")
+        with ProjectAuditStore(config.project_audit_database) as store:
+            try:
+                report = store.render_report(run_id, report_format)
+            except ValueError as exc:
+                raise HTTPException(404, "Audit run not found") from exc
+        headers = {"X-Request-ID": request.state.request_id}
+        if report_format == "json":
+            return FastAPIResponse(
+                report,
+                media_type="application/json",
+                headers=headers,
+            )
+        return PlainTextResponse(report, headers=headers)
+
+    def safe_file(virtual_path: str, *, must_exist: bool) -> Path:
+        try:
+            path = resolve_inside(
+                config.workspace,
+                f"/workspace/{virtual_path.lstrip('/')}",
+                must_exist=must_exist,
+            )
+        except (OSError, PathSecurityError) as exc:
+            raise HTTPException(404, "Workspace path not found") from exc
+        if _is_secret_path(path.relative_to(config.workspace)):
+            raise HTTPException(404, "Workspace path not found")
+        return path
+
+    @app.get("/api/files")
+    def list_files(
+        request: Request,
+        path: str = "",
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ):
+        directory = safe_file(path, must_exist=True)
+        if not directory.is_dir():
+            raise HTTPException(400, "Path is not a directory")
+        entries = [
+            entry
+            for entry in directory.iterdir()
+            if not _is_secret_path(entry.relative_to(config.workspace))
+            and not entry.is_symlink()
+        ]
+        entries.sort(key=lambda item: (not item.is_dir(), item.name.casefold()))
+        page = entries[offset : offset + limit]
+        return _request_payload(
+            request,
+            items=[
+                {
+                    "name": entry.name,
+                    "path": "/workspace/"
+                    + entry.relative_to(config.workspace).as_posix(),
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size": entry.stat().st_size if entry.is_file() else None,
+                }
+                for entry in page
+            ],
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/api/files/{virtual_path:path}")
+    def read_file(
+        request: Request,
+        virtual_path: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1_000),
+    ):
+        path = safe_file(virtual_path, must_exist=True)
+        if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+            raise HTTPException(413, "File is not a bounded text file")
+        raw = path.read_bytes()
+        if b"\0" in raw[:4096]:
+            raise HTTPException(415, "Binary preview is not supported")
+        text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        lines = text.splitlines(keepends=True)
+        return _request_payload(
+            request,
+            path="/workspace/" + path.relative_to(config.workspace).as_posix(),
+            content="".join(lines[offset : offset + limit]),
+            offset=offset,
+            next_offset=(offset + limit if offset + limit < len(lines) else None),
+            sha256=hashlib.sha256(raw).hexdigest(),
+            total_lines=len(lines),
+        )
+
+    @app.put("/api/files/{virtual_path:path}")
+    def update_file(request: Request, virtual_path: str, body: FileWriteRequest):
+        path = safe_file(virtual_path, must_exist=True)
+        if not path.is_file():
+            raise HTTPException(400, "Path is not a file")
+        current_hash = _file_sha256(path)
+        if body.expected_sha256 is None or body.expected_sha256 != current_hash:
+            raise HTTPException(409, "File changed; reload before saving")
+        path.write_text(body.content, encoding="utf-8", newline="\n")
+        return _request_payload(request, path=virtual_path, sha256=_file_sha256(path))
+
+    @app.post("/api/files/{virtual_path:path}", status_code=201)
+    def create_file(request: Request, virtual_path: str, body: FileWriteRequest):
+        path = safe_file(virtual_path, must_exist=False)
+        if path.exists():
+            raise HTTPException(409, "Path already exists")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body.content, encoding="utf-8", newline="\n")
+        return _request_payload(request, path=virtual_path, sha256=_file_sha256(path))
+
+    @app.delete("/api/files/{virtual_path:path}")
+    def delete_file(request: Request, virtual_path: str, body: FileDeleteRequest):
+        if os.getenv("AGENT_WEB_ALLOW_DELETE", "").casefold() not in {"1", "true"}:
+            raise HTTPException(403, "Web file deletion is disabled")
+        expected = "/workspace/" + virtual_path.lstrip("/")
+        if body.confirm_path.replace("\\", "/") != expected:
+            raise HTTPException(409, "Exact virtual path confirmation is required")
+        path = safe_file(virtual_path, must_exist=True)
+        if path == config.workspace:
+            raise HTTPException(403, "Workspace root cannot be deleted")
+        if path.is_dir():
+            path.rmdir()
+        else:
+            path.unlink()
+        return _request_payload(request, path=expected, deleted=True)
+
+    @app.get("/api/providers")
+    def provider_list(request: Request):
+        return _request_payload(
+            request,
+            items=[
+                {
+                    "provider": item.name,
+                    "model": item.model,
+                    "base_url": item.base_url,
+                    "api_key": "configured",
+                    "priority": index,
+                }
+                for index, item in enumerate(providers)
+            ],
+        )
+
+    @app.post("/api/providers/doctor")
+    def provider_doctor(request: Request, body: ProviderDoctorRequest):
+        if not body.live:
+            return _request_payload(request, status="configured", live=False)
+
+        def operation(
+            _emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            failures: list[str] = []
+            for provider in providers:
+                if cancelled.is_set():
+                    raise _TaskCancelledError
+                try:
+                    response = create_chat_model(provider).invoke(
+                        "Reply with exactly: OK"
+                    )
+                except Exception as exc:
+                    failures.append(f"{provider.name}:{type(exc).__name__}")
+                    continue
+                return {
+                    "provider": provider.name,
+                    "response": message_text(response).strip(),
+                }
+            raise AgentError("All providers failed: " + ", ".join(failures))
+
+        return _request_payload(request, task_id=tasks.submit("doctor", operation))
+
+    @app.get("/api/settings")
+    def settings(request: Request):
+        current = AppConfig.from_env(config.project_root)
+        values = {key: getattr(current, key) for key in _SETTINGS_ENV}
+        return _request_payload(request, values=values)
+
+    @app.put("/api/settings")
+    def update_settings(request: Request, body: SettingsRequest):
+        nonlocal config
+        unknown = set(body.values) - set(_SETTINGS_ENV)
+        if unknown:
+            raise HTTPException(422, "Unsupported setting")
+        previous: dict[str, str | None] = {
+            name: os.environ.get(env) for name, env in _SETTINGS_ENV.items()
+        }
+        try:
+            for name, value in body.values.items():
+                os.environ[_SETTINGS_ENV[name]] = str(value)
+            updated_config = AppConfig.from_env(config.project_root)
+            updated_config.prepare_directories()
+        except Exception:
+            for name, previous_value in previous.items():
+                env = _SETTINGS_ENV[name]
+                if previous_value is None:
+                    os.environ.pop(env, None)
+                else:
+                    os.environ[env] = previous_value
+            raise HTTPException(422, "Setting value is invalid") from None
+        config = updated_config
+        app.state.config = config
+        return _request_payload(request, updated=sorted(body.values))
+
+    @app.get("/assets/{asset_name}")
+    def asset(asset_name: str) -> FileResponse:
+        if asset_name not in {"app.js", "styles.css"}:
+            raise HTTPException(404, "Asset not found")
+        return FileResponse(_STATIC_ROOT / asset_name)
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def frontend(path: str) -> FastAPIResponse:
+        if path.startswith("api/"):
+            raise HTTPException(404, "API endpoint not found")
+        return FileResponse(_STATIC_ROOT / "index.html")
+
+    return app

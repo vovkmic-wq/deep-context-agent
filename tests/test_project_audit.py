@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 import context_agent.project_audit as project_audit_module
-from context_agent.project_audit import ProjectAuditStore
+from context_agent.project_audit import (
+    AuditSelectionRules,
+    ProjectAuditStore,
+    select_project_files,
+)
 
 
 def test_audit_manifest_resumes_and_reopens_only_changed_files(tmp_path: Path) -> None:
@@ -264,5 +268,110 @@ def test_removed_file_is_purged_from_summary_and_ast_indexes(tmp_path: Path) -> 
         assert progress.total == 0
         assert not store.search_symbols("obsolete_symbol", workspace=workspace, limit=5)
         assert store.file_summary("obsolete.py", workspace=workspace) is None
+    finally:
+        store.close()
+
+
+def test_selection_rules_exclude_generated_artifacts_and_report_reasons(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (workspace / "notes.txt").write_text("notes\n", encoding="utf-8")
+    for directory in (".deps", ".pytest_tmp-1", "reports", "demo.egg-info"):
+        target = workspace / directory
+        target.mkdir()
+        (target / "artifact.txt").write_text("generated\n", encoding="utf-8")
+
+    selection = select_project_files(
+        workspace,
+        AuditSelectionRules(include=("*.py",), exclude=("src/legacy*",)),
+    )
+
+    assert [path.relative_to(workspace).as_posix() for path in selection.paths] == [
+        "src/main.py"
+    ]
+    assert selection.excluded == 5
+    assert selection.reasons == {
+        "generated_directory": 4,
+        "not_included": 1,
+    }
+
+
+def test_requirements_findings_and_utf8_reports_are_persistent(tmp_path: Path) -> None:
+    workspace = tmp_path / "рабочая папка"
+    workspace.mkdir()
+    (workspace / "TECHNICAL_SPEC.md").write_text(
+        "# Безопасность\n- Система должна работать в read-only по умолчанию.\n",
+        encoding="utf-8",
+    )
+    (workspace / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+    store = ProjectAuditStore(tmp_path / "data" / "audit.sqlite3")
+    try:
+        progress = store.start_or_resume(
+            thread_id="requirements",
+            objective="Проверь проект по TECHNICAL_SPEC.md",
+            workspace=workspace,
+            batch_size=10,
+        )
+        requirements = store.list_requirements(progress.run_id)
+        assert len(requirements) == 1
+        requirement_id = str(requirements[0]["requirement_id"])
+        batch = store.next_batch(progress.run_id)
+        assert batch is not None
+        answer = (
+            f"Evidence for {requirement_id}.\n"
+            '<audit_findings>[{"severity":"high","path":"main.py",'
+            '"line":1,"title":"Проверка","evidence":"VALUE = 1",'
+            '"recommendation":"Исправить."}]</audit_findings>'
+        )
+        store.complete_batch(
+            batch,
+            processed_paths={f"/workspace/{path}" for path in batch.paths},
+            answer=answer,
+        )
+        store.record_batch_evidence(batch, answer)
+
+        report_base = tmp_path / "отчёты" / "полный-отчёт.md"
+        written = store.write_reports(progress.run_id, report_base, "both")
+        assert {path.suffix for path in written} == {".txt", ".json"}
+        text_report = report_base.with_suffix(".txt").read_text(encoding="utf-8")
+        json_report = report_base.with_suffix(".json").read_text(encoding="utf-8")
+        assert "Проверка" in text_report
+        assert "candidate_evidence" in json_report
+        assert store.list_findings(progress.run_id)[0]["severity"] == "high"
+    finally:
+        store.close()
+
+
+def test_manifest_handles_one_million_lines_and_five_hundred_documents(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    large = workspace / "million-lines.txt"
+    line = b"x\n"
+    with large.open("wb") as stream:
+        for _ in range(1_000):
+            stream.write(line * 1_000)
+    for index in range(500):
+        (workspace / f"doc-{index:03d}.md").write_text(
+            f"# Document {index}\nCONTROL_{index}\n",
+            encoding="utf-8",
+        )
+
+    store = ProjectAuditStore(tmp_path / "audit.sqlite3")
+    try:
+        progress = store.start_or_resume(
+            thread_id="million-lines",
+            objective="Audit the entire corpus",
+            workspace=workspace,
+            batch_size=25,
+        )
+        assert progress.total == 501
+        assert progress.pending == 501
+        assert store.next_batch(progress.run_id) is not None
     finally:
         store.close()

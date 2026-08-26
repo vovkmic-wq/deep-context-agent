@@ -101,6 +101,9 @@ def test_generated_and_browser_artifacts_are_not_indexed(tmp_path: Path) -> None
         "e2e/EDGE-PROFILE2/Default/History.txt": "browser history",
         "playwright-report/index.html": "generated report",
         ".venv/package.py": "generated environment",
+        ".deps/vendor.py": "dependency copy",
+        "reports/generated.json": "generated report",
+        "example.egg-info/PKG-INFO": "package metadata",
     }
     for relative_path, content in generated_files.items():
         target = source_root / relative_path
@@ -181,3 +184,27 @@ def test_context_path_outside_root_is_rejected(tmp_path: Path) -> None:
         pytest.raises(PathSecurityError),
     ):
         store.index_path(outside, source_root)
+
+
+def test_archived_threads_and_long_messages_are_reconstructed_without_overlap(
+    tmp_path: Path,
+) -> None:
+    content = "START_" + ("x" * 240) + "_END"
+    with ContextStore(
+        tmp_path / "context.sqlite3",
+        chunk_size=80,
+        chunk_overlap=20,
+    ) as store:
+        store.archive_message("web-thread", "user", content)
+        threads = store.list_threads()
+        messages = store.thread_messages("web-thread")
+
+    assert threads[0]["thread_id"] == "web-thread"
+    assert threads[0]["message_count"] == 1
+    assert messages == [
+        {
+            "role": "user",
+            "content": content,
+            "indexed_at": messages[0]["indexed_at"],
+        }
+    ]

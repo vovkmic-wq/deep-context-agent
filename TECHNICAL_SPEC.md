@@ -2,7 +2,7 @@
 
 ## 1. Цель
 
-Создать на Python 3.11+ CLI-агента на базе Deep Agents, который:
+Создать на Python 3.11+ CLI- и Web-агента на базе Deep Agents, который:
 
 - сохраняет историю и большой внешний контекст между запусками;
 - ищет релевантные фрагменты контекста перед ответом и по запросу модели;
@@ -246,6 +246,48 @@
     в одном ходе ограничено. Это обеспечивает bounded analyze → fix → test →
     repeat без бесконечного agent loop.
 
+## 2.1. Production-аудит и Web UI 0.13.0
+
+1. Пакетный аудит всегда создаётся в режиме `read-only`. Право записи возникает
+   только из явного операторского `audit --allow-write` либо подтверждённого
+   Web-переключателя. Текст цели, ТЗ, retrieval и ответ модели не могут изменить
+   режим. Режим входит в идентичность запуска и хранится в SQLite.
+2. До создания пачек runtime строит точный file ledger. По умолчанию исключены
+   `.deps`, `.pytest_tmp*`, `.pytest-*`, `reports`, `e2e/reports`,
+   `*.egg-info`, virtualenv, dependency, build, cache, coverage, browser и test
+   artifacts. Дополнительные glob задаются `AGENT_AUDIT_INCLUDE` и
+   `AGENT_AUDIT_EXCLUDE`; статус хранит selected/excluded и причины.
+3. До первой пачки из явно релевантных Markdown-ТЗ формируется межпакетный
+   реестр с устойчивыми `REQ-*`, source/section/text/source hash/level. В prompt
+   пачки передаётся только ограниченное релевантное подмножество. Матрица
+   сохраняет `not_proven`, пока нет явной evidence-ссылки; LLM-текст не является
+   окончательным доказательством.
+4. Подтверждённые findings принимаются только из ограниченного JSON-блока,
+   валидируются относительно выделенных путей, дедуплицируются fingerprint и
+   сохраняются отдельно от prose. Severity, путь, строка, evidence,
+   recommendation и статус доступны через CLI report и Web API.
+5. Консольный результат ограничен 20 000 символами. Полный UTF-8 text/JSON
+   report создаётся напрямую Python через `--report-file` и
+   `--report-format text|json|both`, без PowerShell `Tee-Object`.
+6. После каждой пачки CLI немедленно выводит одну flush-строку
+   `AUDIT_PROGRESS` с JSON. `audit-status --run-id ... --json` читает состояние
+   без LLM. Незавершённая пачка возвращается в pending; тот же identity
+   продолжает с первого незавершённого файла.
+7. Локальный Web UI является optional extra `web`, запускается на
+   `127.0.0.1:8765`, использует те же runtime/SQLite/policies и не отправляет
+   большой корпус браузеру. Полный нормативный контракт находится в
+   `WEB_INTERFACE_TECHNICAL_SPECIFICATION.md` и является частью этого ТЗ.
+8. Web API включает health/runtime, threads/chat/SSE, context, audits,
+   workspace files, providers и settings. Все списки ограничены/пагинированы;
+   длительные операции возвращают task ID и события.
+9. State-changing Web API требует same-origin и CSRF token. Секреты и raw
+   exceptions не возвращаются; CSP запрещает внешние/inline scripts. File API
+   повторно проверяет resolved path, блокирует секретные файлы и symlink escape,
+   использует SHA-256 optimistic concurrency; удаление выключено по умолчанию.
+10. Внешний bind запрещён без `--allow-remote` и `AGENT_WEB_AUTH_TOKEN`; для
+    production обязательно HTTPS reverse proxy. Первый релиз остаётся локальным
+    single-user и не объявляется публичным SaaS.
+
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |
@@ -290,12 +332,18 @@ Coding Plan пользователь явно задаёт
 - `context-agent ask -` — один запрос из stdin;
 - `context-agent audit "..."` / `audit --file PROMPT.txt` — создать или
   продолжить SQLite-манифест пакетного аудита; `--max-batches` задаёт жёсткий
-  предел 1–100 для текущего процесса;
+  предел 1–100 для текущего процесса; `--allow-write` является единственным
+  CLI-разрешением записи; `--report-file` и `--report-format` создают полный
+  UTF-8 отчёт;
+- `context-agent audit-status --run-id ID [--json]` — получить persisted
+  progress без LLM и платного API;
 - `context-agent index [PATH]` — индексирование файла или каталога внутри
   `AGENT_CONTEXT_ROOT`;
 - `context-agent search "..."` — проверка поиска по локальному контексту;
 - `context-agent doctor` — безопасная диагностика конфигурации без вывода
-  ключей.
+  ключей, Web extra/static bundle и локального порта.
+- `context-agent web --host 127.0.0.1 --port 8765` — безопасный локальный Web
+  UI; внешний host требует `--allow-remote` и bearer token из окружения.
 - `context-agent --providers "glm,openai" doctor --live` — проверить
   цепочку по приоритету и остановиться на первом успешном провайдере.
 
@@ -385,6 +433,19 @@ Coding Plan пользователь явно задаёт
   live smoke-test запускаются отдельно.
 
 ## 7. Критерии приёмки
+
+Для релиза 0.13.0 дополнительно обязательны:
+
+- regression, что слова «исправь/fix» без `--allow-write` не разрешают запись;
+- file-selection regression для dependency/generated/report/pytest/egg-info и
+  пользовательских include/exclude;
+- сохранение requirements/findings и UTF-8 text/JSON report с кириллицей;
+- корпус не менее 1 000 000 строк и 500 документов без помещения корпуса в
+  model prompt;
+- Web API regressions CSRF/origin/CSP, traversal, secret path, stale hash,
+  отключённого delete, redaction ключей и remote authentication gate;
+- offline Web smoke на чистых workspace/data, package/wheel/static проверки и
+  отдельный opt-in `doctor --live` только при существующем локальном ключе.
 
 1. `ruff check --no-cache .` и `ruff format --check --no-cache .` завершаются
    без ошибок независимо от владельца служебных каталогов.

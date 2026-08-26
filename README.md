@@ -43,7 +43,7 @@ FTS5 — лексический поиск: он не требует embedding A
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,web]"
 Copy-Item .env.example .env.local
 ```
 
@@ -70,6 +70,10 @@ AGENT_WEB_RETRY_ATTEMPTS=3
 AGENT_RECURSION_LIMIT=100
 AGENT_AUDIT_BATCH_SIZE=8
 AGENT_AUDIT_MAX_BATCHES_PER_REQUEST=4
+AGENT_AUDIT_MAX_READS_PER_FILE=4
+# Необязательные comma-separated glob-фильтры:
+AGENT_AUDIT_INCLUDE=
+AGENT_AUDIT_EXCLUDE=
 AGENT_AUDIT_MAX_READS_PER_FILE=4
 AGENT_PROJECT_CHECK_TIMEOUT_SECONDS=300
 AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS=20000
@@ -206,9 +210,23 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 # Не добавлять автоматический retrieval (search_context остаётся доступен)
 .\.venv\Scripts\context-agent.exe --provider openai --no-auto-context ask "..."
 
-# Полный пакетный аудит/исправление проекта с SQLite-resume
+# Полный read-only пакетный аудит с SQLite-resume и прямым UTF-8 отчётом
 .\.venv\Scripts\context-agent.exe --thread ozon-audit audit `
-  --file .\ozon-project-improvement-prompt.txt --max-batches 100
+  --file .\ozon-project-improvement-prompt.txt `
+  --max-batches 100 `
+  --report-file .\reports\ozon-audit.txt `
+  --report-format both
+
+# Только явный флаг разрешает исправления существующих выделенных файлов
+.\.venv\Scripts\context-agent.exe --thread ozon-fix audit `
+  --file .\ozon-project-improvement-prompt.txt `
+  --allow-write --max-batches 100
+
+# Проверка persisted-прогресса не вызывает LLM
+.\.venv\Scripts\context-agent.exe audit-status --run-id RUN_ID --json
+
+# Локальный Web UI (браузер автоматически не открывается)
+.\.venv\Scripts\context-agent.exe web --host 127.0.0.1 --port 8765
 ```
 
 Путь команды `index` обязан находиться внутри `AGENT_CONTEXT_ROOT`.
@@ -225,12 +243,43 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 `--max-batches 100` — жёсткий предел, а не обещание модели. Текущий прогресс
 доступен LLM через `project_audit_status` и физически хранится в
 `AGENT_DATA_DIR/project_audit.sqlite3`.
+Слова «исправь», `fix` или `update` внутри цели никогда не дают право записи:
+без `--allow-write` middleware блокирует все mutating tools. Режим входит в
+identity запуска, поэтому read-only и allow-write используют разные manifests.
 Manifest отдельно показывает число уникальных `reviewed` файлов и фактических
 успешных страниц `file_reads`; многостраничное чтение не маскируется как один
 tool call. Для слишком большого отдельного файла агент обязан указать покрытие
 и использовать точечный FTS/AST-поиск, а не заявлять построчное чтение целиком.
 После исчерпания `AGENT_AUDIT_MAX_READS_PER_FILE` такой файл получает отдельный
 статус `partial`, а итог всего запуска — `complete_with_partial`.
+До пачек создаются точный file ledger и registry требований `REQ-*`; generated,
+dependency, report, cache, pytest/browser и `*.egg-info` artifacts исключаются.
+После каждой пачки CLI печатает flush-строку `AUDIT_PROGRESS`. Консольный итог
+ограничен, а полный report сохраняет requirements matrix, дедуплицированные
+findings и batch evidence в UTF-8 text/JSON.
+
+## Веб-интерфейс
+
+Web UI использует те же workspace, контекст, audit SQLite и provider chain, что
+и CLI. Доступны обзор, чат/SSE, контекстный поиск, пакетные аудиты, ограниченный
+file browser, provider doctor и безопасные настройки. Корпус не загружается в
+браузер целиком: API возвращает только ограниченные страницы и top-k.
+
+По умолчанию сервер слушает только loopback. State-changing API защищён
+same-origin и CSRF, ответы имеют CSP, секреты/ключи не передаются JavaScript,
+files повторно проверяются после `resolve()`, а сохранение использует ожидаемый
+SHA-256. Web-delete выключен; включение `AGENT_WEB_ALLOW_DELETE=1` всё равно
+требует точного подтверждения пути. Внешний bind требует `--allow-remote`,
+`AGENT_WEB_AUTH_TOKEN`, `AGENT_WEB_TRUSTED_HTTPS_PROXY=1` и production HTTPS
+reverse proxy; remote API дополнительно ограничивает частоту запросов.
+
+Модель угроз первого релиза — один доверенный локальный пользователь; публичный
+SaaS, tenant isolation и совместное редактирование не поддерживаются. Для
+резервной копии остановите CLI/Web процессы и скопируйте весь
+`AGENT_DATA_DIR` (включая SQLite `-wal`/`-shm`, если они остались). Для
+восстановления верните каталог целиком при остановленных процессах и сначала
+запустите `doctor`; частичное копирование отдельных SQLite-файлов не считается
+надёжной резервной копией.
 
 ## Безопасность файлов
 
@@ -295,8 +344,9 @@ tool call. Для слишком большого отдельного файл�
 - Явно оборванная изменяющая команда отклоняется до модели и tools; отсутствующее
   содержимое не угадывается.
 
-Версия 0.12.0 готова для production-эксплуатации как локальный однопользовательский
-CLI в границах `AGENT_WORKSPACE`. Для многопользовательского сервиса добавьте
+Версия 0.13.0 предназначена для production-эксплуатации как локальный
+однопользовательский CLI/Web UI в границах `AGENT_WORKSPACE`. Для
+многопользовательского сервиса добавьте
 процессную изоляцию workspace, аутентификацию, лимиты запросов, централизованные
 логи и human-in-the-loop для необратимых действий.
 
@@ -305,7 +355,8 @@ CLI в границах `AGENT_WORKSPACE`. Для многопользовате
 ```powershell
 .\.venv\Scripts\python.exe -m ruff check --no-cache .
 .\.venv\Scripts\python.exe -m ruff format --check --no-cache .
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m mypy src/context_agent
+.\.venv\Scripts\python.exe -m pytest -ra
 ```
 
 Обычные тесты не вызывают платные API. Реальный сетевой smoke-test запускается
@@ -315,8 +366,9 @@ CLI в границах `AGENT_WORKSPACE`. Для многопользовате
 пользователь. Ruff запускается с `--no-cache` по той же причине.
 
 Индексатор поддерживает UTF-8, CP1251 и BOM-тексты UTF-16/UTF-32. Он не
-загружает служебные `.pytest-*`, `.coverage*`, browser-profile,
-Playwright/cache и build-артефакты. `list_context_sources` возвращает 20
+загружает служебные `.deps`, `.pytest-*`, `.coverage*`, `reports`,
+`*.egg-info`, browser-profile, Playwright/cache и build-артефакты.
+`list_context_sources` возвращает 20
 источников по умолчанию и не более 50 за один вызов, чтобы аудит больших
 проектов не переполнял окно модели.
 

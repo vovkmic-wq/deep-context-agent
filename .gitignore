@@ -15,3 +15,5 @@ langchain-master-v0/
 dist/
 build/
 *.egg-info/
+webui/node_modules/
+acceptance/
