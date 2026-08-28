@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ CANONICAL_PROVIDERS = (
 PROVIDER_ALIASES = {"glm": "zhipu"}
 SUPPORTED_PROVIDERS = (*CANONICAL_PROVIDERS, *PROVIDER_ALIASES)
 DEFAULT_PROVIDER_PRIORITY = ("glm", "openai")
+_CUSTOM_PROVIDER_PATTERN = re.compile(r"^custom-[a-z0-9][a-z0-9-]{0,47}$")
 
 
 def _absolute_path(value: str, base_dir: Path) -> Path:
@@ -87,10 +89,11 @@ class ProviderConfig:
     reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
-        if self.name not in CANONICAL_PROVIDERS:
+        is_custom = _CUSTOM_PROVIDER_PATTERN.fullmatch(self.name)
+        if self.name not in CANONICAL_PROVIDERS and not is_custom:
             supported = ", ".join(SUPPORTED_PROVIDERS)
             raise ConfigurationError(
-                f"Unknown provider '{self.name}'. Supported: {supported}"
+                f"Unknown provider '{self.name}'. Supported: {supported}, custom-<id>"
             )
         if not self.model.strip():
             raise ConfigurationError(f"Model is not configured for {self.name}")

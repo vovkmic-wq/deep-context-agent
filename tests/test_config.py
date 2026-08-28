@@ -147,6 +147,27 @@ def test_unknown_provider_is_rejected() -> None:
         ProviderConfig.from_env("unknown", {})
 
 
+def test_valid_custom_provider_configuration_is_accepted() -> None:
+    provider = ProviderConfig(
+        name="custom-private",
+        model="private-model",
+        base_url="http://127.0.0.1:9000/v1",
+        api_key="local-provider",
+    )
+    assert provider.name == "custom-private"
+
+
+@pytest.mark.parametrize("name", ["custom-", "custom-UPPER", "private", "custom-a_b"])
+def test_invalid_custom_provider_name_is_rejected(name: str) -> None:
+    with pytest.raises(ConfigurationError, match="Unknown provider"):
+        ProviderConfig(
+            name=name,
+            model="model",
+            base_url="http://127.0.0.1:9000/v1",
+            api_key="local-provider",
+        )
+
+
 def test_provider_priority_uses_explicit_order_and_canonical_alias() -> None:
     providers = ProviderConfig.priority_from_env(
         providers="openai, glm, deepseek",

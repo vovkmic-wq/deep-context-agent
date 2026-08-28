@@ -294,9 +294,9 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
    активный provider удалить нельзя; дубликаты запрещены.
 3. Move up/down, add и remove атомарно валидируют всю новую цепочку и применяют
    её ко всем последующим chat/audit/doctor вызовам.
-4. У каждого активного provider есть `Проверить / Live check`. Проверка требует
-   явного подтверждения платного запроса, вызывает только выбранного provider и
-   показывает safe available/unavailable status.
+4. У каждого активного provider есть `Проверить / Live check`. Remote-
+   проверка требует явного подтверждения возможной оплаты. Loopback-
+   проверка запускается без payment dialog и помечается «без платы API».
 5. API никогда не сериализует credential, authorization header или raw SDK
    exception. Missing configuration возвращает safe 422.
 
@@ -323,3 +323,20 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 6. Адаптивный viewport 390x844 сохраняет все семь разделов в нижней навигации,
    читаемые mode cards и доступный keyboard flow.
 7. Console error/warning log пуст после bootstrap и основных переходов.
+
+### 13.8. Provider/files acceptance 0.15.0
+
+1. LM Studio doctor читает bounded `/models`, отличает unreachable,
+   empty catalog и missing model. Placeholder `local-model` заменяется
+   загруженной не-embedding model и отражается в catalog.
+2. `POST /api/providers` принимает только `custom-*`, model и URL.
+   Extra/browser secret отклоняется. Remote HTTP, URL credentials,
+   query/fragment отклоняются; remote API key остаётся в server env.
+3. Созданный profile можно атомарно добавить в active chain,
+   переместить, проверить и убрать до перезапуска process.
+4. Files `Назад` возвращает предыдущий просмотр, `Выше` открывает
+   parent, а `Открыть` всегда выдаёт видимый status. В корне Back/Up
+   disabled пока нет history/родителя.
+5. Unit/API/bundle и real browser E2E подтверждают local-free label,
+   no-confirm LM Studio, custom provider flow, history/up/open status и нулевые
+   console errors.

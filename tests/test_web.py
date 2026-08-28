@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from context_agent.config import AppConfig, ProviderConfig
+from context_agent.errors import AgentError
 from context_agent.project_audit import ProjectAuditStore
 from context_agent.web import create_app
 
@@ -149,6 +152,135 @@ def test_provider_priority_changes_atomically_for_live_web_runtime(
     assert runtime.json()["provider_priority"] == ["openai", "lmstudio"]
     assert catalog.json()["active"] == ["openai", "lmstudio"]
     assert "fallback-secret" not in catalog.text
+
+
+def test_custom_local_provider_can_be_created_and_activated(tmp_path: Path) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    created = client.post(
+        "/api/providers",
+        json={
+            "name": "custom-local",
+            "model": "local-chat",
+            "base_url": "http://127.0.0.1:4321/v1",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    changed = client.put(
+        "/api/providers/priority",
+        json={"providers": ["custom-local", "lmstudio"]},
+        headers={"x-csrf-token": csrf},
+    )
+    catalog = client.get("/api/providers")
+
+    assert created.status_code == 201
+    assert created.json()["provider"]["local"] is True
+    assert "local-provider" not in created.text
+    assert changed.json()["active"] == ["custom-local", "lmstudio"]
+    custom = next(
+        item for item in catalog.json()["items"] if item["provider"] == "custom-local"
+    )
+    assert custom["custom"] is True
+    assert custom["active"] is True
+
+
+def test_custom_provider_rejects_remote_http_and_browser_secret(
+    tmp_path: Path,
+) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    remote_http = client.post(
+        "/api/providers",
+        json={
+            "name": "custom-insecure",
+            "model": "remote-chat",
+            "base_url": "http://models.example/v1",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    secret_field = client.post(
+        "/api/providers",
+        json={
+            "name": "custom-secret",
+            "model": "remote-chat",
+            "base_url": "https://models.example/v1",
+            "api_key": "must-not-be-accepted",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+
+    assert remote_http.status_code == 422
+    assert secret_field.status_code == 422
+    assert "must-not-be-accepted" not in secret_field.text
+
+
+def test_lmstudio_doctor_selects_loaded_chat_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ProviderConfig(
+        name="lmstudio",
+        model="local-model",
+        base_url="http://127.0.0.1:1234/v1",
+        api_key="lm-studio",
+    )
+    monkeypatch.setattr(
+        "context_agent.web._probe_openai_models",
+        lambda _provider: ("embedding-model", "qwen-local"),
+    )
+
+    class _Model:
+        def invoke(self, _query: str) -> SimpleNamespace:
+            return SimpleNamespace(content="OK")
+
+    monkeypatch.setattr(
+        "context_agent.web.create_chat_model", lambda _provider: _Model()
+    )
+    app = create_app(_config(tmp_path), (provider,))
+    client = TestClient(app)
+    csrf = str(client.get("/api/runtime").json()["csrf_token"])
+    started = client.post(
+        "/api/providers/lmstudio/doctor",
+        json={"live": True},
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+    catalog = client.get("/api/providers").json()["items"]
+    lmstudio = next(item for item in catalog if item["provider"] == "lmstudio")
+
+    assert started.status_code == 200
+    assert '"model": "qwen-local"' in events.text
+    assert '"local": true' in events.text
+    assert "event: completed" in events.text
+    assert lmstudio["model"] == "qwen-local"
+
+
+def test_expected_agent_error_has_safe_operator_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingRuntime:
+        def __enter__(self) -> _FailingRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AgentError("private provider detail")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _FailingRuntime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={"query": "test", "thread_id": "safe-error"},
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert "Проверьте их live-статус" in events.text
+    assert "private provider detail" not in events.text
 
 
 def test_context_index_uses_virtual_workspace_root_and_reports_result(

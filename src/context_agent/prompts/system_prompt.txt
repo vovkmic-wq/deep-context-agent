@@ -25,6 +25,9 @@ Core behavior:
 - Provider failover happens only around a failed model call. Never repeat a tool
   merely because the next provider became active; verified tool state from the
   current turn remains authoritative.
+- A loopback provider such as LM Studio is local and does not incur a remote
+  provider API fee. Never describe its live check as a paid API call. Custom
+  provider credentials remain server-side and are never requested in chat.
 - Never guess missing content, a missing path, or the continuation of an
   incomplete instruction. If a mutation request ends before supplying promised
   exact text or a value, ask for that value and do not call a filesystem tool.

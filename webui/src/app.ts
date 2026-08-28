@@ -18,6 +18,8 @@ let activeChatTask = "";
 let currentThread = "web";
 let currentFilePath = "";
 let currentFileSha = "";
+let currentDirectory = "/workspace";
+const directoryHistory: string[] = [];
 let providerCatalog: Payload[] = [];
 let activeProviders: string[] = [];
 
@@ -295,38 +297,72 @@ function fileEndpoint(path: string): string {
   );
 }
 
-async function loadDirectory(requestedPath: string): Promise<void> {
+function updateDirectoryControls(): void {
+  element<HTMLButtonElement>("files-back").disabled = !directoryHistory.length;
+  element<HTMLButtonElement>("files-up").disabled = currentDirectory === "/workspace";
+}
+
+async function loadDirectory(
+  requestedPath: string,
+  addToHistory = true,
+): Promise<void> {
   const path = normalizeWorkspacePath(requestedPath);
-  const result = await api<{ items: Payload[]; request_id: string }>(
-    `/api/files?path=${encodeURIComponent(path)}&limit=500`,
-  );
-  element<HTMLInputElement>("files-path").value = path;
-  const output = element("files-output");
-  output.replaceChildren();
-  if (!result.items.length) {
-    output.append(card("Пустой каталог", "В этом каталоге нет доступных файлов."));
-    return;
-  }
-  for (const item of result.items) {
-    const itemPath = text(item.path);
-    const isDirectory = item.type === "directory";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "file-row";
-    const icon = document.createElement("span");
-    icon.className = "file-kind";
-    icon.textContent = isDirectory ? "▱" : "≡";
-    const name = document.createElement("span");
-    name.className = "file-path";
-    name.textContent = text(item.name);
-    const meta = document.createElement("small");
-    meta.textContent = isDirectory ? "Каталог" : `${text(item.size)} байт`;
-    button.append(icon, name, meta);
-    button.addEventListener("click", () => {
-      const action = isDirectory ? loadDirectory(itemPath) : openFile(itemPath);
-      void action.catch((error: Error) => showToast(error.message));
-    });
-    output.append(button);
+  const openButton = element<HTMLButtonElement>("open-directory");
+  openButton.disabled = true;
+  setOperationStatus("files-status", `Открываю ${path}…`);
+  try {
+    const result = await api<{ items: Payload[]; request_id: string }>(
+      `/api/files?path=${encodeURIComponent(path)}&limit=500`,
+    );
+    if (addToHistory && path !== currentDirectory) {
+      directoryHistory.push(currentDirectory);
+      if (directoryHistory.length > 100) directoryHistory.shift();
+    }
+    currentDirectory = path;
+    element<HTMLInputElement>("files-path").value = path;
+    updateDirectoryControls();
+    const output = element("files-output");
+    output.replaceChildren();
+    if (!result.items.length) {
+      output.append(
+        card("Пустой каталог", "В этом каталоге нет доступных файлов."),
+      );
+    }
+    for (const item of result.items) {
+      const itemPath = text(item.path);
+      const isDirectory = item.type === "directory";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "file-row";
+      const icon = document.createElement("span");
+      icon.className = "file-kind";
+      icon.textContent = isDirectory ? "▱" : "≡";
+      const name = document.createElement("span");
+      name.className = "file-path";
+      name.textContent = text(item.name);
+      const meta = document.createElement("small");
+      meta.textContent = isDirectory ? "Каталог" : `${text(item.size)} байт`;
+      button.append(icon, name, meta);
+      button.addEventListener("click", () => {
+        const action = isDirectory ? loadDirectory(itemPath) : openFile(itemPath);
+        void action.catch((error: Error) => showToast(error.message));
+      });
+      output.append(button);
+    }
+    setOperationStatus(
+      "files-status",
+      `Открыт ${path} · объектов: ${result.items.length}`,
+      "success",
+    );
+  } catch (error) {
+    setOperationStatus(
+      "files-status",
+      error instanceof Error ? error.message : "Ошибка открытия каталога",
+      "error",
+    );
+    throw error;
+  } finally {
+    openButton.disabled = false;
   }
 }
 
@@ -380,10 +416,24 @@ function providerStatus(provider: string, message: string, ok: boolean): void {
 }
 
 async function checkProvider(provider: string): Promise<void> {
-  if (!window.confirm(`Проверить ${provider} реальным платным API-запросом?`)) {
+  const catalogItem = providerCatalog.find(
+    (item) => text(item.provider) === provider,
+  );
+  const local = Boolean(catalogItem?.local);
+  if (
+    !local &&
+    !window.confirm(
+      `Проверить ${provider} реальным API-запросом? ` +
+        "Удалённый провайдер может взимать плату.",
+    )
+  ) {
     return;
   }
-  providerStatus(provider, "Проверка…", true);
+  providerStatus(
+    provider,
+    local ? "Локальная проверка · без платы за API…" : "Проверка…",
+    true,
+  );
   try {
     const result = await api<Payload>(
       `/api/providers/${encodeURIComponent(provider)}/doctor`,
@@ -392,11 +442,13 @@ async function checkProvider(provider: string): Promise<void> {
     streamTask(text(result.task_id), (name, data) => {
       if (name === "result") {
         const checkedResult = data.result as Payload;
-        providerStatus(
-          provider,
-          `Доступен · ответ ${text(checkedResult.response)}`,
-          true,
-        );
+        void refreshProviders().then(() => {
+          providerStatus(
+            provider,
+            `Доступен · ${text(checkedResult.model)} · ответ ${text(checkedResult.response)}`,
+            true,
+          );
+        });
       }
       if (name === "failed") providerStatus(provider, text(data.message), false);
     });
@@ -407,6 +459,26 @@ async function checkProvider(provider: string): Promise<void> {
       false,
     );
   }
+}
+
+async function createCustomProvider(): Promise<void> {
+  const result = await api<Payload>("/api/providers", {
+    method: "POST",
+    body: JSON.stringify({
+      name: value("custom-provider-name").trim().toLowerCase(),
+      model: value("custom-provider-model").trim(),
+      base_url: value("custom-provider-url").trim(),
+    }),
+  });
+  const provider = result.provider as Payload;
+  const providerName = text(provider.provider);
+  await refreshProviders();
+  if (providerName && !activeProviders.includes(providerName)) {
+    activeProviders.push(providerName);
+    await saveProviderPriority();
+  }
+  element<HTMLFormElement>("custom-provider-form").reset();
+  showToast(`Провайдер ${providerName} добавлен`);
 }
 
 function renderProviders(): void {
@@ -426,7 +498,9 @@ function renderProviders(): void {
     const heading = document.createElement("strong");
     heading.textContent = providerName;
     const model = document.createElement("small");
-    model.textContent = text(item.model);
+    model.textContent = `${text(item.model)} · ${
+      item.local ? "локально, без платы API" : "удалённо"
+    }`;
     const endpoint = document.createElement("div");
     endpoint.className = "provider-details";
     const url = document.createElement("small");
@@ -588,7 +662,7 @@ async function bootstrap(): Promise<void> {
     refreshThreads(),
     refreshProviders(),
     loadSettings(),
-    loadDirectory("/workspace"),
+    loadDirectory("/workspace", false),
   ]);
   const requestedPanel = window.location.hash.slice(1);
   if (pageTitles[requestedPanel]) navigate(requestedPanel);
@@ -770,8 +844,18 @@ element<HTMLFormElement>("files-form").addEventListener("submit", (event) => {
   );
 });
 
+element("files-back").addEventListener("click", () => {
+  const previous = directoryHistory.pop();
+  if (!previous) return;
+  void loadDirectory(previous, false).catch((error: Error) => {
+    directoryHistory.push(previous);
+    updateDirectoryControls();
+    showToast(error.message);
+  });
+});
+
 element("files-up").addEventListener("click", () => {
-  const current = normalizeWorkspacePath(value("files-path"));
+  const current = currentDirectory;
   const segments = current.replace(/^\/workspace\/?/, "").split("/").filter(Boolean);
   segments.pop();
   const parent = segments.length ? `/workspace/${segments.join("/")}` : "/workspace";
@@ -802,6 +886,13 @@ element("add-provider").addEventListener("click", () => {
     void refreshProviders();
   });
 });
+element<HTMLFormElement>("custom-provider-form").addEventListener(
+  "submit",
+  (event) => {
+    event.preventDefault();
+    void createCustomProvider().catch((error: Error) => showToast(error.message));
+  },
+);
 
 element<HTMLFormElement>("settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();

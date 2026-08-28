@@ -3,6 +3,33 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Provider/files hardening 0.15.0 — 2026-08-29
+
+| Этап 0.15.0 | Статус | Реализация/проверка |
+|---|---|---|
+| LM Studio diagnostics | Завершён | Bounded `/models`, safe errors, `local-model` auto-selection, catalog update |
+| Local/remote payment UX | Завершён | Loopback без confirm и с явным free label; remote с opt-in warning |
+| Custom providers | Завершён | `custom-*` UI/API, immediate activation, HTTPS/loopback validation, server-only key |
+| Files navigation | Завершён | Bounded history Back, parent Up, loading/success/error и object count |
+| Error UX | Завершён | Expected AgentError в SSE даёт safe provider guidance без raw exception |
+| Документация/version | Завершён | Release prompt, global prompt/ТЗ, Web-ТЗ, system prompt, README/env/changelog, 0.15.0 |
+| Финальный контур | Завершён | Python/TS/package, real LM Studio/custom live, desktop/mobile browser acceptance PASS |
+
+Финальные evidence 0.15.0:
+
+- `ruff check` и `ruff format --check` — PASS, 41 файл; mypy —
+  13 source files без ошибок; pytest — 193 passed, 1 planned Windows
+  symlink skip; compileall и pip check — PASS;
+- TypeScript `tsc --noEmit`, esbuild и bundle test — PASS, JS+CSS 37 370 bytes;
+- реальный LM Studio `/models` вернул 7 models; Web doctor выбрал
+  `qwen2.5-7b-instruct` вместо placeholder и получил `OK`;
+- custom local provider создан, помещён первым в active chain и
+  получил `OK` без сетевой платы;
+- browser E2E: LM Studio no payment dialog, custom provider form, file Open/
+  Back/Up/editor, mobile 390x844 и zero console warnings/errors — PASS;
+- wheel 0.15.0 содержит 22 файла и static bundle, SHA-256
+  `55608F53674F7EDC1D213C975911F42E04A66779771240759F5974D73076A2E2`.
+
 ## Единый Web API и Codex-like UX 0.14.0 — 2026-08-29
 
 | Этап 0.14.0 | Статус | Реализация/проверка |

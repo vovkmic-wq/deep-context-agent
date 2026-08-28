@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import queue
+import re
 import secrets
 import sys
 import threading
@@ -16,9 +18,13 @@ from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -30,7 +36,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.responses import Response as FastAPIResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from context_agent import __version__
 from context_agent.config import AppConfig, ProviderConfig
@@ -153,7 +159,15 @@ class ProviderDoctorRequest(BaseModel):
 
 
 class ProviderPriorityRequest(BaseModel):
-    providers: list[str] = Field(min_length=1, max_length=6)
+    providers: list[str] = Field(min_length=1, max_length=20)
+
+
+class ProviderCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=r"^custom-[a-z0-9][a-z0-9-]{0,47}$")
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(min_length=8, max_length=500)
 
 
 class SettingsRequest(BaseModel):
@@ -236,6 +250,23 @@ class TaskRegistry:
                         "message": exc.safe_message,
                     },
                 )
+            except AgentError as exc:
+                print(
+                    f"web task {task.task_id} failed: {type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                emit(
+                    "failed",
+                    {
+                        "task_id": task.task_id,
+                        "error_type": type(exc).__name__,
+                        "message": (
+                            "LLM-запрос не завершён ни одним "
+                            "провайдером. Проверьте их live-статус "
+                            "на вкладке «Провайдеры» и повторите запрос."
+                        ),
+                    },
+                )
             except Exception as exc:  # backend boundary: never expose raw details
                 print(
                     f"web task {task.task_id} failed: {type(exc).__name__}",
@@ -282,6 +313,9 @@ class ProviderRegistry:
         if not providers:
             raise ValueError("At least one provider is required")
         self._providers = providers
+        self._custom: dict[str, ProviderConfig] = {
+            item.name: item for item in providers if item.name.startswith("custom-")
+        }
         self._lock = threading.RLock()
 
     def snapshot(self) -> tuple[ProviderConfig, ...]:
@@ -297,13 +331,15 @@ class ProviderRegistry:
         if any(not item for item in normalized):
             raise ConfigurationError("Provider names cannot be empty")
         active = {item.name: item for item in self.snapshot()}
+        with self._lock:
+            custom = dict(self._custom)
         resolved: list[ProviderConfig] = []
         seen: set[str] = set()
         for requested_name in normalized:
             canonical = "zhipu" if requested_name == "glm" else requested_name
             if canonical in seen:
                 raise ConfigurationError(f"Provider '{canonical}' is repeated")
-            provider = active.get(canonical)
+            provider = active.get(canonical) or custom.get(canonical)
             if provider is None:
                 provider = ProviderConfig.from_env(canonical)
             seen.add(canonical)
@@ -313,6 +349,39 @@ class ProviderRegistry:
             self._providers = updated
         return updated
 
+    def add_custom(self, provider: ProviderConfig) -> None:
+        """Add one validated custom provider to the process-local catalog."""
+
+        if not provider.name.startswith("custom-"):
+            raise ConfigurationError("Custom provider ID must start with custom-")
+        with self._lock:
+            if provider.name in self._custom or any(
+                item.name == provider.name for item in self._providers
+            ):
+                raise ConfigurationError("Provider ID already exists")
+            self._custom[provider.name] = provider
+
+    def get(self, name: str) -> ProviderConfig | None:
+        """Return configured provider metadata without exposing its credential."""
+
+        canonical = "zhipu" if name.casefold() == "glm" else name.casefold()
+        with self._lock:
+            for provider in self._providers:
+                if provider.name == canonical:
+                    return provider
+            return self._custom.get(canonical)
+
+    def update(self, provider: ProviderConfig) -> None:
+        """Replace one provider config in the catalog and active chain."""
+
+        with self._lock:
+            if provider.name.startswith("custom-"):
+                self._custom[provider.name] = provider
+            self._providers = tuple(
+                provider if item.name == provider.name else item
+                for item in self._providers
+            )
+
     def catalog(self) -> list[dict[str, object]]:
         """Return configured/active metadata without returning credentials."""
 
@@ -321,12 +390,26 @@ class ProviderRegistry:
             item.name: (position, item) for position, item in enumerate(active)
         }
         items: list[dict[str, object]] = []
-        for name in ("lmstudio", "zhipu", "openai", "yandex", "deepseek", "qwen"):
+        with self._lock:
+            custom_names = tuple(sorted(self._custom))
+        names = (
+            "lmstudio",
+            "zhipu",
+            "openai",
+            "yandex",
+            "deepseek",
+            "qwen",
+            *custom_names,
+        )
+        for name in names:
             active_entry = active_by_name.get(name)
             provider = active_entry[1] if active_entry else None
+            if provider is None:
+                with self._lock:
+                    provider = self._custom.get(name)
             configured = provider is not None
             configuration_error = ""
-            if provider is None:
+            if provider is None and not name.startswith("custom-"):
                 try:
                     provider = ProviderConfig.from_env(name)
                     configured = True
@@ -342,6 +425,10 @@ class ProviderRegistry:
                     "active": active_entry is not None,
                     "priority": active_entry[0] if active_entry else None,
                     "configuration_error": configuration_error,
+                    "local": bool(
+                        provider and _is_loopback_base_url(provider.base_url)
+                    ),
+                    "custom": name.startswith("custom-"),
                 }
             )
         return items
@@ -408,6 +495,102 @@ def _file_sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_loopback_base_url(base_url: str) -> bool:
+    """Return whether an OpenAI-compatible endpoint is strictly local."""
+
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").casefold()
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _custom_api_key_environment(provider_name: str) -> str:
+    suffix = re.sub(r"[^A-Z0-9]", "_", provider_name.upper())
+    return f"{suffix}_API_KEY"
+
+
+def _custom_provider(body: ProviderCreateRequest) -> ProviderConfig:
+    """Build a safe custom OpenAI-compatible provider without browser secrets."""
+
+    parsed = urlparse(body.base_url.strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigurationError("Provider URL is invalid")
+    base_url = body.base_url.strip().rstrip("/")
+    local = _is_loopback_base_url(base_url)
+    if parsed.scheme == "http" and not local:
+        raise ConfigurationError("Remote custom providers require HTTPS")
+    environment = _custom_api_key_environment(body.name)
+    api_key = "local-provider" if local else os.getenv(environment, "").strip()
+    if not api_key:
+        raise ConfigurationError(f"Set server environment variable {environment}")
+    return ProviderConfig(
+        name=body.name,
+        model=body.model.strip(),
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+
+def _probe_openai_models(provider: ProviderConfig) -> tuple[str, ...]:
+    """Read a bounded OpenAI-compatible model catalog with safe failures."""
+
+    endpoint = provider.base_url.rstrip("/") + "/models"
+    headers = {"Accept": "application/json"}
+    if provider.api_key not in {"lm-studio", "local-provider"}:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    request = UrlRequest(endpoint, headers=headers)
+    try:
+        with urlopen(request, timeout=min(provider.timeout, 10.0)) as response:
+            raw = response.read(1024 * 1024 + 1)
+    except HTTPError as exc:
+        message = (
+            "Сервер отклонил API-ключ провайдера."
+            if exc.code in {401, 403}
+            else "Сервер провайдера ответил ошибкой на запрос списка моделей."
+        )
+        raise _PublicTaskError("provider_catalog_failed", message) from exc
+    except (OSError, TimeoutError, URLError) as exc:
+        raise _PublicTaskError(
+            "provider_unreachable",
+            "Локальный сервер модели недоступен. Запустите сервер и загрузите модель.",
+        ) from exc
+    if len(raw) > 1024 * 1024:
+        raise _PublicTaskError(
+            "provider_catalog_too_large",
+            "Список моделей провайдера превысил безопасный размер.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        models = tuple(
+            str(row["id"])
+            for row in rows[:100]
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        )
+    except (UnicodeError, ValueError, TypeError, KeyError) as exc:
+        raise _PublicTaskError(
+            "provider_catalog_invalid",
+            "Сервер вернул некорректный список моделей.",
+        ) from exc
+    if not models:
+        raise _PublicTaskError(
+            "provider_model_missing",
+            "Сервер доступен, но ни одна модель не загружена.",
+        )
+    return models
 
 
 def _runtime_factory(
@@ -1031,6 +1214,27 @@ def create_app(
             active=[item.name for item in provider_registry.snapshot()],
         )
 
+    @app.post("/api/providers", status_code=201)
+    def create_provider(request: Request, body: ProviderCreateRequest):
+        try:
+            provider = _custom_provider(body)
+            provider_registry.add_custom(provider)
+        except ConfigurationError as exc:
+            status_code = 409 if "already exists" in str(exc) else 422
+            raise HTTPException(status_code, str(exc)) from exc
+        return _request_payload(
+            request,
+            provider={
+                "provider": provider.name,
+                "model": provider.model,
+                "base_url": provider.base_url,
+                "configured": True,
+                "local": _is_loopback_base_url(provider.base_url),
+                "api_key_environment": _custom_api_key_environment(provider.name),
+            },
+            effective_immediately=True,
+        )
+
     @app.put("/api/providers/priority")
     def update_provider_priority(request: Request, body: ProviderPriorityRequest):
         try:
@@ -1103,8 +1307,7 @@ def create_app(
         ) -> object:
             if cancelled.is_set():
                 raise _TaskCancelledError
-            active = {item.name: item for item in provider_registry.snapshot()}
-            candidate = active.get(provider_name.casefold())
+            candidate = provider_registry.get(provider_name)
             if candidate is None:
                 try:
                     candidate = ProviderConfig.from_env(provider_name)
@@ -1113,16 +1316,51 @@ def create_app(
                         "provider_not_configured",
                         "Провайдер не настроен на сервере.",
                     ) from None
+            available_models: tuple[str, ...] = ()
+            local = _is_loopback_base_url(candidate.base_url)
+            if local:
+                available_models = _probe_openai_models(candidate)
+                if candidate.model not in available_models:
+                    is_default_lmstudio = (
+                        candidate.name == "lmstudio"
+                        and candidate.model == "local-model"
+                    )
+                    if is_default_lmstudio:
+                        chat_models = tuple(
+                            model
+                            for model in available_models
+                            if not any(
+                                marker in model.casefold()
+                                for marker in ("embed", "rerank")
+                            )
+                        )
+                        selected_model = (chat_models or available_models)[0]
+                        candidate = replace(candidate, model=selected_model)
+                        provider_registry.update(candidate)
+                    else:
+                        raise _PublicTaskError(
+                            "provider_model_not_loaded",
+                            "Сервер доступен, но выбранная модель не загружена.",
+                        )
             try:
                 response = create_chat_model(candidate).invoke("Reply with exactly: OK")
             except Exception as exc:
+                message = (
+                    "LM Studio доступна, но локальная модель не ответила. "
+                    "Проверьте поддержку Chat Completions и tool calling."
+                    if candidate.name == "lmstudio"
+                    else "Провайдер не ответил на live-проверку."
+                )
                 raise _PublicTaskError(
                     "provider_unavailable",
-                    "Провайдер не ответил на live-проверку.",
+                    message,
                 ) from exc
             return {
                 "provider": candidate.name,
+                "model": candidate.model,
                 "response": message_text(response).strip(),
+                "local": local,
+                "available_models": list(available_models),
             }
 
         return _request_payload(

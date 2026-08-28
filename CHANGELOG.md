@@ -3,6 +3,37 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.15.0] — 2026-08-29
+
+### Добавлено
+
+- Создание и немедленное включение process-local OpenAI-compatible
+  профилей `custom-*` во вкладке провайдеров.
+- Отдельные Files-действия `Назад / Back` по history и `Выше / Up`
+  к parent, а также видимый loading/success/error для `Открыть`.
+
+### Исправлено
+
+- LM Studio Web doctor получает bounded каталог моделей и заменяет
+  placeholder `local-model` на реальную загруженную чат-модель.
+- Для loopback убрано ложное payment warning; теперь UI явно
+  показывает `локально, без платы API`, а remote сохраняет
+  opt-in предупреждение.
+- Expected `AgentError` получил safe operator guidance в SSE вместо
+  неинформативного «проверьте журнал».
+
+### Безопасность
+
+- Custom provider API запрещает browser secrets, URL credentials/query/
+  fragment и remote HTTP; remote credential читается только из server env.
+- `/models` ограничен 1 MiB, 100 записями и коротким timeout;
+  API keys и raw SDK exceptions не сериализуются.
+
+### Проверено
+
+- Финальные Ruff/mypy/pytest/TypeScript/package/live/browser evidence указаны
+  в `IMPLEMENTATION_STATUS.md`.
+
 ## [0.14.0] — 2026-08-29
 
 ### Добавлено

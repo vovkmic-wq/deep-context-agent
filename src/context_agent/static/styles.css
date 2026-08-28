@@ -85,6 +85,7 @@ main { max-width: 1440px; margin: auto; padding: clamp(1rem, 3vw, 2rem); }
 .form-grid .full { grid-column: 1 / -1; }
 .form-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
 .search-row, .path-bar { display: grid; grid-template-columns: minmax(15rem, 1fr) minmax(8rem, auto) auto; gap: .7rem; align-items: end; margin: 1rem 0; }
+.path-bar { grid-template-columns: auto auto minmax(15rem, 1fr) auto; }
 .index-box { display: grid; grid-template-columns: minmax(15rem, 1fr) auto; gap: .7rem; align-items: end; }
 .index-box .help, .index-box .operation-status { grid-column: 1 / -1; }
 .index-box .operation-status { margin: .2rem 0 0; }
@@ -141,6 +142,9 @@ th { color: var(--muted); font-size: .82rem; }
 .file-editor textarea { min-height: 55vh; font: 13px/1.55 "Cascadia Code", "SFMono-Regular", Consolas, monospace; tab-size: 4; }
 
 .provider-add { display: grid; grid-template-columns: minmax(230px, 1fr) auto; gap: .7rem; align-items: end; margin-bottom: 1rem; }
+.custom-provider { margin-bottom: 1rem; }
+.custom-provider summary { cursor: pointer; color: var(--accent); font-weight: 800; }
+.custom-provider[open] summary { margin-bottom: 1rem; }
 .provider-list { display: grid; gap: .6rem; margin-bottom: 1rem; }
 .provider-row { display: grid; grid-template-columns: 42px minmax(170px, 1fr) minmax(180px, 1.5fr) auto; gap: .75rem; align-items: center; border: 1px solid var(--border); border-radius: .7rem; padding: .75rem; background: var(--surface); }
 .provider-priority { display: grid; width: 2rem; height: 2rem; place-items: center; border-radius: 50%; color: #111506; background: var(--accent); font-weight: 900; }

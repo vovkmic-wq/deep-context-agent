@@ -19,7 +19,10 @@ if (!source.includes("/api/runtime") || !source.includes("x-csrf-token")) {
 for (const required of [
   "/api/context/index",
   "/api/providers/priority",
+  '"/api/providers"',
   "dca_enter_send",
+  "files-back",
+  "custom-provider-form",
   "expected_sha256",
 ]) {
   if (!source.includes(required)) {

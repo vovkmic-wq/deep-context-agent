@@ -120,7 +120,8 @@
 
           <section id="files" class="panel" aria-labelledby="files-title">
             <div class="section-heading"><div><h2 id="files-title">Файлы / Files</h2><p>Безопасный просмотр и редактирование только внутри <code>/workspace</code>.</p></div></div>
-            <form id="files-form" class="path-bar"><button id="files-up" type="button" class="secondary" aria-label="На уровень выше">←</button><label>Путь / Path<input id="files-path" value="/workspace"></label><button type="submit">Открыть</button></form>
+            <form id="files-form" class="path-bar"><button id="files-back" type="button" class="secondary" aria-label="Назад по истории" title="Назад / Back" disabled>← Назад</button><button id="files-up" type="button" class="secondary" aria-label="На уровень выше" title="На уровень выше / Up" disabled>↑ Выше</button><label>Путь / Path<input id="files-path" value="/workspace"></label><button id="open-directory" type="submit">Открыть / Open</button></form>
+            <div id="files-status" class="operation-status" aria-live="polite">Готов открыть каталог.</div>
             <div class="file-layout">
               <div id="files-output" class="file-list" aria-live="polite"></div>
               <section id="file-editor" class="file-editor" hidden>
@@ -134,8 +135,17 @@
           <section id="providers" class="panel" aria-labelledby="providers-title">
             <div class="section-heading"><div><h2 id="providers-title">Провайдеры / Providers</h2><p>Порядок применяется ко всем новым вызовам сразу. Ключи остаются только на сервере.</p></div><button id="load-providers" type="button" class="secondary">Обновить</button></div>
             <div class="surface provider-add"><label>Добавить настроенного провайдера / Add provider<select id="provider-select"></select></label><button id="add-provider" type="button">Добавить</button></div>
+            <details class="surface custom-provider">
+              <summary>Новый OpenAI-совместимый провайдер / New provider</summary>
+              <form id="custom-provider-form" class="form-grid">
+                <label>ID провайдера / Provider ID<input id="custom-provider-name" required pattern="custom-[a-z0-9][a-z0-9-]{0,47}" placeholder="custom-company"><span class="help">Только латиница, цифры и дефис; начните с <code>custom-</code>.</span></label>
+                <label>Модель / Model<input id="custom-provider-model" required placeholder="model-name"></label>
+                <label class="full">OpenAI-compatible Base URL<input id="custom-provider-url" type="url" required placeholder="http://127.0.0.1:1234/v1"><span class="help">Локальный HTTP разрешён только для localhost. Для удалённого URL нужен HTTPS и ключ в серверной переменной <code>CUSTOM_COMPANY_API_KEY</code>.</span></label>
+                <div class="form-actions full"><button type="submit">Создать и добавить / Create and add</button></div>
+              </form>
+            </details>
             <div id="providers-output" class="provider-list" aria-live="polite"></div>
-            <p class="help">Live-проверка делает короткий платный запрос только выбранному провайдеру. Изменение порядка действует до перезапуска Web-процесса.</p>
+            <p class="help">Live-проверка LM Studio и других localhost-моделей не требует платы за API. Удалённый провайдер может учесть короткий тестовый запрос. Изменения действуют до перезапуска Web-процесса.</p>
           </section>
 
           <section id="settings" class="panel" aria-labelledby="settings-title">

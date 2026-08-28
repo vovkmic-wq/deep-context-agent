@@ -1,6 +1,32 @@
 # Управляющий промпт реализации
 
-Актуальный управляющий промпт версии 0.14.0 находится в этом файле.
+Актуальный управляющий промпт версии 0.15.0 находится в этом файле.
+
+## Provider and files UX hardening 0.15.0 (2026-08-29)
+
+Работай по `DEEP_CONTEXT_AGENT_0_15_PROVIDER_FILES_PRODUCTION_PROMPT.md`,
+основному `TECHNICAL_SPEC.md` и Web-ТЗ. Диагностируй LM Studio через
+ограниченный `/models`: если Web получил default placeholder
+`local-model`, выбери первую загруженную не-embedding модель и
+примени её к новым Web-вызовам. Показывай safe причины:
+сервер недоступен, модель не загружена, неверный каталог или
+Chat Completions не поддержан.
+
+Локальный loopback provider не требует предупреждения об оплате
+API. Для remote provider сохрани opt-in confirmation. Добавь
+создание process-local OpenAI-compatible profiles `custom-*`: HTTP только
+для loopback, HTTPS для remote, ключ только из server environment,
+никогда из browser payload/response.
+
+В Files раздели «Назад» (история) и «Выше» (родитель),
+выключай их только когда действие невозможно. Кнопка «Открыть»
+обязана показать loading, success/error, точный virtual path и
+число объектов.
+
+Закрепи всё API/unit/bundle/browser regression-тестами, выполни
+реальную бесплатную LM Studio live-проверку, полный Python/TS/
+package контур, secret scan и browser desktop/mobile acceptance. Публикуй
+только после фактического PASS.
 
 ## Codex-like local Web UI 0.14.0 (2026-08-29)
 

@@ -319,6 +319,26 @@
 10. Нормативные API/UX/security критерии и browser E2E определены в разделе 13
     `WEB_INTERFACE_TECHNICAL_SPECIFICATION.md`.
 
+## 2.3. Provider/files hardening 0.15.0
+
+1. Web live-doctor loopback OpenAI-compatible provider до вызова model
+   получает ограниченный `/models`. Для LM Studio placeholder
+   `local-model` атомарно заменяется первой загруженной чат-
+   моделью; embedding/rerank не выбираются при наличии чат-
+   модели.
+2. Loopback live-check в UI явно обозначен как локальный и без
+   платы за provider API; payment confirmation нужен только для
+   remote endpoint.
+3. Web API разрешает process-local custom profiles с ID `custom-*`, model
+   и OpenAI-compatible base URL. Browser credential запрещён; remote key
+   читается из вычисляемой `CUSTOM_<ID>_API_KEY`. HTTP допустим
+   только для loopback; remote требует HTTPS.
+4. File browser хранит ограниченную видимую историю навигации
+   в browser state. `Назад / Back` и `Выше / Up` разделены; каждый
+   open показывает loading, safe error или path/count success.
+5. Expected background `AgentError` возвращает понятное safe SSE-
+   объяснение и никогда raw SDK exception, credential или physical path.
+
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |
