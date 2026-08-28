@@ -1,6 +1,34 @@
 # Управляющий промпт реализации
 
-Актуальный управляющий промпт версии 0.13.0 находится в этом файле.
+Актуальный управляющий промпт версии 0.14.0 находится в этом файле.
+
+## Codex-like local Web UI 0.14.0 (2026-08-29)
+
+Работай по `DEEP_CONTEXT_AGENT_0_14_WEB_PRODUCTION_PROMPT.md`, основному
+`TECHNICAL_SPEC.md` и нормативному `WEB_INTERFACE_TECHNICAL_SPECIFICATION.md`.
+Не создавай Web-only runtime, SQLite, файловую логику или provider chain: Web
+является клиентом тех же сервисов, данных и security policies, что CLI.
+
+Сделай чат ориентированным на задачи: thread list/history из SQLite, новый
+thread, нижний auto-grow composer, stop/error states, выбор инженерной роли,
+optional local Enter-to-send и неизменный Shift+Enter newline. Роль является
+ограниченной инструкцией и никогда не даёт право записи.
+
+Исправь virtual root `/workspace`, добавь явные состояния и counters индексации,
+кликабельный файловый browser/editor с bounded preview и optimistic SHA-256.
+Подпиши audit include/exclude/batch size и safe settings по-русски / по-английски
+с понятными комментариями.
+
+Используй thread-safe live provider registry: все новые chat/audit/doctor берут
+один snapshot текущего порядка; настроенные providers можно добавить, убрать
+или переставить без рестарта, а каждый — проверить отдельным opt-in live call.
+Ключи и raw exceptions браузеру не передавать.
+
+Проверь API/SSE, TypeScript bundle, desktop/mobile UX, Enter/Shift+Enter,
+индексацию, file open, provider reorder/restore и один primary live chat.
+Обнови system prompt, оба ТЗ, README, changelog, status/version. После полного
+Ruff/mypy/pytest/compileall/build/pip-check и browser acceptance публикуй только
+проверенные release-файлы без секретов.
 
 ## Production audit and Web UI 0.13.0 (2026-08-27)
 

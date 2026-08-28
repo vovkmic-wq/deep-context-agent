@@ -1,5 +1,7 @@
 """Secure local FastAPI interface backed by the CLI runtime and SQLite stores."""
 
+# ruff: noqa: RUF001 -- bilingual Russian/English UI strings are intentional.
+
 from __future__ import annotations
 
 import hashlib
@@ -16,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -33,7 +35,12 @@ from pydantic import BaseModel, Field
 from context_agent import __version__
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
-from context_agent.errors import AgentError, PathSecurityError
+from context_agent.errors import (
+    AgentError,
+    ConfigurationError,
+    ContextStoreError,
+    PathSecurityError,
+)
 from context_agent.paths import resolve_inside
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
@@ -44,19 +51,74 @@ _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _SECRET_NAMES = frozenset(
     {".env", ".env.local", ".env.production", ".env.test", "credentials.json"}
 )
-_SETTINGS_ENV = {
-    "context_top_k": "AGENT_CONTEXT_TOP_K",
-    "auto_context_max_chars": "AGENT_AUTO_CONTEXT_MAX_CHARS",
-    "audit_batch_size": "AGENT_AUDIT_BATCH_SIZE",
-    "audit_max_batches_per_request": "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST",
-    "audit_max_reads_per_file": "AGENT_AUDIT_MAX_READS_PER_FILE",
+_SETTINGS = {
+    "context_top_k": {
+        "environment": "AGENT_CONTEXT_TOP_K",
+        "label": "Результаты поиска / Context results",
+        "comment": "Сколько наиболее подходящих фрагментов возвращать из SQLite.",
+        "minimum": 1,
+        "maximum": 100,
+    },
+    "auto_context_max_chars": {
+        "environment": "AGENT_AUTO_CONTEXT_MAX_CHARS",
+        "label": "Лимит автоконтекста / Auto-context limit",
+        "comment": "Максимум символов найденного контекста в одном запросе к LLM.",
+        "minimum": 1_000,
+        "maximum": 200_000,
+    },
+    "audit_batch_size": {
+        "environment": "AGENT_AUDIT_BATCH_SIZE",
+        "label": "Файлов в пакете / Files per batch",
+        "comment": "Сколько файлов аудита анализировать за один ограниченный шаг LLM.",
+        "minimum": 1,
+        "maximum": 25,
+    },
+    "audit_max_batches_per_request": {
+        "environment": "AGENT_AUDIT_MAX_BATCHES_PER_REQUEST",
+        "label": "Пакетов за запуск / Batches per run",
+        "comment": "Сколько пакетов обработать до безопасной точки продолжения.",
+        "minimum": 1,
+        "maximum": 100,
+    },
+    "audit_max_reads_per_file": {
+        "environment": "AGENT_AUDIT_MAX_READS_PER_FILE",
+        "label": "Чтений файла / Reads per file",
+        "comment": "Защитный предел повторных чтений одного файла во время аудита.",
+        "minimum": 2,
+        "maximum": 12,
+    },
 }
+_WORK_MODES = {
+    "general": "Работай как универсальный инженер программного обеспечения.",
+    "audit": "Проведи доказательный аудит кода и сначала сформулируй находки.",
+    "coder": "Реализуй запрошенное изменение безопасно и минимально.",
+    "tester": "Спроектируй и выполни тесты, не заявляя PASS без фактического лога.",
+    "reviewer": "Выполни code review с приоритетом корректности и рисков.",
+    "debugger": "Диагностируй первопричину ошибки и проверь исправление.",
+    "refactor": "Улучши структуру без изменения наблюдаемого поведения.",
+    "security": "Проверь границы доверия, секреты, пути и опасные операции.",
+    "docs": "Обнови техническую документацию по фактическому поведению кода.",
+    "architect": "Спроектируй изменение с учётом совместимости и эксплуатации.",
+}
+WorkMode = Literal[
+    "general",
+    "audit",
+    "coder",
+    "tester",
+    "reviewer",
+    "debugger",
+    "refactor",
+    "security",
+    "docs",
+    "architect",
+]
 
 
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2 * 1024 * 1024)
     thread_id: str = Field(default="web", min_length=1, max_length=100)
     auto_context: bool = True
+    mode: WorkMode = "general"
 
 
 class AuditRequest(BaseModel):
@@ -90,12 +152,25 @@ class ProviderDoctorRequest(BaseModel):
     live: bool = False
 
 
+class ProviderPriorityRequest(BaseModel):
+    providers: list[str] = Field(min_length=1, max_length=6)
+
+
 class SettingsRequest(BaseModel):
     values: dict[str, int | float] = Field(default_factory=dict)
 
 
 class _TaskCancelledError(Exception):
     pass
+
+
+class _PublicTaskError(Exception):
+    """Expected background failure with a bounded user-facing explanation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.safe_message = message
 
 
 @dataclass(slots=True)
@@ -152,7 +227,20 @@ class TaskRegistry:
                 emit("completed", {"task_id": task.task_id})
             except _TaskCancelledError:
                 emit("cancelled", {"task_id": task.task_id})
+            except _PublicTaskError as exc:
+                emit(
+                    "failed",
+                    {
+                        "task_id": task.task_id,
+                        "error_type": exc.code,
+                        "message": exc.safe_message,
+                    },
+                )
             except Exception as exc:  # backend boundary: never expose raw details
+                print(
+                    f"web task {task.task_id} failed: {type(exc).__name__}",
+                    file=sys.stderr,
+                )
                 emit(
                     "failed",
                     {
@@ -185,6 +273,78 @@ class TaskRegistry:
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+class ProviderRegistry:
+    """Thread-safe live provider order used by every Web operation."""
+
+    def __init__(self, providers: tuple[ProviderConfig, ...]) -> None:
+        if not providers:
+            raise ValueError("At least one provider is required")
+        self._providers = providers
+        self._lock = threading.RLock()
+
+    def snapshot(self) -> tuple[ProviderConfig, ...]:
+        """Return one immutable provider-chain snapshot for an operation."""
+
+        with self._lock:
+            return self._providers
+
+    def replace(self, requested: list[str]) -> tuple[ProviderConfig, ...]:
+        """Validate and atomically activate an ordered provider chain."""
+
+        normalized = [item.strip().casefold() for item in requested]
+        if any(not item for item in normalized):
+            raise ConfigurationError("Provider names cannot be empty")
+        active = {item.name: item for item in self.snapshot()}
+        resolved: list[ProviderConfig] = []
+        seen: set[str] = set()
+        for requested_name in normalized:
+            canonical = "zhipu" if requested_name == "glm" else requested_name
+            if canonical in seen:
+                raise ConfigurationError(f"Provider '{canonical}' is repeated")
+            provider = active.get(canonical)
+            if provider is None:
+                provider = ProviderConfig.from_env(canonical)
+            seen.add(canonical)
+            resolved.append(provider)
+        updated = tuple(resolved)
+        with self._lock:
+            self._providers = updated
+        return updated
+
+    def catalog(self) -> list[dict[str, object]]:
+        """Return configured/active metadata without returning credentials."""
+
+        active = self.snapshot()
+        active_by_name = {
+            item.name: (position, item) for position, item in enumerate(active)
+        }
+        items: list[dict[str, object]] = []
+        for name in ("lmstudio", "zhipu", "openai", "yandex", "deepseek", "qwen"):
+            active_entry = active_by_name.get(name)
+            provider = active_entry[1] if active_entry else None
+            configured = provider is not None
+            configuration_error = ""
+            if provider is None:
+                try:
+                    provider = ProviderConfig.from_env(name)
+                    configured = True
+                except ConfigurationError:
+                    configuration_error = "Требуется настройка модели или API-ключа"
+            items.append(
+                {
+                    "provider": name,
+                    "model": provider.model if provider else "",
+                    "base_url": provider.base_url if provider else "",
+                    "api_key": "configured" if configured else "missing",
+                    "configured": configured,
+                    "active": active_entry is not None,
+                    "priority": active_entry[0] if active_entry else None,
+                    "configuration_error": configuration_error,
+                }
+            )
+        return items
 
 
 class _RemoteRateLimiter:
@@ -280,6 +440,7 @@ def create_app(
         raise RuntimeError("Web static bundle is missing")
 
     tasks = TaskRegistry()
+    provider_registry = ProviderRegistry(providers)
     rate_limiter = _RemoteRateLimiter()
 
     @asynccontextmanager
@@ -296,7 +457,7 @@ def create_app(
     )
     app.state.tasks = tasks
     app.state.config = config
-    app.state.providers = providers
+    app.state.providers = provider_registry
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next: Callable[..., Any]):
@@ -415,16 +576,18 @@ def create_app(
 
     @app.get("/api/runtime")
     def runtime_info(request: Request) -> dict[str, object]:
+        current_providers = provider_registry.snapshot()
         return _request_payload(
             request,
             version=__version__,
             csrf_token=request.state.csrf_token,
-            provider=providers[0].name,
-            model=providers[0].model,
-            provider_priority=[item.name for item in providers],
+            provider=current_providers[0].name,
+            model=current_providers[0].model,
+            provider_priority=[item.name for item in current_providers],
             workspace="/workspace",
             active_tasks=tasks.active_count(),
             audit_mode_default="read-only",
+            work_modes=list(_WORK_MODES),
         )
 
     @app.get("/api/threads")
@@ -457,11 +620,13 @@ def create_app(
             emit: Callable[[str, Mapping[str, object]], None],
             cancelled: threading.Event,
         ) -> object:
-            with _runtime_factory(config, providers) as runtime:
+            current_providers = provider_registry.snapshot()
+            with _runtime_factory(config, current_providers) as runtime:
                 if cancelled.is_set():
                     raise _TaskCancelledError
+                mode_instruction = _WORK_MODES[body.mode]
                 answer = runtime.ask(
-                    body.query,
+                    f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}",
                     thread_id=body.thread_id,
                     auto_context=body.auto_context,
                 )
@@ -518,13 +683,24 @@ def create_app(
                 chunk_overlap=config.chunk_overlap,
                 max_file_bytes=config.max_file_bytes,
             ) as store:
-                report = store.index_path(body.path, config.context_root)
+                try:
+                    report = store.index_path(body.path, config.context_root)
+                except (ContextStoreError, PathSecurityError) as exc:
+                    raise _PublicTaskError(
+                        "context_index_failed",
+                        "Не удалось индексировать выбранный путь внутри /workspace.",
+                    ) from exc
             return {
                 "files_indexed": report.files_indexed,
                 "files_unchanged": report.files_unchanged,
                 "files_skipped": report.files_skipped,
                 "chunks_written": report.chunks_written,
-                "errors": report.errors,
+                "error_count": len(report.errors),
+                "errors": (
+                    ["Некоторые файлы не удалось индексировать."]
+                    if report.errors
+                    else []
+                ),
             }
 
         task_id = tasks.submit("context_index", operation)
@@ -616,7 +792,8 @@ def create_app(
                 if cancelled.is_set():
                     raise _TaskCancelledError
 
-            with _runtime_factory(config, providers) as runtime:
+            current_providers = provider_registry.snapshot()
+            with _runtime_factory(config, current_providers) as runtime:
                 return runtime.run_project_audit(
                     body.objective,
                     thread_id=body.thread_id,
@@ -732,10 +909,17 @@ def create_app(
         return PlainTextResponse(report, headers=headers)
 
     def safe_file(virtual_path: str, *, must_exist: bool) -> Path:
+        normalized = virtual_path.replace("\\", "/").strip()
+        if normalized in {"", "/", "/workspace", "/workspace/"}:
+            requested = "/workspace"
+        elif normalized.startswith("/workspace/"):
+            requested = normalized
+        else:
+            requested = "/workspace/" + normalized.lstrip("/")
         try:
             path = resolve_inside(
                 config.workspace,
-                f"/workspace/{virtual_path.lstrip('/')}",
+                requested,
                 must_exist=must_exist,
             )
         except (OSError, PathSecurityError) as exc:
@@ -843,16 +1027,23 @@ def create_app(
     def provider_list(request: Request):
         return _request_payload(
             request,
-            items=[
-                {
-                    "provider": item.name,
-                    "model": item.model,
-                    "base_url": item.base_url,
-                    "api_key": "configured",
-                    "priority": index,
-                }
-                for index, item in enumerate(providers)
-            ],
+            items=provider_registry.catalog(),
+            active=[item.name for item in provider_registry.snapshot()],
+        )
+
+    @app.put("/api/providers/priority")
+    def update_provider_priority(request: Request, body: ProviderPriorityRequest):
+        try:
+            updated = provider_registry.replace(body.providers)
+        except ConfigurationError as exc:
+            raise HTTPException(
+                422,
+                "Провайдер не настроен. Добавьте API-ключ и параметры на сервере.",
+            ) from exc
+        return _request_payload(
+            request,
+            active=[item.name for item in updated],
+            effective_immediately=True,
         )
 
     @app.post("/api/providers/doctor")
@@ -865,7 +1056,7 @@ def create_app(
             cancelled: threading.Event,
         ) -> object:
             failures: list[str] = []
-            for provider in providers:
+            for provider in provider_registry.snapshot():
                 if cancelled.is_set():
                     raise _TaskCancelledError
                 try:
@@ -883,29 +1074,96 @@ def create_app(
 
         return _request_payload(request, task_id=tasks.submit("doctor", operation))
 
+    @app.post("/api/providers/{provider_name}/doctor")
+    def single_provider_doctor(
+        request: Request,
+        provider_name: str,
+        body: ProviderDoctorRequest,
+    ):
+        catalog = provider_registry.catalog()
+        known = next(
+            (item for item in catalog if item["provider"] == provider_name.casefold()),
+            None,
+        )
+        if known is None:
+            raise HTTPException(404, "Provider not found")
+        if not bool(known["configured"]):
+            raise HTTPException(422, "Провайдер ещё не настроен на сервере")
+        if not body.live:
+            return _request_payload(
+                request,
+                provider=provider_name.casefold(),
+                status="configured",
+                live=False,
+            )
+
+        def operation(
+            _emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            if cancelled.is_set():
+                raise _TaskCancelledError
+            active = {item.name: item for item in provider_registry.snapshot()}
+            candidate = active.get(provider_name.casefold())
+            if candidate is None:
+                try:
+                    candidate = ProviderConfig.from_env(provider_name)
+                except ConfigurationError:
+                    raise _PublicTaskError(
+                        "provider_not_configured",
+                        "Провайдер не настроен на сервере.",
+                    ) from None
+            try:
+                response = create_chat_model(candidate).invoke("Reply with exactly: OK")
+            except Exception as exc:
+                raise _PublicTaskError(
+                    "provider_unavailable",
+                    "Провайдер не ответил на live-проверку.",
+                ) from exc
+            return {
+                "provider": candidate.name,
+                "response": message_text(response).strip(),
+            }
+
+        return _request_payload(
+            request,
+            task_id=tasks.submit("provider_doctor", operation),
+        )
+
     @app.get("/api/settings")
     def settings(request: Request):
         current = AppConfig.from_env(config.project_root)
-        values = {key: getattr(current, key) for key in _SETTINGS_ENV}
-        return _request_payload(request, values=values)
+        values = {key: getattr(current, key) for key in _SETTINGS}
+        items = [
+            {"name": key, "value": values[key], **definition}
+            for key, definition in _SETTINGS.items()
+        ]
+        return _request_payload(request, values=values, items=items)
 
     @app.put("/api/settings")
     def update_settings(request: Request, body: SettingsRequest):
         nonlocal config
-        unknown = set(body.values) - set(_SETTINGS_ENV)
+        unknown = set(body.values) - set(_SETTINGS)
         if unknown:
             raise HTTPException(422, "Unsupported setting")
+        for name, value in body.values.items():
+            definition = _SETTINGS[name]
+            minimum = float(str(definition["minimum"]))
+            maximum = float(str(definition["maximum"]))
+            if isinstance(value, bool) or not minimum <= float(value) <= maximum:
+                raise HTTPException(422, "Setting value is outside allowed bounds")
         previous: dict[str, str | None] = {
-            name: os.environ.get(env) for name, env in _SETTINGS_ENV.items()
+            name: os.environ.get(str(definition["environment"]))
+            for name, definition in _SETTINGS.items()
         }
         try:
             for name, value in body.values.items():
-                os.environ[_SETTINGS_ENV[name]] = str(value)
+                os.environ[str(_SETTINGS[name]["environment"])] = str(value)
             updated_config = AppConfig.from_env(config.project_root)
             updated_config.prepare_directories()
         except Exception:
             for name, previous_value in previous.items():
-                env = _SETTINGS_ENV[name]
+                env = str(_SETTINGS[name]["environment"])
                 if previous_value is None:
                     os.environ.pop(env, None)
                 else:

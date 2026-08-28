@@ -3,6 +3,31 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Единый Web API и Codex-like UX 0.14.0 — 2026-08-29
+
+| Этап 0.14.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Shared API boundary | Завершён | Web использует общие runtime, context/audit SQLite, provider failover и path policy |
+| Chat UX | Завершён | Tasks/history, mode selector, bottom composer, stop, optional Enter send, Shift+Enter newline |
+| Context/files | Завершён | Исправлен `/workspace`, index lifecycle/counters, directory navigation, bounded editor + SHA |
+| Audit/settings labels | Завершён | Bilingual fields и русские help/comments вместо raw JSON |
+| Live providers | Завершён | Thread-safe atomic priority, add/remove configured providers, per-provider live check |
+| Responsive/accessibility | Завершён | Desktop sidebar, mobile bottom nav, keyboard/focus/aria-live, 390 px browser acceptance |
+| Документация/version | Завершён | Web prompt, Web-ТЗ, global prompt/ТЗ, README, changelog, 0.14.0 |
+| Финальный контур | Завершён | Ruff/format, mypy, 184 passed + 1 planned skip, compileall, TS build, wheel, pip check и browser live acceptance PASS |
+
+Финальные evidence 0.14.0:
+
+- `ruff check` и `ruff format --check` — PASS, 40 файлов formatted; mypy —
+  24 source files без ошибок; pytest — 184 passed, 1 planned Windows symlink skip;
+- `compileall` и `pip check` — PASS;
+- TypeScript `tsc --noEmit`, esbuild и bundle test — PASS, JS+CSS 35 174 bytes;
+- реальный browser E2E: GLM-5.3 chat ответил `ГОТОВ`, Enter/Shift+Enter,
+  context index, file preview, provider reorder/restore и mobile 390x844 — PASS;
+- console errors/warnings после основных flows — отсутствуют;
+- wheel 0.14.0 содержит 22 файла и static bundle, SHA-256
+  `F1AF91D1FB0B9CF97964F52D0951CB8278393C1919B5BB1B224E9B71B5F4A4E2`.
+
 ## Production audit and Web UI 0.13.0 — 2026-08-27
 
 | Этап 0.13.0 | Статус | Реализация/проверка |

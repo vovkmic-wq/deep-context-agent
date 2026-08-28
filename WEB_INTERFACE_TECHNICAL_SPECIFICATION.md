@@ -230,3 +230,96 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 - хранение API-ключей в браузере;
 - выполнение произвольных shell-команд;
 - совместное редактирование одного файла несколькими пользователями.
+
+## 13. Обновление UX и единого API 0.14.0
+
+### 13.1. Архитектурная граница
+
+1. Web UI является только клиентом единого локального API. Chat, audit,
+   context, files и providers используют те же `AgentRuntime`, provider
+   failover middleware, `ContextStore`, `ProjectAuditStore`, SQLite-файлы и
+   workspace policy, что CLI.
+2. Запрещены Web-only база сообщений, второй context index, отдельная файловая
+   реализация и browser-side вызов LLM provider.
+3. Динамическая цепочка провайдеров хранится в thread-safe server registry.
+   Каждая новая операция получает immutable snapshot цепочки, поэтому
+   перестановка не меняет уже выполняющийся запрос.
+4. Изменение live priority действует до перезапуска Web-процесса и не
+   переписывает `.env`. Долговременная конфигурация остаётся операторской.
+
+### 13.2. Чат уровня инженерной задачи
+
+1. Основная сущность интерфейса — task/thread. Слева показываются существующие
+   thread из context SQLite, новая задача получает безопасный уникальный ID.
+2. При выборе thread Web загружает bounded page истории, различает user/agent и
+   не считает assistant history доказательством текущего состояния файлов.
+3. Composer закреплён снизу, автоматически растёт до ограниченной высоты,
+   показывает busy, cancel, failed и completed состояния.
+4. Настройка «Enter отправляет» является несекретным device preference в local
+   storage и по умолчанию выключена. При включении Enter отправляет сообщение;
+   Shift+Enter всегда вставляет перевод строки, IME composition не прерывается.
+5. Режимы `general`, `audit`, `coder`, `tester`, `reviewer`, `debugger`,
+   `refactor`, `security`, `architect`, `docs` доступны на обзоре и в чате.
+   Режим влияет только на краткую инструкцию модели и не расширяет Web или
+   filesystem authority.
+
+### 13.3. Контекст и аудит
+
+1. `/workspace` означает корень `AGENT_CONTEXT_ROOT`; prefix нормализуется ровно
+   один раз. Вложенный путь передаётся как `/workspace/<relative>`.
+2. Индексация показывает started, result или safe failed; итог содержит
+   `files_indexed`, `files_unchanged`, `files_skipped`, `chunks_written` и
+   bounded errors count без закрытых real paths.
+3. Поля аудита подписываются `Включить файлы / Include glob`,
+   `Исключить файлы / Exclude glob`, `Файлов в пакете / Batch size`.
+4. Help-текст объясняет: include ограничивает набор, exclude добавляет
+   исключения, batch size — число файлов в одном bounded LLM step; рекомендуемое
+   значение 8. Пустые include/exclude допустимы.
+
+### 13.4. Файлы
+
+1. Directory list возвращает virtual path и кликабельный тип. UI поддерживает
+   открытие каталога, переход вверх и ручной virtual path.
+2. UTF-8 файл до 2 MiB открывается bounded page. Если весь файл не получен,
+   preview помечается как частичный и write блокируется.
+3. Полное содержимое сохраняется только с `expected_sha256`; конфликт даёт 409
+   и требует перечитать. UI не выполняет silent overwrite.
+4. Secret filtering, resolved path/symlink checks, запрет корня и
+   disabled-by-default delete применяются на сервере независимо от UI.
+
+### 13.5. Live-провайдеры
+
+1. UI показывает configured catalog без ключей и ordered active chain.
+2. В цепочку можно добавить только server-configured provider; последний
+   активный provider удалить нельзя; дубликаты запрещены.
+3. Move up/down, add и remove атомарно валидируют всю новую цепочку и применяют
+   её ко всем последующим chat/audit/doctor вызовам.
+4. У каждого активного provider есть `Проверить / Live check`. Проверка требует
+   явного подтверждения платного запроса, вызывает только выбранного provider и
+   показывает safe available/unavailable status.
+5. API никогда не сериализует credential, authorization header или raw SDK
+   exception. Missing configuration возвращает safe 422.
+
+### 13.6. Настройки и обзор
+
+1. Обзор предлагает инженерные режимы и кратко описывает ожидаемый результат;
+   выбор синхронизирует mode и открывает чат.
+2. Технический health JSON находится в сворачиваемом блоке и не является
+   основным пользовательским экраном.
+3. Настройки отображаются отдельными строками: bilingual label, env name,
+   numeric value и русский комментарий. Секретные переменные отсутствуют.
+4. PUT settings принимает только server allowlist, атомарно откатывает env при
+   ошибке и повторно создаёт/валидирует `AppConfig`.
+
+### 13.7. Дополнительная приёмка 0.14.0
+
+1. API regression доказывает, что `/workspace` не удваивается.
+2. Index task на реальном временном документе выдаёт result и completed.
+3. Provider reorder немедленно отражается в `/api/runtime`, а serialized body
+   не содержит test secret.
+4. Bundle содержит wiring index, provider priority, Enter preference и SHA.
+5. Browser E2E подтверждает role -> chat, реальный primary response, Enter send,
+   Shift+Enter newline, context index, file preview и provider reorder/restore.
+6. Адаптивный viewport 390x844 сохраняет все семь разделов в нижней навигации,
+   читаемые mode cards и доступный keyboard flow.
+7. Console error/warning log пуст после bootstrap и основных переходов.

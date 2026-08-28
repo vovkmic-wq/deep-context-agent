@@ -92,6 +92,7 @@ def test_files_api_blocks_traversal_secrets_and_stale_writes(tmp_path: Path) -> 
     )
     secret = client.get("/api/files/.env")
     traversal = client.get("/api/files", params={"path": "../../"})
+    workspace_root = client.get("/api/files", params={"path": "/workspace"})
 
     assert read.json()["content"] == "first\n"
     assert stale.status_code == 409
@@ -99,6 +100,8 @@ def test_files_api_blocks_traversal_secrets_and_stale_writes(tmp_path: Path) -> 
     assert target.read_text(encoding="utf-8") == "second\n"
     assert secret.status_code == 404
     assert traversal.status_code == 404
+    assert workspace_root.status_code == 200
+    assert workspace_root.json()["items"][0]["path"] == "/workspace/note.txt"
 
 
 def test_web_never_returns_provider_key_and_delete_is_off(tmp_path: Path) -> None:
@@ -117,6 +120,70 @@ def test_web_never_returns_provider_key_and_delete_is_off(tmp_path: Path) -> Non
     assert providers.json()["items"][0]["api_key"] == "configured"
     assert deletion.status_code == 403
     assert target.exists()
+
+
+def test_provider_priority_changes_atomically_for_live_web_runtime(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    fallback = ProviderConfig(
+        name="openai",
+        model="fallback-model",
+        base_url="https://api.openai.com/v1",
+        api_key="fallback-secret",
+    )
+    app = create_app(config, (_provider(), fallback))
+    client = TestClient(app)
+    csrf = str(client.get("/api/runtime").json()["csrf_token"])
+
+    changed = client.put(
+        "/api/providers/priority",
+        json={"providers": ["openai", "lmstudio"]},
+        headers={"x-csrf-token": csrf},
+    )
+    runtime = client.get("/api/runtime")
+    catalog = client.get("/api/providers")
+
+    assert changed.status_code == 200
+    assert changed.json()["effective_immediately"] is True
+    assert runtime.json()["provider_priority"] == ["openai", "lmstudio"]
+    assert catalog.json()["active"] == ["openai", "lmstudio"]
+    assert "fallback-secret" not in catalog.text
+
+
+def test_context_index_uses_virtual_workspace_root_and_reports_result(
+    tmp_path: Path,
+) -> None:
+    client, csrf, config = _client(tmp_path)
+    (config.workspace / "document.txt").write_text("INDEX_MARKER\n", encoding="utf-8")
+    started = client.post(
+        "/api/context/index",
+        json={"path": "/workspace"},
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert started.status_code == 202
+    assert events.status_code == 200
+    assert '"files_indexed": 1' in events.text
+    assert "event: completed" in events.text
+
+
+def test_settings_and_work_modes_include_russian_explanations(tmp_path: Path) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    settings = client.get("/api/settings").json()
+    runtime = client.get("/api/runtime").json()
+    invalid = client.put(
+        "/api/settings",
+        json={"values": {"audit_batch_size": 26}},
+        headers={"x-csrf-token": csrf},
+    )
+
+    assert settings["items"]
+    assert all(item["comment"] for item in settings["items"])
+    assert all(" / " in item["label"] for item in settings["items"])
+    assert {"audit", "coder", "tester", "security"}.issubset(runtime["work_modes"])
+    assert invalid.status_code == 422
 
 
 def test_remote_web_mode_requires_authentication_token(tmp_path: Path) -> None:

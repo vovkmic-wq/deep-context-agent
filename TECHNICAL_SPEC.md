@@ -288,6 +288,37 @@
     production обязательно HTTPS reverse proxy. Первый релиз остаётся локальным
     single-user и не объявляется публичным SaaS.
 
+## 2.2. Единый Web API и инженерный UX 0.14.0
+
+1. Web UI не имеет собственной business logic: все chat/audit/context/files
+   операции проходят через общий `AgentRuntime`, `ContextStore`,
+   `ProjectAuditStore`, provider middleware и те же SQLite/policy, что CLI.
+2. Chat организован как task/thread: bounded persistent history, новая задача,
+   нижний auto-grow composer, cancel/error states. Device preference
+   Enter-to-send выключен по умолчанию; Shift+Enter всегда добавляет строку.
+3. Overview и chat поддерживают режимы general/audit/coder/tester/reviewer/
+   debugger/refactor/security/architect/docs. Режим — prompt hint и никогда не
+   предоставляет mutation authority.
+4. Context index нормализует virtual `/workspace` ровно один раз, показывает
+   lifecycle фоновой задачи и точные итоговые counters либо safe error.
+5. Audit include, exclude и batch size имеют bilingual label и русское
+   объяснение. Пустые glob означают безопасный default selection, batch size —
+   число файлов в одном bounded model step.
+6. Files UI поддерживает каталог, переход вверх, bounded UTF-8 preview/editor.
+   Частичный preview read-only; запись требует актуальный SHA-256. Secret,
+   traversal, symlink и delete policies остаются только server-authoritative.
+7. Все Web-вызовы используют thread-safe live provider registry. Порядок
+   configured providers можно атомарно менять до перезапуска процесса; одна
+   выполняющаяся операция использует неизменный snapshot. Каждый provider
+   имеет отдельный opt-in live check без раскрытия ключа/raw exception.
+8. Safe settings представлены allowlisted строками с bilingual label, env name,
+   numeric value и русским комментарием. Изменение повторно валидирует весь
+   `AppConfig` и откатывается атомарно при ошибке.
+9. Desktop sidebar преобразуется в мобильную нижнюю навигацию. Keyboard focus,
+   semantic labels, aria-live, IME и viewport от 360 px входят в приёмку.
+10. Нормативные API/UX/security критерии и browser E2E определены в разделе 13
+    `WEB_INTERFACE_TECHNICAL_SPECIFICATION.md`.
+
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |

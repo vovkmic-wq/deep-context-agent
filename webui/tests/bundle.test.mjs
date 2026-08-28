@@ -16,4 +16,14 @@ const source = await readFile(bundle, "utf8");
 if (!source.includes("/api/runtime") || !source.includes("x-csrf-token")) {
   throw new Error("Production bundle is missing required API/security wiring");
 }
+for (const required of [
+  "/api/context/index",
+  "/api/providers/priority",
+  "dca_enter_send",
+  "expected_sha256",
+]) {
+  if (!source.includes(required)) {
+    throw new Error(`Production bundle is missing feature: ${required}`);
+  }
+}
 console.log(`bundle_ok bytes=${total}`);

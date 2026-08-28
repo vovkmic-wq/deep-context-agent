@@ -3,6 +3,49 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.14.0] — 2026-08-29
+
+### Добавлено
+
+- Codex-подобный чат: список задач, persistent history, нижний composer,
+  автоувеличение поля, остановка, выбор инженерной роли и сохраняемая локальная
+  опция «Enter отправляет»; `Shift+Enter` всегда создаёт новую строку.
+- На обзоре — режимы аудитора, кодера, тестировщика, reviewer, отладчика,
+  рефакторинга, безопасности, архитектора и документации.
+- Live-реестр провайдеров: атомарное изменение приоритета, добавление и удаление
+  настроенных провайдеров и отдельная платная проверка доступности каждого.
+- Полноценный файловый браузер и UTF-8 editor с SHA-256 optimistic concurrency;
+  большие файлы открываются ограниченно и только для чтения.
+- Русские/английские названия и пояснения audit glob, batch size и всех
+  безопасных Web-настроек.
+
+### Исправлено
+
+- Virtual path `/workspace` больше не удваивается до
+  `/workspace/workspace`; корень и вложенные каталоги открываются одинаково.
+- Контекстная индексация показывает итоговые счётчики и безопасное объяснение
+  ошибки вместо молчаливого завершения фоновой задачи.
+- Кнопка «Открыть» и элементы файлов теперь выполняют реальную навигацию и
+  открывают содержимое, а не выводят некликабельные карточки.
+
+### Безопасность и совместимость
+
+- Web UI по-прежнему использует те же `AgentRuntime`, provider failover,
+  `ContextStore`, `ProjectAuditStore`, SQLite и workspace policy, что CLI.
+- Инженерная роль является только ограниченной инструкцией и не предоставляет
+  право записи. Секреты, raw paths вне workspace и ключи в браузер не передаются.
+- Сохранены same-origin, CSRF, CSP, remote bearer gate, secret/symlink guards и
+  disabled-by-default delete.
+
+### Проверено
+
+- Ruff lint/format, mypy 24 source files, compileall и pip check: PASS;
+  pytest — 184 passed, 1 planned Windows symlink skip.
+- TypeScript check/build/bundle, wheel static inspection, local Uvicorn и
+  browser E2E desktop/mobile: PASS.
+- Primary `zhipu/glm-5.3` через новый Codex-like chat ответил `ГОТОВ`;
+  index, file preview и provider reorder/restore подтверждены в браузере.
+
 ## [0.13.0] — 2026-08-27
 
 ### Добавлено

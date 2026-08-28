@@ -3,102 +3,148 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark light">
+    <meta name="color-scheme" content="dark">
     <title>Deep Context Agent</title>
     <link rel="stylesheet" href="/assets/styles.css">
     <script src="/assets/app.js" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Перейти к содержимому</a>
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">Локальная рабочая среда</p>
-        <h1>Deep Context Agent</h1>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">D</span>
+          <div><strong>Deep Context</strong><small>Agent workspace</small></div>
+        </div>
+        <nav aria-label="Разделы приложения">
+          <button data-panel="overview" aria-current="page"><span>⌂</span>Обзор</button>
+          <button data-panel="chat"><span>◫</span>Чат</button>
+          <button data-panel="context"><span>⌕</span>Контекст</button>
+          <button data-panel="audits"><span>✓</span>Аудиты</button>
+          <button data-panel="files"><span>▱</span>Файлы</button>
+          <button data-panel="providers"><span>⌁</span>Провайдеры</button>
+          <button data-panel="settings"><span>⚙</span>Настройки</button>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div><small>Активная модель</small><strong id="runtime-badge">Подключение…</strong></div>
+        </div>
+      </aside>
+
+      <div class="workspace-shell">
+        <header class="topbar">
+          <div><p class="eyebrow">Локальная среда разработки</p><h1 id="page-title">Обзор</h1></div>
+          <div class="topbar-actions"><span id="workspace-badge" class="badge">/workspace</span></div>
+        </header>
+
+        <main id="main">
+          <section id="overview" class="panel active" aria-labelledby="overview-title">
+            <div class="section-heading">
+              <div><h2 id="overview-title">С чего начнём?</h2><p>Выберите инженерный режим — он откроется в чате с подходящей ролью.</p></div>
+            </div>
+            <div id="mode-grid" class="mode-grid">
+              <button class="mode-card" data-mode="audit"><span>◎</span><strong>Аудитор</strong><small>Сверка кода с ТЗ и доказательные находки</small></button>
+              <button class="mode-card featured" data-mode="coder"><span>⌘</span><strong>Кодер</strong><small>Реализация функций и безопасные правки</small></button>
+              <button class="mode-card" data-mode="tester"><span>✓</span><strong>Тестировщик</strong><small>Тест-дизайн, запуск и проверка результата</small></button>
+              <button class="mode-card" data-mode="reviewer"><span>◉</span><strong>Code reviewer</strong><small>Корректность, регрессии и качество кода</small></button>
+              <button class="mode-card" data-mode="debugger"><span>⌕</span><strong>Отладчик</strong><small>Поиск первопричины и проверка исправления</small></button>
+              <button class="mode-card" data-mode="refactor"><span>↻</span><strong>Рефакторинг</strong><small>Улучшение структуры без смены поведения</small></button>
+              <button class="mode-card" data-mode="security"><span>◇</span><strong>Безопасность</strong><small>Секреты, пути и границы доверия</small></button>
+              <button class="mode-card" data-mode="architect"><span>△</span><strong>Архитектор</strong><small>Проектирование совместимых изменений</small></button>
+              <button class="mode-card" data-mode="docs"><span>≡</span><strong>Документация</strong><small>ТЗ, инструкции и история изменений</small></button>
+            </div>
+            <div id="overview-grid" class="metric-grid"></div>
+            <details class="diagnostics"><summary>Техническая диагностика / Technical diagnostics</summary><pre id="health" class="output"></pre></details>
+          </section>
+
+          <section id="chat" class="panel chat-panel" aria-labelledby="chat-title">
+            <div class="chat-layout">
+              <aside class="thread-sidebar" aria-label="Задачи чата">
+                <button id="new-thread" class="primary wide" type="button">＋ Новая задача</button>
+                <div id="thread-list" class="thread-list"></div>
+              </aside>
+              <div class="chat-main">
+                <div class="chat-header">
+                  <div><p class="eyebrow">Текущая задача</p><h2 id="chat-title">Чат с агентом</h2><small id="current-thread-label">web</small></div>
+                  <label class="compact-label">Режим / Mode
+                    <select id="chat-mode">
+                      <option value="general">Универсальный</option><option value="audit">Аудитор</option><option value="coder">Кодер</option><option value="tester">Тестировщик</option><option value="reviewer">Code reviewer</option><option value="debugger">Отладчик</option><option value="refactor">Рефакторинг</option><option value="security">Безопасность</option><option value="architect">Архитектор</option><option value="docs">Документация</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="chat-output" class="conversation" aria-live="polite"><div class="empty-state"><strong>Готов к работе</strong><span>Опишите задачу, приложите путь или попросите проверить проект.</span></div></div>
+                <form id="chat-form" class="composer">
+                  <textarea id="chat-query" rows="2" required aria-label="Сообщение" placeholder="Сообщение агенту…"></textarea>
+                  <div class="composer-bar">
+                    <div class="composer-options">
+                      <label class="toggle"><input id="auto-context" type="checkbox" checked> Автоконтекст</label>
+                      <label class="toggle"><input id="enter-send" type="checkbox"> Enter отправляет</label>
+                    </div>
+                    <div class="composer-actions"><button id="cancel-chat" type="button" class="icon-button" disabled aria-label="Остановить">■</button><button type="submit" class="send-button" aria-label="Отправить">↑</button></div>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </section>
+
+          <section id="context" class="panel" aria-labelledby="context-title">
+            <div class="section-heading"><div><h2 id="context-title">Большой контекст / Large context</h2><p>В SQLite попадают фрагменты документов; весь корпус не отправляется модели.</p></div></div>
+            <div class="surface index-box">
+              <label>Путь для индексации / Index path<input id="index-path" value="/workspace" aria-describedby="index-help"></label>
+              <p id="index-help" class="help">Корень проекта уже называется <code>/workspace</code>. Для вложенной папки укажите, например, <code>/workspace/src</code>.</p>
+              <button id="index-workspace" type="button">Индексировать</button>
+              <div id="index-status" class="operation-status" aria-live="polite">Индексация ещё не запускалась.</div>
+            </div>
+            <form id="context-form" class="search-row">
+              <label>Поисковый запрос / Search query<input id="context-query" required></label>
+              <label>Количество / Top-k<input id="context-limit" type="number" value="8" min="1" max="100"></label>
+              <button type="submit">Найти</button>
+            </form>
+            <div id="context-output" class="cards" aria-live="polite"></div>
+          </section>
+
+          <section id="audits" class="panel" aria-labelledby="audits-title">
+            <div class="section-heading"><div><h2 id="audits-title">Пакетный аудит / Batch audit</h2><p>Большой проект проверяется небольшими возобновляемыми группами файлов.</p></div></div>
+            <form id="audit-form" class="surface form-grid">
+              <label>ID задачи / Thread ID<input id="audit-thread" value="web-audit" maxlength="100"><span class="help">Имя независимой истории аудита.</span></label>
+              <label class="full">Цель и техническое задание / Objective<textarea id="audit-objective" rows="7" required></textarea></label>
+              <label>Включить файлы / Include glob<input id="audit-include" placeholder="src/**, tests/**"><span class="help">Необязательно. Какие пути проверять; пусто — весь безопасный проект.</span></label>
+              <label>Исключить файлы / Exclude glob<input id="audit-exclude" placeholder="docs/generated/**"><span class="help">Необязательно. Дополнительные пути, которые нужно пропустить.</span></label>
+              <label>Файлов в пакете / Batch size<input id="audit-batch-size" type="number" min="1" max="25" value="8"><span class="help">Сколько файлов получает LLM за один шаг. 8 — безопасный баланс.</span></label>
+              <label class="toggle warning full"><input id="audit-write" type="checkbox"> Разрешить изменение файлов / Allow write<span class="help">Выключено по умолчанию. Текст задачи сам не даёт право записи.</span></label>
+              <div class="form-actions full"><button type="submit">Запустить аудит</button><button id="refresh-audits" type="button" class="secondary">Обновить список</button></div>
+            </form>
+            <div id="audit-progress" class="operation-status" aria-live="polite">Нет активного аудита.</div>
+            <div class="table-wrap"><table><thead><tr><th>Запуск / Run ID</th><th>Режим / Mode</th><th>Статус / Status</th><th>Обновлён / Updated</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
+          </section>
+
+          <section id="files" class="panel" aria-labelledby="files-title">
+            <div class="section-heading"><div><h2 id="files-title">Файлы / Files</h2><p>Безопасный просмотр и редактирование только внутри <code>/workspace</code>.</p></div></div>
+            <form id="files-form" class="path-bar"><button id="files-up" type="button" class="secondary" aria-label="На уровень выше">←</button><label>Путь / Path<input id="files-path" value="/workspace"></label><button type="submit">Открыть</button></form>
+            <div class="file-layout">
+              <div id="files-output" class="file-list" aria-live="polite"></div>
+              <section id="file-editor" class="file-editor" hidden>
+                <div class="editor-header"><div><strong id="file-name"></strong><small id="file-meta"></small></div><button id="close-file" type="button" class="secondary">Закрыть</button></div>
+                <textarea id="file-content" spellcheck="false" aria-label="Содержимое файла"></textarea>
+                <div class="form-actions"><button id="save-file" type="button">Сохранить</button><button id="reload-file" type="button" class="secondary">Перечитать</button></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="providers" class="panel" aria-labelledby="providers-title">
+            <div class="section-heading"><div><h2 id="providers-title">Провайдеры / Providers</h2><p>Порядок применяется ко всем новым вызовам сразу. Ключи остаются только на сервере.</p></div><button id="load-providers" type="button" class="secondary">Обновить</button></div>
+            <div class="surface provider-add"><label>Добавить настроенного провайдера / Add provider<select id="provider-select"></select></label><button id="add-provider" type="button">Добавить</button></div>
+            <div id="providers-output" class="provider-list" aria-live="polite"></div>
+            <p class="help">Live-проверка делает короткий платный запрос только выбранному провайдеру. Изменение порядка действует до перезапуска Web-процесса.</p>
+          </section>
+
+          <section id="settings" class="panel" aria-labelledby="settings-title">
+            <div class="section-heading"><div><h2 id="settings-title">Настройки / Settings</h2><p>Каждый параметр подписан по-русски. Секреты и API-ключи браузеру не передаются.</p></div></div>
+            <form id="settings-form" class="settings-list"><div id="settings-output"></div><button type="submit">Применить настройки</button></form>
+          </section>
+        </main>
       </div>
-      <div id="runtime-badge" class="badge" aria-live="polite">Подключение…</div>
-    </header>
-    <nav aria-label="Разделы">
-      <button data-panel="overview" aria-current="page">Обзор</button>
-      <button data-panel="chat">Чат</button>
-      <button data-panel="context">Контекст</button>
-      <button data-panel="audits">Аудиты</button>
-      <button data-panel="files">Файлы</button>
-      <button data-panel="providers">Провайдеры</button>
-      <button data-panel="settings">Настройки</button>
-    </nav>
-    <main id="main">
-      <section id="overview" class="panel active" aria-labelledby="overview-title">
-        <h2 id="overview-title">Состояние</h2>
-        <div id="overview-grid" class="metric-grid"></div>
-        <pre id="health" class="output" aria-live="polite"></pre>
-      </section>
-
-      <section id="chat" class="panel" aria-labelledby="chat-title">
-        <h2 id="chat-title">Чат</h2>
-        <form id="chat-form">
-          <label>Thread ID <input id="thread-id" value="web" maxlength="100"></label>
-          <label>Сообщение <textarea id="chat-query" rows="7" required></textarea></label>
-          <label class="check"><input id="auto-context" type="checkbox" checked> Автопоиск контекста</label>
-          <button type="submit">Отправить</button>
-          <button id="cancel-chat" type="button" class="secondary">Отменить</button>
-        </form>
-        <div id="chat-output" class="output conversation" aria-live="polite"></div>
-      </section>
-
-      <section id="context" class="panel" aria-labelledby="context-title">
-        <h2 id="context-title">Большой контекст</h2>
-        <form id="context-form" class="inline-form">
-          <label>Поиск <input id="context-query" required></label>
-          <label>Top-k <input id="context-limit" type="number" value="8" min="1" max="100"></label>
-          <button type="submit">Найти</button>
-        </form>
-        <button id="index-workspace" type="button" class="secondary">Индексировать /workspace</button>
-        <div id="context-output" class="cards" aria-live="polite"></div>
-      </section>
-
-      <section id="audits" class="panel" aria-labelledby="audits-title">
-        <h2 id="audits-title">Пакетный аудит</h2>
-        <form id="audit-form">
-          <label>Thread ID <input id="audit-thread" value="web-audit" maxlength="100"></label>
-          <label>Цель и ТЗ <textarea id="audit-objective" rows="8" required></textarea></label>
-          <div class="inline-form">
-            <label>Include glob <input id="audit-include" placeholder="src/**,tests/**"></label>
-            <label>Exclude glob <input id="audit-exclude" placeholder="docs/generated/**"></label>
-            <label>Размер пачки <input id="audit-batch-size" type="number" min="1" max="25" value="8"></label>
-          </div>
-          <label class="check warning"><input id="audit-write" type="checkbox"> Разрешить изменение выделенных файлов</label>
-          <button type="submit">Запустить аудит</button>
-          <button id="refresh-audits" type="button" class="secondary">Обновить список</button>
-        </form>
-        <div id="audit-progress" class="output" aria-live="polite"></div>
-        <div class="table-wrap"><table>
-          <thead><tr><th>Run ID</th><th>Режим</th><th>Статус</th><th>Обновлён</th></tr></thead>
-          <tbody id="audit-rows"></tbody>
-        </table></div>
-      </section>
-
-      <section id="files" class="panel" aria-labelledby="files-title">
-        <h2 id="files-title">Файлы workspace</h2>
-        <form id="files-form" class="inline-form">
-          <label>Каталог <input id="files-path" value=""></label>
-          <button type="submit">Открыть</button>
-        </form>
-        <div id="files-output" class="cards" aria-live="polite"></div>
-      </section>
-
-      <section id="providers" class="panel" aria-labelledby="providers-title">
-        <h2 id="providers-title">Провайдеры</h2>
-        <button id="load-providers" type="button">Проверить конфигурацию</button>
-        <button id="live-doctor" type="button" class="danger">Платный live-check</button>
-        <div id="providers-output" class="cards" aria-live="polite"></div>
-      </section>
-
-      <section id="settings" class="panel" aria-labelledby="settings-title">
-        <h2 id="settings-title">Безопасные настройки</h2>
-        <p>Секреты и API-ключи никогда не передаются браузеру.</p>
-        <pre id="settings-output" class="output"></pre>
-      </section>
-    </main>
+    </div>
     <div id="toast" role="status" aria-live="polite"></div>
   </body>
 </html>
