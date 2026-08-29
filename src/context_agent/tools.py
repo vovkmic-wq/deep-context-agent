@@ -67,7 +67,11 @@ SAFE_FILESYSTEM_TOOL_DESCRIPTIONS = {
     ),
     "edit_file": (
         "Edit only the exact /workspace/ file and exact change requested by the "
-        "user. Never edit or create an alternative file as a substitute."
+        "user. Never edit or create an alternative file as a substitute. If the "
+        "tool returns stale_edit_conflict with recovery permission, read that "
+        "same file exactly once, rebuild old_string from the fresh content, and "
+        "retry the edit once. Do not call edit_file before that fresh read. Stop "
+        "when the bounded retry is exhausted."
     ),
     "glob": (
         "Search workspace path names only when the user asks for path discovery or "
@@ -616,7 +620,41 @@ def build_agent_tools(
         chunk_index: int,
         radius: int = 2,
     ) -> str:
-        """Read a found chunk plus neighboring chunks from the same source."""
+        """Expand an indexed search hit; never use this for /workspace files."""
+        normalized_source = source.strip().replace("\\", "/")
+        if (
+            normalized_source == "/workspace"
+            or normalized_source.startswith("/workspace/")
+            or not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", normalized_source)
+        ):
+            return json.dumps(
+                {
+                    "status": "denied",
+                    "error_type": "workspace_source_requires_read_file",
+                    "results": [],
+                    "message": (
+                        "Use read_file for an exact /workspace path. "
+                        "read_context_window accepts only an indexed source "
+                        "returned by search_context."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        if chunk_index < 0 or not 0 <= radius <= 20:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_type": "invalid_context_window",
+                    "results": [],
+                    "message": (
+                        "chunk_index must be non-negative and radius must be "
+                        "between 0 and 20."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         return format_context_hits(
             context_store.context_window(
                 source,

@@ -3,6 +3,35 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Bounded stale-edit recovery 0.16.0 — 2026-08-29
+
+| Этап 0.16.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Root cause | Завершён | Exact edit conflict был тупиком после two-read limit; recovery state отсутствовал |
+| Runtime state machine | Завершён | One path/version recovery read, forced fresh read, one revised edit, second-conflict stop |
+| Context-tool hardening | Завершён | `/workspace`/bare source denied, invalid radius safe, hard eight-call budget |
+| Security | Завершён | No raw old_string/content/physical path; exact edit and all prior path/write policies preserved |
+| Документация/version | Завершён | Release prompt, global prompt/ТЗ, Web-ТЗ, system prompt, README/changelog, 0.16.0 |
+| Финальный контур | Завершён | Python/TS/package, LM Studio+GLM doctor, real GLM stale-edit live и Web smoke PASS |
+
+Финальные evidence 0.16.0:
+
+- `ruff check` и `ruff format --check` — PASS, 42 файла; mypy —
+  13 source files без ошибок; pytest — 197 passed, 1 planned Windows
+  symlink skip; compileall, pip check и `git diff --check` — PASS;
+- TypeScript `tsc --noEmit`, esbuild и bundle test — PASS, JS+CSS
+  37 370 bytes;
+- deterministic external-mutation sequence и negative state-machine tests —
+  PASS; LM Studio `qwen2.5-7b-instruct` и Zhipu `glm-5.3` doctor live — `OK`;
+- чистый GLM-5.3 live audit: `read success, read success, edit error,
+  read success, edit success, read success`; независимое exact-file
+  assertion — `RECOVERED_LINE_51602`, PASS;
+- Web smoke `127.0.0.1:8766`: `/api/health=ok`, runtime version `0.16.0`,
+  provider `zhipu`; TypeScript bundle — PASS;
+- wheel 0.16.0 содержит 22 файла, static bundle и system prompt,
+  target-install вернул 0.16.0; SHA-256
+  `D06294936A5CB11E9CBAD7726AE47A212683387CF27A86CD39A80AFCD5A3D503`.
+
 ## Provider/files hardening 0.15.0 — 2026-08-29
 
 | Этап 0.15.0 | Статус | Реализация/проверка |

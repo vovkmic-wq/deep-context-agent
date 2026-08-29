@@ -339,6 +339,38 @@
 5. Expected background `AgentError` возвращает понятное safe SSE-
    объяснение и никогда raw SDK exception, credential или physical path.
 
+## 2.4. Bounded stale-edit recovery 0.16.0
+
+1. `edit_file` сохраняет exact-match семантику. Runtime не использует fuzzy
+   replacement, silent trimming или overwrite в ответ на конфликт.
+2. Exact-match ошибки not-found, trailing-newline mismatch и ambiguous multiple
+   matches классифицируются как `stale_edit_conflict`. Raw `old_string` не
+   возвращается; ToolMessage содержит bounded JSON с virtual path, error type,
+   recovery action и safe message.
+3. Первый conflict для одного normalized path и path-version в текущем
+   user turn открывает ровно один recovery-read этого же файла.
+   Он может превысить обычный two-read limit только на один вызов.
+4. После recovery-read агент строит уникальный `old_string` только из
+   свежего ToolMessage и повторяет edit не более одного раза. Неуспешный
+   edit не меняет mutation epoch/path version и не имеет success evidence.
+   Попытка revised edit до обязательного recovery-read отклоняется runtime и
+   не расходует разрешённый retry.
+5. Второй conflict того же path/version возвращает
+   `stop_and_report_conflict`, удаляет recovery token и запрещает четвёртое
+   чтение. Recovery ledger сбрасывается между user turns.
+6. Recovery не расширяет workspace path, read prohibition, audit batch,
+   mutation authorization, duplicate mutation и secret policies. Каждый шаг имеет
+   отдельный actual ToolMessage и audit status.
+7. Приёмка обязана воспроизвести два reads → external mutation →
+   stale edit → recovery read → revised edit и bounded негативный
+   сценарий со вторым conflict. Обычное третье чтение без conflict
+   остаётся denied.
+8. `read_context_window` принимает только indexed source и chunk_index
+   из retrieval evidence. `/workspace` source отклоняется с указанием
+   использовать `read_file`; invalid chunk/radius возвращает bounded
+   structured error, не exception. Hard budget не более восьми context-window
+   вызовов на user turn не может быть расширен prompt-ом.
+
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |

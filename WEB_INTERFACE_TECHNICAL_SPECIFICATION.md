@@ -340,3 +340,14 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 5. Unit/API/bundle и real browser E2E подтверждают local-free label,
    no-confirm LM Studio, custom provider flow, history/up/open status и нулевые
    console errors.
+
+### 13.9. Stale-edit errors 0.16.0
+
+1. Web chat и audit используют общий runtime stale-edit recovery; browser не
+   реализует собственный retry и не повторяет mutation.
+2. В SSE/chat не попадает failed `old_string`, raw file content или physical path.
+   Финальное unresolved state показывает safe conflict guidance и verified
+   error/denied tool evidence.
+3. Invalid `read_context_window` arguments и runaway budget exhaustion
+   отображаются как safe tool status; Web task не падает с raw
+   `ValueError` и не реализует browser-side retry.

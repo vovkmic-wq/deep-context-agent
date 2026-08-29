@@ -71,6 +71,9 @@ REPEAT_LIMITED_TOOLS = frozenset(
         "grep",
     }
 )
+HARD_PER_TURN_TOOL_LIMITS = {
+    "read_context_window": 8,
+}
 KNOWN_AGENT_TOOLS = frozenset(
     {
         *MUTATING_FILESYSTEM_TOOLS,
@@ -113,6 +116,11 @@ _TOOL_EVIDENCE_PATTERN = re.compile(
     r"\b(?:open|fetch|search|read|write|edit|delete|remove)\b|"
     r"откро(?:й|йте)|найд(?:и|ите)|проч(?:итай|тите)|созда(?:й|йте)|"
     r"измен(?:и|ите)|удал(?:и|ите)|текущ(?:ая|ую|ей)\s+верси)"
+)
+_EDIT_MATCH_CONFLICT_MARKERS = (
+    "string not found in file",
+    "old_string ends with a newline",
+    "times in file. use replace_all=true",
 )
 _OVERALL_PASS_CLAIM_PATTERN = re.compile(
     r"(?iu)(?:candidate_result\s*:\s*[a-z_]+|"
@@ -614,7 +622,7 @@ class ExactOnceToolMiddleware(AgentMiddleware):
 
 
 class ExplicitToolBudgetMiddleware(AgentMiddleware):
-    """Enforce explicit per-turn total and per-tool maximums."""
+    """Enforce explicit budgets and non-overridable runaway-tool limits."""
 
     name = "explicit_tool_call_budget"
 
@@ -626,14 +634,15 @@ class ExplicitToolBudgetMiddleware(AgentMiddleware):
         """Hide exhausted tools and suppress stale calls after a stated limit."""
 
         budget = explicit_tool_call_budget(current_user_query(request.state))
-        if budget.total is None and not budget.per_tool:
-            return handler(request)
+        per_tool_limits = dict(HARD_PER_TURN_TOOL_LIMITS)
+        for name, limit in budget.per_tool.items():
+            per_tool_limits[name] = min(per_tool_limits.get(name, limit), limit)
 
         audit = extract_tool_audit(request.state)
         attempted = Counter(entry.name for entry in audit)
         total_exhausted = budget.total is not None and len(audit) >= budget.total
         exhausted = {
-            name for name, limit in budget.per_tool.items() if attempted[name] >= limit
+            name for name, limit in per_tool_limits.items() if attempted[name] >= limit
         }
         if total_exhausted:
             exhausted.update(_model_tool_name(tool) for tool in request.tools)
@@ -651,7 +660,7 @@ class ExplicitToolBudgetMiddleware(AgentMiddleware):
             response,
             exhausted,
             fallback_content=(
-                "The explicit tool-call budget is exhausted. Use the existing "
+                "The tool-call budget is exhausted. Use the existing "
                 "ToolMessage evidence and provide the final answer."
             ),
         )
@@ -752,6 +761,10 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         self._mutation_epoch = 0
         self._project_check_runs = 0
         self._audit_read_limit = audit_read_limit
+        self._edit_conflicts: Counter[tuple[str, int]] = Counter()
+        self._edit_recovery_reads: set[tuple[str, int]] = set()
+        self._edit_retry_ready: set[tuple[str, int]] = set()
+        self._edit_tool_blocked = False
 
     def reset(self) -> None:
         """Start fresh per-turn call, path-version, and read ledgers."""
@@ -762,6 +775,57 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         self._seen_audit_read_signatures.clear()
         self._mutation_epoch = 0
         self._project_check_runs = 0
+        self._edit_conflicts.clear()
+        self._edit_recovery_reads.clear()
+        self._edit_retry_ready.clear()
+        self._edit_tool_blocked = False
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Expose only the next legal tool while an edit recovery is active."""
+
+        required_tool: str | None = None
+        if self._edit_recovery_reads:
+            required_tool = "read_file"
+        elif self._edit_retry_ready:
+            required_tool = "edit_file"
+
+        if required_tool is not None:
+            available_tools = [
+                tool
+                for tool in request.tools
+                if _model_tool_name(tool) == required_tool
+            ]
+            updates: dict[str, Any] = {"tools": available_tools}
+            updates["tool_choice"] = required_tool if available_tools else None
+            response = handler(request.override(**updates))
+            if required_tool == "read_file":
+                recovery_path, path_version = sorted(self._edit_recovery_reads)[0]
+                path_token = hashlib.sha256(recovery_path.encode()).hexdigest()[:12]
+                return _force_recovery_read_tool_call(
+                    response,
+                    recovery_path,
+                    call_id=(f"stale-edit-recovery-read-{path_version}-{path_token}"),
+                )
+            return response
+
+        if not self._edit_tool_blocked:
+            return handler(request)
+        available_tools = [
+            tool for tool in request.tools if _model_tool_name(tool) != "edit_file"
+        ]
+        response = handler(request.override(tools=available_tools, tool_choice=None))
+        return _suppress_exhausted_tool_calls(
+            response,
+            {"edit_file"},
+            fallback_content=(
+                "The bounded stale-edit retry is exhausted. Report the "
+                "unresolved conflict without another file mutation."
+            ),
+        )
 
     def wrap_tool_call(
         self,
@@ -773,6 +837,30 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         name = str(request.tool_call.get("name", "unknown"))
         raw_args = request.tool_call.get("args", {})
         args = raw_args if isinstance(raw_args, Mapping) else {}
+        requested_path = _filesystem_target(args)
+        normalized_path = (
+            normalize_virtual_path(requested_path) if requested_path else None
+        )
+        current_path_key = (
+            (normalized_path, self._path_versions[normalized_path])
+            if normalized_path
+            else None
+        )
+        if name == "edit_file" and current_path_key in self._edit_recovery_reads:
+            return denied_tool_message(
+                request,
+                "Fresh read required before the bounded edit retry.",
+                requested_path,
+            )
+        if name == "read_context_window":
+            source = args.get("source")
+            if isinstance(source, str) and is_virtual_workspace_path(source):
+                return denied_tool_message(
+                    request,
+                    "Context-window read denied for a workspace path; use "
+                    "read_file for an exact /workspace file.",
+                    source,
+                )
         signature = json.dumps(
             {
                 "name": name,
@@ -805,10 +893,6 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
             if name == "run_project_checks":
                 self._project_check_runs += 1
 
-        requested_path = _filesystem_target(args)
-        normalized_path = (
-            normalize_virtual_path(requested_path) if requested_path else None
-        )
         if name == "read_file" and normalized_path:
             read_key = (normalized_path, self._path_versions[normalized_path])
             is_audit_batch = (
@@ -824,16 +908,39 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
                     )
                 self._seen_audit_read_signatures.add(signature)
             read_limit = self._audit_read_limit if is_audit_batch else 2
-            if self._read_counts[read_key] >= read_limit:
+            recovery_read = read_key in self._edit_recovery_reads
+            if self._read_counts[read_key] >= read_limit and not recovery_read:
                 return denied_tool_message(
                     request,
                     "Redundant read denied: this path reached the current "
                     f"{read_limit}-read limit without an intervening mutation.",
                     requested_path,
                 )
+            if recovery_read:
+                self._edit_recovery_reads.discard(read_key)
+                self._edit_retry_ready.add(read_key)
             self._read_counts[read_key] += 1
 
+        if name == "edit_file" and current_path_key in self._edit_retry_ready:
+            self._edit_retry_ready.discard(current_path_key)
         result = handler(request)
+        if name == "edit_file" and normalized_path and _is_edit_match_conflict(result):
+            conflict_key = (
+                normalized_path,
+                self._path_versions[normalized_path],
+            )
+            self._edit_conflicts[conflict_key] += 1
+            recovery_allowed = self._edit_conflicts[conflict_key] == 1
+            self._edit_recovery_reads.discard(conflict_key)
+            self._edit_retry_ready.discard(conflict_key)
+            if recovery_allowed:
+                self._edit_recovery_reads.add(conflict_key)
+            else:
+                self._edit_tool_blocked = True
+            return edit_conflict_tool_message(
+                request,
+                recovery_allowed=recovery_allowed,
+            )
         if (
             name in MUTATING_FILESYSTEM_TOOLS
             and normalized_path
@@ -859,6 +966,10 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
             )
         for path in affected:
             self._path_versions[path] += 1
+            stale_keys = {key for key in self._edit_recovery_reads if key[0] == path}
+            self._edit_recovery_reads.difference_update(stale_keys)
+            retry_keys = {key for key in self._edit_retry_ready if key[0] == path}
+            self._edit_retry_ready.difference_update(retry_keys)
 
 
 def _filesystem_target(args: Mapping[str, Any]) -> str | None:
@@ -875,6 +986,61 @@ def _tool_message_status(result: Any) -> str:
         return "success"
     status, _ = _tool_result(str(result.name or "unknown"), result)
     return status
+
+
+def _is_edit_match_conflict(result: Any) -> bool:
+    """Detect exact-match edit conflicts without accepting arbitrary errors."""
+
+    if not isinstance(result, ToolMessage) or result.status != "error":
+        return False
+    content = message_text(result).casefold()
+    return any(marker in content for marker in _EDIT_MATCH_CONFLICT_MARKERS)
+
+
+def edit_conflict_tool_message(
+    request: ToolCallRequest,
+    *,
+    recovery_allowed: bool,
+) -> ToolMessage:
+    """Return bounded stale-edit guidance without echoing file content."""
+
+    path = _filesystem_target(
+        request.tool_call.get("args", {})
+        if isinstance(request.tool_call.get("args"), Mapping)
+        else {}
+    )
+    if recovery_allowed:
+        message = (
+            "The exact edit text is stale or ambiguous. Read this same file "
+            "once now, rebuild old_string from the fresh content, and retry "
+            "edit_file once with a unique exact match."
+        )
+        recovery = "read_same_file_once_then_retry_edit_once"
+    else:
+        message = (
+            "The bounded stale-edit retry was exhausted. Stop editing this "
+            "file and report the unresolved conflict to the operator."
+        )
+        recovery = "stop_and_report_conflict"
+    payload = json.dumps(
+        {
+            "operation": "edit_file",
+            "path": path,
+            "status": "error",
+            "error_type": "stale_edit_conflict",
+            "recovery": recovery,
+            "message": message,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return ToolMessage(
+        content=payload,
+        tool_call_id=request.tool_call["id"],
+        name="edit_file",
+        status="error",
+        additional_kwargs={"stale_edit_recovery": recovery},
+    )
 
 
 def denied_tool_message(
@@ -1487,6 +1653,54 @@ def _suppress_exhausted_tool_calls(
         result=messages,
         structured_response=response.structured_response,
     )
+
+
+def _force_recovery_read_tool_call(
+    response: ModelResponse,
+    path: str,
+    *,
+    call_id: str,
+) -> ModelResponse:
+    """Replace a premature provider response with the authorized recovery read."""
+
+    messages = list(response.result)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, AIMessage):
+            continue
+        if len(message.tool_calls) == 1:
+            call = message.tool_calls[0]
+            raw_args = call.get("args", {})
+            args = raw_args if isinstance(raw_args, Mapping) else {}
+            requested = args.get("file_path")
+            if (
+                call.get("name") == "read_file"
+                and isinstance(requested, str)
+                and normalize_virtual_path(requested) == path
+            ):
+                return response
+        additional_kwargs = dict(message.additional_kwargs)
+        additional_kwargs.pop("tool_calls", None)
+        additional_kwargs.pop("function_call", None)
+        messages[index] = message.model_copy(
+            update={
+                "content": "",
+                "additional_kwargs": additional_kwargs,
+                "tool_calls": [
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": path},
+                        "id": call_id,
+                        "type": "tool_call",
+                    }
+                ],
+            }
+        )
+        return ModelResponse(
+            result=messages,
+            structured_response=response.structured_response,
+        )
+    return response
 
 
 def append_acceptance_guard(

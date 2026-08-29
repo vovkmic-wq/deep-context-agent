@@ -3,6 +3,42 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [0.16.0] — 2026-08-29
+
+### Добавлено
+
+- Bounded stale-edit state machine: первый exact-match conflict
+  открывает один свежий read того же path/version и один revised edit.
+- Production-промпт 0.16.0, нормативные разделы в глобальном
+  промпте, основном ТЗ и Web-ТЗ.
+
+### Исправлено
+
+- `String not found in file` больше не заходит в тупик из-за
+  исчерпанного read budget: runtime принудительно выстраивает
+  `read_file → edit_file` и останавливает второй conflict.
+- Invalid `read_context_window` source/chunk/radius возвращает safe
+  ToolMessage вместо необработанного `ValueError`; workspace path направляется
+  к `read_file`.
+- Hard budget в восемь context-window calls и скрытие `edit_file`
+  после exhausted retry исключают live runaway/recursion loops.
+
+### Безопасность
+
+- Failed `old_string` не возвращается модели/Web; conflict evidence
+  ограничено virtual path, error type и recovery action.
+- Recovery не расширяет workspace, write/read prohibition, audit,
+  duplicate mutation и secret policies; fuzzy/silent replacement запрещён.
+
+### Проверено
+
+- External-mutation integration, premature retry, second-conflict stop,
+  normal third-read и runaway context-window regressions — PASS.
+- Реальный GLM-5.3 на чистых workspace/SQLite/thread воспроизвёл
+  expected stale conflict, recovery-read, revised edit и контрольное чтение — PASS.
+- Финальные Ruff/mypy/pytest/TypeScript/package/live evidence указаны
+  в `IMPLEMENTATION_STATUS.md`.
+
 ## [0.15.0] — 2026-08-29
 
 ### Добавлено

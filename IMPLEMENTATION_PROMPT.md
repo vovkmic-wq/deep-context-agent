@@ -1,6 +1,22 @@
 # Управляющий промпт реализации
 
-Актуальный управляющий промпт версии 0.15.0 находится в этом файле.
+Актуальный управляющий промпт версии 0.16.0 находится в этом файле.
+
+## Bounded stale-edit recovery 0.16.0 (2026-08-29)
+
+Работай по `DEEP_CONTEXT_AGENT_0_16_STALE_EDIT_RECOVERY_PROMPT.md` и
+`TECHNICAL_SPEC.md`. Не ослабляй exact `edit_file`: первый match-conflict
+даёт только один целевой recovery-read того же path/version и один
+revised edit по свежему content. Второй conflict закрывает recovery и
+требует stop/report. Сырой failed `old_string` не возвращай.
+Не разрешай `read_context_window` подменять `read_file` для
+`/workspace`: invalid source/radius должен давать safe ToolMessage, а
+hard per-turn budget обязан остановить runaway context-window loop.
+
+Закрепи external-mutation integration, bounded negative и обычный
+third-read regression. Повтори исходную ситуацию в live runtime и на
+реальном LLM provider. После full offline/live/package contour обнови
+документы/version/status и только затем публикуй release.
 
 ## Provider and files UX hardening 0.15.0 (2026-08-29)
 

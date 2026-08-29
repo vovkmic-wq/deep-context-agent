@@ -1573,6 +1573,239 @@ def test_third_read_without_path_mutation_is_denied(tmp_path: Path) -> None:
     ]
 
 
+def test_stale_edit_allows_one_fresh_read_and_revised_retry(tmp_path: Path) -> None:
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    target = app_config.workspace / "conflict.txt"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+
+    class ExternalMutationModel(SequenceChatModel):
+        target_path: Path
+
+        def _generate(
+            self,
+            messages: list[Any],
+            stop: list[str] | None = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            if self.generation_attempts == 2:
+                self.target_path.write_text("VALUE = 2\n", encoding="utf-8")
+            return super()._generate(messages, stop, run_manager, **kwargs)
+
+    read_call = {
+        "name": "read_file",
+        "args": {"file_path": "/workspace/conflict.txt"},
+        "type": "tool_call",
+    }
+    model = ExternalMutationModel(
+        target_path=target,
+        responses=[
+            AIMessage(content="", tool_calls=[{**read_call, "id": "read-before-1"}]),
+            AIMessage(content="", tool_calls=[{**read_call, "id": "read-before-2"}]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "file_path": "/workspace/conflict.txt",
+                            "old_string": "VALUE = 1\n",
+                            "new_string": "VALUE = 3\n",
+                        },
+                        "id": "stale-edit",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="", tool_calls=[{**read_call, "id": "recovery-read"}]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "file_path": "/workspace/conflict.txt",
+                            "old_string": "VALUE = 2\n",
+                            "new_string": "VALUE = 3\n",
+                        },
+                        "id": "revised-edit",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Conflict recovered."),
+        ],
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        answer = runtime.ask(
+            "Update /workspace/conflict.txt safely despite a concurrent change."
+        )
+
+    tool_contents = [
+        message_text(message)
+        for batch in model.received_message_batches
+        for message in batch
+        if isinstance(message, ToolMessage)
+    ]
+    assert target.read_text(encoding="utf-8") == "VALUE = 3\n"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "success",
+        "error",
+        "success",
+        "success",
+    ]
+    assert any('"error_type": "stale_edit_conflict"' in item for item in tool_contents)
+    assert any(
+        '"recovery": "read_same_file_once_then_retry_edit_once"' in item
+        for item in tool_contents
+    )
+    assert model.bound_tool_name_batches[3] == ["read_file"]
+    assert model.bound_tool_name_batches[4] == ["edit_file"]
+    assert "edit_file /workspace/conflict.txt: success" in answer
+
+
+def test_second_stale_edit_exhausts_recovery_read(tmp_path: Path) -> None:
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    target = app_config.workspace / "bounded-conflict.txt"
+    target.write_text("CURRENT\n", encoding="utf-8")
+    read_call = {
+        "name": "read_file",
+        "args": {"file_path": "/workspace/bounded-conflict.txt"},
+        "type": "tool_call",
+    }
+    responses = [
+        AIMessage(content="", tool_calls=[{**read_call, "id": "bounded-read-1"}]),
+        AIMessage(content="", tool_calls=[{**read_call, "id": "bounded-read-2"}]),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "edit_file",
+                    "args": {
+                        "file_path": "/workspace/bounded-conflict.txt",
+                        "old_string": "STALE_ONE\n",
+                        "new_string": "UPDATED\n",
+                    },
+                    "id": "bounded-edit-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content="", tool_calls=[{**read_call, "id": "bounded-recovery"}]),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "edit_file",
+                    "args": {
+                        "file_path": "/workspace/bounded-conflict.txt",
+                        "old_string": "STALE_TWO\n",
+                        "new_string": "UPDATED\n",
+                    },
+                    "id": "bounded-edit-2",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content="", tool_calls=[{**read_call, "id": "bounded-read-4"}]),
+        AIMessage(content="Bounded recovery stopped."),
+    ]
+    model = SequenceChatModel(responses=responses)
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask("Safely edit /workspace/bounded-conflict.txt.")
+
+    tool_contents = [
+        message_text(message)
+        for batch in model.received_message_batches
+        for message in batch
+        if isinstance(message, ToolMessage)
+    ]
+    assert target.read_text(encoding="utf-8") == "CURRENT\n"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "success",
+        "error",
+        "success",
+        "error",
+        "denied",
+    ]
+    assert any(
+        '"recovery": "stop_and_report_conflict"' in item for item in tool_contents
+    )
+
+
+def test_stale_edit_forces_fresh_read_before_retry(tmp_path: Path) -> None:
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    target = app_config.workspace / "mandatory-reread.txt"
+    target.write_text("CURRENT\n", encoding="utf-8")
+    read_call = {
+        "name": "read_file",
+        "args": {"file_path": "/workspace/mandatory-reread.txt"},
+        "type": "tool_call",
+    }
+    revised_edit = {
+        "name": "edit_file",
+        "args": {
+            "file_path": "/workspace/mandatory-reread.txt",
+            "old_string": "CURRENT\n",
+            "new_string": "UPDATED\n",
+        },
+        "type": "tool_call",
+    }
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(content="", tool_calls=[{**read_call, "id": "initial-read"}]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "file_path": "/workspace/mandatory-reread.txt",
+                            "old_string": "STALE\n",
+                            "new_string": "UPDATED\n",
+                        },
+                        "id": "initial-conflict",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**revised_edit, "id": "premature-retry"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{**revised_edit, "id": "fresh-retry"}],
+            ),
+            AIMessage(content="Fresh retry completed."),
+        ]
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask("Safely edit /workspace/mandatory-reread.txt.")
+
+    assert target.read_text(encoding="utf-8") == "UPDATED\n"
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "error",
+        "success",
+        "success",
+    ]
+    assert [entry.name for entry in runtime.last_tool_audit] == [
+        "read_file",
+        "edit_file",
+        "read_file",
+        "edit_file",
+    ]
+
+
 def test_recursive_parent_removal_opens_a_new_child_read_state(
     tmp_path: Path,
 ) -> None:
@@ -2411,6 +2644,38 @@ def test_explicit_per_tool_budget_suppresses_stale_provider_call(
         "search_context",
     ]
     assert "search_context" not in model.bound_tool_name_batches[-1]
+    assert "tool-call budget is exhausted" in answer
+
+
+def test_hard_context_window_budget_suppresses_runaway_calls(tmp_path: Path) -> None:
+    calls = [
+        {
+            "name": "read_context_window",
+            "args": {
+                "source": "memory://missing",
+                "chunk_index": 0,
+                "radius": index,
+            },
+            "id": f"call-context-window-{index}",
+            "type": "tool_call",
+        }
+        for index in range(9)
+    ]
+    model = SequenceChatModel(
+        responses=[
+            *(AIMessage(content="", tool_calls=[call]) for call in calls),
+            AIMessage(content="This response must not be needed."),
+        ]
+    )
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask("Inspect indexed context for missing evidence.")
+
+    assert len(runtime.last_tool_audit) == 8
+    assert all(entry.name == "read_context_window" for entry in runtime.last_tool_audit)
+    assert "read_context_window" not in model.bound_tool_name_batches[-1]
     assert "tool-call budget is exhausted" in answer
 
 

@@ -321,6 +321,29 @@ def test_bound_context_and_filesystem_tools(tmp_path: Path) -> None:
             tools["search_context"].invoke({"query": "ORBITAL"})
         )
         assert context_payload["results"][0]["source"] == "memory://one"
+        window_payload = json.loads(
+            tools["read_context_window"].invoke(
+                {"source": "memory://one", "chunk_index": 0, "radius": 1}
+            )
+        )
+        assert window_payload["results"][0]["source"] == "memory://one"
+        workspace_window = json.loads(
+            tools["read_context_window"].invoke(
+                {
+                    "source": "/workspace/project.py",
+                    "chunk_index": 0,
+                    "radius": 2,
+                }
+            )
+        )
+        invalid_window = json.loads(
+            tools["read_context_window"].invoke(
+                {"source": "memory://one", "chunk_index": 0, "radius": 21}
+            )
+        )
+        assert workspace_window["status"] == "denied"
+        assert invalid_window["status"] == "error"
+        assert invalid_window["error_type"] == "invalid_context_window"
         sources_payload = json.loads(tools["list_context_sources"].invoke({}))
         assert sources_payload["sources"][0]["source"] == "memory://one"
         page_payload = json.loads(
