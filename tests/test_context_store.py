@@ -104,6 +104,11 @@ def test_generated_and_browser_artifacts_are_not_indexed(tmp_path: Path) -> None
         ".deps/vendor.py": "dependency copy",
         "reports/generated.json": "generated report",
         "example.egg-info/PKG-INFO": "package metadata",
+        "diagnostics.sqlite3": "durable journal fixture",
+        "diagnostics.sqlite3-wal": "journal wal fixture",
+        "context-agent-server.jsonl": "structured log fixture",
+        "context-agent-server.jsonl.1": "rotated log fixture",
+        "diagnostic-export-1.json": "operator export fixture",
     }
     for relative_path, content in generated_files.items():
         target = source_root / relative_path

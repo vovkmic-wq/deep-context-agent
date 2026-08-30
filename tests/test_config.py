@@ -259,6 +259,7 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_CONTEXT_TOP_K": "9",
             "AGENT_AUTO_CONTEXT_MAX_CHARS": "6000",
             "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS": "1500",
+            "AGENT_ACTIVE_CONTEXT_MAX_TOKENS": "64000",
             "AGENT_CONTEXT_MAX_FILE_MB": "64",
             "AGENT_MODEL_CALL_RETRIES": "4",
             "AGENT_MODEL_RETRY_INITIAL_DELAY": "0.5",
@@ -270,6 +271,10 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_AUDIT_MAX_READS_PER_FILE": "5",
             "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "600",
             "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "30000",
+            "AGENT_FAILURE_LOG_MODE": "metadata",
+            "AGENT_FAILURE_LOG_RETENTION_DAYS": "45",
+            "AGENT_FAILURE_LOG_MAX_ROWS": "12000",
+            "AGENT_FAILURE_LOG_QUERY_MAX_BYTES": "32768",
         },
     )
     config.prepare_directories()
@@ -277,6 +282,7 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.context_top_k == 9
     assert config.auto_context_max_chars == 6000
     assert config.auto_context_query_max_chars == 1500
+    assert config.active_context_max_tokens == 64_000
     assert config.max_file_bytes == 64 * 1024 * 1024
     assert config.model_call_retries == 4
     assert config.model_retry_initial_delay == 0.5
@@ -288,7 +294,12 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.audit_max_reads_per_file == 5
     assert config.project_check_timeout_seconds == 600
     assert config.project_check_output_max_chars == 30_000
+    assert config.failure_log_mode == "metadata"
+    assert config.failure_log_retention_days == 45
+    assert config.failure_log_max_rows == 12_000
+    assert config.failure_log_query_max_bytes == 32_768
     assert config.project_audit_database == (tmp_path / "data/project_audit.sqlite3")
+    assert config.diagnostics_database == (tmp_path / "data/diagnostics.sqlite3")
     assert config.workspace.is_dir()
     assert config.data_dir.is_dir()
     assert config.context_root.is_dir()
@@ -304,15 +315,30 @@ def test_legacy_retrieval_limit_alias_is_supported(tmp_path: Path) -> None:
     assert canonical.context_top_k == 7
 
 
+def test_data_directory_cannot_be_exposed_inside_workspace(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="outside AGENT_WORKSPACE"):
+        AppConfig(
+            project_root=tmp_path,
+            workspace=tmp_path / "workspace",
+            data_dir=tmp_path / "workspace" / ".agent_data",
+            context_root=tmp_path / "workspace",
+        )
+
+
 @pytest.mark.parametrize(
     ("environment", "message"),
     [
+        ({"AGENT_ACTIVE_CONTEXT_MAX_TOKENS": "15999"}, "ACTIVE_CONTEXT"),
         ({"AGENT_RECURSION_LIMIT": "24"}, "RECURSION_LIMIT"),
         ({"AGENT_AUDIT_BATCH_SIZE": "26"}, "AUDIT_BATCH_SIZE"),
         ({"AGENT_AUDIT_MAX_BATCHES_PER_REQUEST": "0"}, "MAX_BATCHES"),
         ({"AGENT_AUDIT_MAX_READS_PER_FILE": "1"}, "MAX_READS"),
         ({"AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "9"}, "CHECK_TIMEOUT"),
         ({"AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "999"}, "OUTPUT_MAX"),
+        ({"AGENT_FAILURE_LOG_MODE": "unsafe"}, "FAILURE_LOG_MODE"),
+        ({"AGENT_FAILURE_LOG_RETENTION_DAYS": "0"}, "RETENTION_DAYS"),
+        ({"AGENT_FAILURE_LOG_MAX_ROWS": "99"}, "MAX_ROWS"),
+        ({"AGENT_FAILURE_LOG_QUERY_MAX_BYTES": "512"}, "QUERY_MAX_BYTES"),
     ],
 )
 def test_app_config_rejects_unsafe_or_unbounded_operational_limits(

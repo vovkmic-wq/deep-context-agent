@@ -10,12 +10,13 @@ import sys
 import webbrowser
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO, cast
 
 from dotenv import load_dotenv
 
 from context_agent.config import SUPPORTED_PROVIDERS, AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
+from context_agent.diagnostics import DiagnosticStore, configured_secret_values
 from context_agent.errors import AgentError
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
@@ -183,6 +184,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open the UI in the default browser after startup.",
     )
+
+    diagnostics_parser = subparsers.add_parser(
+        "diagnostics",
+        help="Inspect or purge the durable failed-request journal without an LLM.",
+    )
+    diagnostic_commands = diagnostics_parser.add_subparsers(
+        dest="diagnostics_command",
+        required=True,
+    )
+    diagnostic_list = diagnostic_commands.add_parser("list")
+    diagnostic_list.add_argument("--limit", type=int, default=50)
+    diagnostic_list.add_argument("--offset", type=int, default=0)
+    diagnostic_list.add_argument("--status")
+    diagnostic_list.add_argument("--json", action="store_true")
+    diagnostic_show = diagnostic_commands.add_parser("show")
+    diagnostic_show.add_argument("request_id")
+    diagnostic_show.add_argument("--include-query", action="store_true")
+    diagnostic_show.add_argument("--json", action="store_true")
+    diagnostic_export = diagnostic_commands.add_parser("export")
+    diagnostic_export.add_argument("request_id")
+    diagnostic_export.add_argument("--output", type=Path, required=True)
+    diagnostic_export.add_argument("--include-query", action="store_true")
+    diagnostic_purge = diagnostic_commands.add_parser("purge")
+    diagnostic_purge.add_argument("--request-id")
+    diagnostic_purge.add_argument("--older-than-days", type=int)
+    diagnostic_purge.add_argument("--confirm", choices=("PURGE",), required=True)
     return parser
 
 
@@ -246,6 +273,13 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"workspace={app_config.workspace}")
     print(f"context_database={app_config.context_database}")
     print(f"project_audit_database={app_config.project_audit_database}")
+    print(f"diagnostics_database={app_config.diagnostics_database}")
+    print(f"failure_log_mode={app_config.failure_log_mode}")
+    if app_config.failure_log_mode == "full":
+        print(
+            "warning=failure journal stores full prompts and may contain personal data",
+            file=sys.stderr,
+        )
     print(f"recursion_limit={app_config.recursion_limit}")
     print(f"audit_batch_size={app_config.audit_batch_size}")
     print(f"audit_max_reads_per_file={app_config.audit_max_reads_per_file}")
@@ -502,6 +536,92 @@ def _run_web(args: argparse.Namespace, base_dir: Path) -> int:
     return 0
 
 
+def _diagnostic_store(config: AppConfig) -> DiagnosticStore:
+    return DiagnosticStore(
+        config.diagnostics_database,
+        mode=cast(Any, config.failure_log_mode),
+        retention_days=config.failure_log_retention_days,
+        max_rows=config.failure_log_max_rows,
+        query_max_bytes=config.failure_log_query_max_bytes,
+        known_secrets=configured_secret_values(),
+    )
+
+
+def _run_diagnostics(args: argparse.Namespace, base_dir: Path) -> int:
+    config = _app_config(base_dir)
+    with _diagnostic_store(config) as store:
+        if args.diagnostics_command == "list":
+            items = store.list_requests(
+                limit=args.limit,
+                offset=args.offset,
+                status=args.status,
+            )
+            if args.json:
+                print(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                for item in items:
+                    print(
+                        f"{item['request_id']} status={item['status']} "
+                        f"thread={item['thread_id']} code={item['error_code']} "
+                        f"created={item['created_at_utc']}"
+                    )
+            return 0
+        if args.diagnostics_command == "show":
+            try:
+                item = store.request(
+                    args.request_id,
+                    include_query=args.include_query,
+                )
+            except KeyError as exc:
+                raise ValueError("Diagnostic request not found") from exc
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                for name in (
+                    "request_id",
+                    "status",
+                    "thread_id",
+                    "error_code",
+                    "created_at_utc",
+                    "finished_at_utc",
+                    "rollback_success",
+                ):
+                    print(f"{name}={item.get(name)}")
+                if args.include_query:
+                    print("query=" + str(item.get("query") or "<not stored>"))
+            return 0
+        if args.diagnostics_command == "export":
+            try:
+                item = store.request(
+                    args.request_id,
+                    include_query=args.include_query,
+                )
+            except KeyError as exc:
+                raise ValueError("Diagnostic request not found") from exc
+            payload = {
+                "format": "deep-context-agent-diagnostic-v1",
+                "item": item,
+            }
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            print(f"exported={args.output.resolve()}")
+            return 0
+        if args.diagnostics_command == "purge":
+            if args.request_id is None and args.older_than_days is None:
+                raise ValueError("Select --request-id or --older-than-days")
+            deleted = store.purge(
+                request_id=args.request_id,
+                older_than_days=args.older_than_days,
+            )
+            print(f"deleted={deleted}")
+            return 0
+    raise ValueError("Unknown diagnostics command")
+
+
 def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
     print("Deep Context Agent. Enter /paste for multi-line input, /exit to stop.")
     with _runtime(args, base_dir) as runtime:
@@ -540,6 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ask": _run_ask,
         "chat": _run_chat,
         "doctor": _run_doctor,
+        "diagnostics": _run_diagnostics,
         "index": _run_index,
         "search": _run_search,
         "web": _run_web,

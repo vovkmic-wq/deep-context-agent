@@ -18,6 +18,7 @@ if (!source.includes("/api/runtime") || !source.includes("x-csrf-token")) {
 }
 for (const required of [
   "/api/context/index",
+  "/api/tasks/",
   "/api/providers/priority",
   '"/api/providers"',
   "dca_enter_send",

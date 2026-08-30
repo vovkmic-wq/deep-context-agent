@@ -4,14 +4,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
 import secrets
-import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -20,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request as UrlRequest
@@ -41,6 +42,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from context_agent import __version__
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
+from context_agent.diagnostics import (
+    DiagnosticStore,
+    classify_failure,
+    configured_secret_values,
+)
 from context_agent.errors import (
     AgentError,
     ConfigurationError,
@@ -51,11 +57,23 @@ from context_agent.paths import resolve_inside
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
 from context_agent.runtime import AgentRuntime, message_text
+from context_agent.structured_logging import configure_structured_logger
 
 _STATIC_ROOT = Path(__file__).parent / "static"
 _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _SECRET_NAMES = frozenset(
-    {".env", ".env.local", ".env.production", ".env.test", "credentials.json"}
+    {
+        ".agent_data",
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.test",
+        "context-agent-server.jsonl",
+        "credentials.json",
+        "diagnostics.sqlite3",
+        "diagnostics.sqlite3-shm",
+        "diagnostics.sqlite3-wal",
+    }
 )
 _SETTINGS = {
     "context_top_k": {
@@ -71,6 +89,17 @@ _SETTINGS = {
         "comment": "Максимум символов найденного контекста в одном запросе к LLM.",
         "minimum": 1_000,
         "maximum": 200_000,
+    },
+    "active_context_max_tokens": {
+        "environment": "AGENT_ACTIVE_CONTEXT_MAX_TOKENS",
+        "label": "Активное окно LLM / Active LLM window",
+        "comment": (
+            "После этого примерного числа токенов старые тела результатов "
+            "инструментов заменяются компактными маркерами только в запросе к LLM; "
+            "полная SQLite-история сохраняется."
+        ),
+        "minimum": 16_000,
+        "maximum": 500_000,
     },
     "audit_batch_size": {
         "environment": "AGENT_AUDIT_BATCH_SIZE",
@@ -174,6 +203,12 @@ class SettingsRequest(BaseModel):
     values: dict[str, int | float] = Field(default_factory=dict)
 
 
+class DiagnosticPurgeRequest(BaseModel):
+    confirm: Literal["PURGE"]
+    request_id: str | None = Field(default=None, min_length=1, max_length=100)
+    older_than_days: int | None = Field(default=None, ge=0, le=3_650)
+
+
 class _TaskCancelledError(Exception):
     pass
 
@@ -181,31 +216,102 @@ class _TaskCancelledError(Exception):
 class _PublicTaskError(Exception):
     """Expected background failure with a bounded user-facing explanation."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.safe_message = message
+        self.retryable = retryable
 
 
 @dataclass(slots=True)
 class _Task:
     task_id: str
     kind: str
+    request_id: str | None = None
     events: queue.Queue[dict[str, object]] = field(default_factory=queue.Queue)
     cancel: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
+    terminal_event: dict[str, object] | None = None
+
+
+_AGENT_FAILURE_MESSAGES = {
+    "context_window_exceeded": (
+        "Активное окно модели переполнено. Старые результаты инструментов будут "
+        "автоматически компактированы; повторите запрос."
+    ),
+    "quota_exhausted": (
+        "У удалённых провайдеров закончились доступные средства или квота. "
+        "Проверьте биллинг либо включите локального провайдера."
+    ),
+    "rate_limited": (
+        "Провайдер временно ограничил частоту запросов. Подождите и повторите запрос."
+    ),
+    "authentication_failed": (
+        "Провайдер отклонил учётные данные. Проверьте серверную настройку API-ключа."
+    ),
+    "provider_timeout": (
+        "Провайдер не ответил за допустимое время. Проверьте live-статус и повторите."
+    ),
+    "provider_unavailable": (
+        "Провайдер недоступен или разорвал соединение. Проверьте live-статус и сеть."
+    ),
+    "agent_step_limit": (
+        "Агент достиг безопасного лимита шагов. Разделите задачу на меньшие этапы."
+    ),
+    "provider_chain_failed": (
+        "LLM-запрос не завершён ни одним провайдером. Проверьте их live-статус "
+        "на вкладке «Провайдеры» и повторите запрос."
+    ),
+}
+_RETRYABLE_AGENT_FAILURES = frozenset(
+    {
+        "context_window_exceeded",
+        "rate_limited",
+        "provider_timeout",
+        "provider_unavailable",
+    }
+)
+
+
+def _agent_failure_code(exc: BaseException) -> str:
+    """Compatibility wrapper around the shared safe classifier."""
+
+    return classify_failure(exc)
+
+
+def _is_benign_windows_pipe_reset(context: Mapping[str, object]) -> bool:
+    """Identify the Proactor callback emitted for a closed browser/SSE socket."""
+
+    if os.name != "nt":
+        return False
+    exception = context.get("exception")
+    if not isinstance(exception, ConnectionResetError):
+        return False
+    if getattr(exception, "winerror", None) != 10054:
+        return False
+    diagnostic = " ".join(
+        str(context.get(key, "")) for key in ("message", "handle", "future")
+    )
+    return "_ProactorBasePipeTransport._call_connection_lost" in diagnostic
 
 
 class TaskRegistry:
     """Run bounded background jobs and expose sanitized event streams."""
 
-    def __init__(self, max_workers: int = 4) -> None:
+    def __init__(
+        self,
+        diagnostic_store: DiagnosticStore,
+        logger: logging.Logger,
+        max_workers: int = 4,
+    ) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="context-agent-web",
         )
         self._tasks: dict[str, _Task] = {}
         self._lock = threading.RLock()
+        self._diagnostic_store = diagnostic_store
+        self._logger = logger
 
     def submit(
         self,
@@ -213,8 +319,20 @@ class TaskRegistry:
         operation: Callable[
             [Callable[[str, Mapping[str, object]], None], threading.Event], object
         ],
+        *,
+        task_id: str | None = None,
+        request_id: str | None = None,
     ) -> str:
-        task = _Task(task_id=uuid4().hex, kind=kind)
+        task = _Task(
+            task_id=task_id or uuid4().hex,
+            kind=kind,
+            request_id=request_id,
+        )
+        self._diagnostic_store.record_task_start(
+            task.task_id,
+            kind,
+            request_id=request_id,
+        )
         with self._lock:
             if len(self._tasks) >= 1_000:
                 completed = [
@@ -227,7 +345,16 @@ class TaskRegistry:
             self._tasks[task.task_id] = task
 
         def emit(event: str, data: Mapping[str, object]) -> None:
-            task.events.put({"event": event, "data": dict(data)})
+            safe_data = dict(data)
+            if event in {"completed", "cancelled", "failed"}:
+                safe_data.setdefault("task_id", task.task_id)
+                safe_data.setdefault("request_id", task.request_id or task.task_id)
+                safe_data.setdefault("retryable", False)
+            record: dict[str, object] = {"event": event, "data": safe_data}
+            if event in {"completed", "cancelled", "failed"}:
+                task.terminal_event = record
+                self._diagnostic_store.record_task_terminal(task.task_id, record)
+            task.events.put(record)
 
         def runner() -> None:
             emit("started", {"task_id": task.task_id, "kind": kind})
@@ -246,40 +373,57 @@ class TaskRegistry:
                     "failed",
                     {
                         "task_id": task.task_id,
+                        "request_id": task.request_id or task.task_id,
                         "error_type": exc.code,
                         "message": exc.safe_message,
+                        "retryable": exc.retryable,
                     },
                 )
             except AgentError as exc:
-                print(
-                    f"web task {task.task_id} failed: {type(exc).__name__}",
-                    file=sys.stderr,
+                error_code = _agent_failure_code(exc)
+                self._logger.error(
+                    "Web background task failed",
+                    extra={
+                        "event_code": error_code,
+                        "safe_fields": {
+                            "task_id": task.task_id,
+                            "kind": kind,
+                            "exception_type": type(exc).__name__,
+                        },
+                    },
                 )
                 emit(
                     "failed",
                     {
                         "task_id": task.task_id,
-                        "error_type": type(exc).__name__,
-                        "message": (
-                            "LLM-запрос не завершён ни одним "
-                            "провайдером. Проверьте их live-статус "
-                            "на вкладке «Провайдеры» и повторите запрос."
-                        ),
+                        "request_id": task.request_id or task.task_id,
+                        "error_type": error_code,
+                        "message": _AGENT_FAILURE_MESSAGES[error_code],
+                        "retryable": error_code in _RETRYABLE_AGENT_FAILURES,
                     },
                 )
             except Exception as exc:  # backend boundary: never expose raw details
-                print(
-                    f"web task {task.task_id} failed: {type(exc).__name__}",
-                    file=sys.stderr,
+                self._logger.error(
+                    "Unhandled Web background task failure",
+                    extra={
+                        "event_code": "background_task_failed",
+                        "safe_fields": {
+                            "task_id": task.task_id,
+                            "kind": kind,
+                            "exception_type": type(exc).__name__,
+                        },
+                    },
                 )
                 emit(
                     "failed",
                     {
                         "task_id": task.task_id,
-                        "error_type": type(exc).__name__,
+                        "request_id": task.request_id or task.task_id,
+                        "error_type": "background_task_failed",
                         "message": (
                             "Операция завершилась ошибкой. Проверьте журнал сервера."
                         ),
+                        "retryable": False,
                     },
                 )
             finally:
@@ -292,7 +436,22 @@ class TaskRegistry:
         with self._lock:
             task = self._tasks.get(task_id)
         if task is None:
-            raise KeyError(task_id)
+            persisted = self._diagnostic_store.task(task_id)
+            if persisted is None:
+                raise KeyError(task_id)
+            task = _Task(
+                task_id=task_id,
+                kind=str(persisted["kind"]),
+                request_id=(
+                    str(persisted["request_id"])
+                    if persisted.get("request_id")
+                    else None
+                ),
+            )
+            terminal = persisted.get("terminal_event")
+            if isinstance(terminal, dict):
+                task.terminal_event = terminal
+            task.done.set()
         return task
 
     def cancel(self, task_id: str) -> None:
@@ -622,14 +781,66 @@ def create_app(
     if not _STATIC_ROOT.joinpath("index.html").is_file():
         raise RuntimeError("Web static bundle is missing")
 
-    tasks = TaskRegistry()
+    diagnostics = DiagnosticStore(
+        config.diagnostics_database,
+        mode=cast(Any, config.failure_log_mode),
+        retention_days=config.failure_log_retention_days,
+        max_rows=config.failure_log_max_rows,
+        query_max_bytes=config.failure_log_query_max_bytes,
+        known_secrets=(
+            *(provider.api_key for provider in providers),
+            *configured_secret_values(),
+        ),
+    )
+    diagnostics.recover_interrupted()
+    logger = configure_structured_logger(
+        config.data_dir,
+        known_secrets=(
+            *(provider.api_key for provider in providers),
+            *configured_secret_values(),
+        ),
+    )
+    tasks = TaskRegistry(diagnostics, logger)
     provider_registry = ProviderRegistry(providers)
     rate_limiter = _RemoteRateLimiter()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        yield
-        tasks.close()
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+
+        def exception_handler(
+            active_loop: asyncio.AbstractEventLoop,
+            context: dict[str, Any],
+        ) -> None:
+            if _is_benign_windows_pipe_reset(context):
+                return
+            exception = context.get("exception")
+            logger.error(
+                "Unhandled asyncio event-loop exception",
+                extra={
+                    "event_code": "asyncio_loop_error",
+                    "safe_fields": {
+                        "exception_type": (
+                            type(exception).__name__
+                            if isinstance(exception, BaseException)
+                            else "unknown"
+                        )
+                    },
+                },
+            )
+            if previous_handler is not None:
+                previous_handler(active_loop, context)
+            else:
+                active_loop.default_exception_handler(context)
+
+        loop.set_exception_handler(exception_handler)
+        try:
+            yield
+        finally:
+            loop.set_exception_handler(previous_handler)
+            tasks.close()
+            diagnostics.close()
 
     app = FastAPI(
         title="Deep Context Agent",
@@ -641,6 +852,7 @@ def create_app(
     app.state.tasks = tasks
     app.state.config = config
     app.state.providers = provider_registry
+    app.state.diagnostics = diagnostics
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next: Callable[..., Any]):
@@ -727,9 +939,15 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
-        print(
-            f"web request {request.state.request_id} failed: {type(exc).__name__}",
-            file=sys.stderr,
+        logger.error(
+            "Unhandled Web request failure",
+            extra={
+                "event_code": "web_request_failed",
+                "safe_fields": {
+                    "request_id": request.state.request_id,
+                    "exception_type": type(exc).__name__,
+                },
+            },
         )
         return _error_response(
             request,
@@ -747,6 +965,7 @@ def create_app(
                 store.list_sources(limit=1)
             with ProjectAuditStore(config.project_audit_database) as store:
                 store.list_runs(workspace=config.workspace, limit=1)
+            diagnostics.list_requests(limit=1)
         except Exception:
             database_ok = False
         return _request_payload(
@@ -771,6 +990,7 @@ def create_app(
             active_tasks=tasks.active_count(),
             audit_mode_default="read-only",
             work_modes=list(_WORK_MODES),
+            failure_log_mode=config.failure_log_mode,
         )
 
     @app.get("/api/threads")
@@ -799,6 +1019,8 @@ def create_app(
 
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
+        task_id = uuid4().hex
+
         def operation(
             emit: Callable[[str, Mapping[str, object]], None],
             cancelled: threading.Event,
@@ -812,12 +1034,20 @@ def create_app(
                     f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}",
                     thread_id=body.thread_id,
                     auto_context=body.auto_context,
+                    diagnostic_source="web",
+                    diagnostic_task_id=task_id,
+                    diagnostic_request_id=task_id,
                 )
                 metadata = runtime._provider_failover_middleware.runtime_metadata()
                 emit("message", {"text": answer, "runtime": metadata})
                 return {"answer": answer, "runtime": metadata}
 
-        task_id = tasks.submit("chat", operation)
+        tasks.submit(
+            "chat",
+            operation,
+            task_id=task_id,
+            request_id=task_id,
+        )
         return _request_payload(request, task_id=task_id)
 
     @app.post("/api/chat/{task_id}/cancel")
@@ -836,11 +1066,26 @@ def create_app(
             raise HTTPException(404, "Task not found") from exc
 
         def stream() -> Iterator[str]:
+            if (
+                task.done.is_set()
+                and task.terminal_event is not None
+                and task.events.empty()
+            ):
+                terminal = task.terminal_event
+                event_name = str(terminal["event"])
+                data = json.dumps(terminal["data"], ensure_ascii=False)
+                yield f"event: {event_name}\ndata: {data}\n\n"
+                return
             while True:
                 try:
                     event = task.events.get(timeout=10)
                 except queue.Empty:
                     if task.done.is_set():
+                        if task.terminal_event is not None:
+                            event = task.terminal_event
+                            event_name = str(event["event"])
+                            data = json.dumps(event["data"], ensure_ascii=False)
+                            yield f"event: {event_name}\ndata: {data}\n\n"
                         break
                     yield ": heartbeat\n\n"
                     continue
@@ -851,6 +1096,82 @@ def create_app(
                     break
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.get("/api/tasks/{task_id}")
+    def task_status(request: Request, task_id: str):
+        try:
+            task = tasks.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Task not found") from exc
+        terminal = task.terminal_event
+        return _request_payload(
+            request,
+            task_id=task.task_id,
+            kind=task.kind,
+            status=(
+                str(terminal["event"])
+                if terminal is not None
+                else ("running" if not task.done.is_set() else "finished")
+            ),
+            terminal=(terminal["data"] if terminal is not None else None),
+        )
+
+    @app.get("/api/diagnostics")
+    def diagnostic_requests(
+        request: Request,
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        status: str | None = Query(default=None, max_length=50),
+    ):
+        items = diagnostics.list_requests(
+            limit=limit,
+            offset=offset,
+            status=status,
+        )
+        return _request_payload(
+            request,
+            items=items,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/api/diagnostics/{request_id}")
+    def diagnostic_details(
+        request: Request,
+        request_id: str,
+        include_query: bool = False,
+    ):
+        if include_query and allow_remote:
+            raise HTTPException(403, "Query disclosure is disabled in remote mode")
+        try:
+            item = diagnostics.request(request_id, include_query=include_query)
+        except KeyError as exc:
+            raise HTTPException(404, "Diagnostic request not found") from exc
+        return _request_payload(request, item=item)
+
+    @app.get("/api/diagnostics/{request_id}/export")
+    def export_diagnostic(
+        request: Request,
+        request_id: str,
+        include_query: bool = False,
+    ):
+        if include_query and allow_remote:
+            raise HTTPException(403, "Query disclosure is disabled in remote mode")
+        try:
+            item = diagnostics.request(request_id, include_query=include_query)
+        except KeyError as exc:
+            raise HTTPException(404, "Diagnostic request not found") from exc
+        return _request_payload(request, format="diagnostic-v1", item=item)
+
+    @app.delete("/api/diagnostics")
+    def purge_diagnostics(request: Request, body: DiagnosticPurgeRequest):
+        if body.request_id is None and body.older_than_days is None:
+            raise HTTPException(422, "Select request_id or older_than_days")
+        deleted = diagnostics.purge(
+            request_id=body.request_id,
+            older_than_days=body.older_than_days,
+        )
+        return _request_payload(request, deleted=deleted)
 
     @app.post("/api/context/index", status_code=202)
     def index_context(request: Request, body: IndexRequest):
@@ -955,6 +1276,8 @@ def create_app(
         )
 
     def submit_audit(body: AuditRequest) -> str:
+        task_id = uuid4().hex
+
         def operation(
             emit: Callable[[str, Mapping[str, object]], None],
             cancelled: threading.Event,
@@ -986,9 +1309,12 @@ def create_app(
                     exclude_patterns=body.exclude_patterns,
                     batch_size=body.batch_size,
                     progress_callback=progress_callback,
+                    diagnostic_source="web",
+                    diagnostic_task_id=task_id,
                 )
 
-        return tasks.submit("audit", operation)
+        tasks.submit("audit", operation, task_id=task_id)
+        return task_id
 
     @app.get("/api/audits")
     def audits(request: Request, limit: int = Query(50, ge=1, le=100)):

@@ -63,6 +63,7 @@ AGENT_DATA_DIR=./.agent_data
 AGENT_CONTEXT_TOP_K=8
 AGENT_AUTO_CONTEXT_MAX_CHARS=12000
 AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS=2000
+AGENT_ACTIVE_CONTEXT_MAX_TOKENS=80000
 AGENT_MODEL_CALL_RETRIES=3
 AGENT_MODEL_RETRY_INITIAL_DELAY=1
 AGENT_MODEL_RETRY_MAX_DELAY=15
@@ -77,10 +78,26 @@ AGENT_AUDIT_EXCLUDE=
 AGENT_AUDIT_MAX_READS_PER_FILE=4
 AGENT_PROJECT_CHECK_TIMEOUT_SECONDS=300
 AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS=20000
+AGENT_FAILURE_LOG_MODE=redacted
+AGENT_FAILURE_LOG_RETENTION_DAYS=30
+AGENT_FAILURE_LOG_MAX_ROWS=10000
+AGENT_FAILURE_LOG_QUERY_MAX_BYTES=65536
 ```
 
 Для совместимости также принимается старое имя `AGENT_RETRIEVAL_LIMIT`, но при
 одновременном задании приоритет имеет `AGENT_CONTEXT_TOP_K`.
+
+`AGENT_ACTIVE_CONTEXT_MAX_TOKENS` ограничивает только transient-ввод модели:
+после порога старые большие результаты инструментов заменяются компактными
+маркерами. Полная SQLite-история, документы и FTS5-поиск не удаляются, поэтому
+корпус в миллион строк остаётся доступен через retrieval.
+
+Неудачные запросы сохраняются отдельно от checkpoint rollback в
+`AGENT_DATA_DIR/diagnostics.sqlite3`. Безопасный default `redacted` хранит
+ограниченный очищенный текст, SHA-256 исходного запроса и операторскую
+диагностику. Режим `metadata` не хранит текст, `off` отключает записи, а `full`
+является явным локальным opt-in и может содержать персональные данные. Просмотр
+не требует LLM: `context-agent diagnostics list`, `show`, `export` и `purge`.
 
 Без явных настроек используется цепочка `glm,openai`: основная модель
 `glm-5.3`, резервная — `gpt-5.6-sol`. `AGENT_PROVIDER` выбирает один провайдер.
@@ -382,7 +399,7 @@ SaaS, tenant isolation и совместное редактирование не
 - Явно оборванная изменяющая команда отклоняется до модели и tools; отсутствующее
   содержимое не угадывается.
 
-Версия 0.16.0 предназначена для production-эксплуатации как локальный
+Версия 0.18.0 предназначена для production-эксплуатации как локальный
 однопользовательский CLI/Web UI в границах `AGENT_WORKSPACE`. Для
 многопользовательского сервиса добавьте
 процессную изоляцию workspace, аутентификацию, лимиты запросов, централизованные

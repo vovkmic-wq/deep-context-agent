@@ -86,6 +86,8 @@ function streamTask(
 ): EventSource {
   const stream = new EventSource(`/api/events/${encodeURIComponent(taskId)}`);
   const terminal = new Set(["completed", "cancelled", "failed"]);
+  let terminalSeen = false;
+  let recoveryPending = false;
   for (const name of [
     "started",
     "message",
@@ -99,14 +101,36 @@ function streamTask(
       const event = rawEvent as MessageEvent<string>;
       const data = JSON.parse(event.data) as Payload;
       handler(name, data);
-      if (terminal.has(name)) stream.close();
+      if (terminal.has(name)) {
+        terminalSeen = true;
+        stream.close();
+      }
     });
   }
   stream.onerror = () => {
-    if (stream.readyState !== EventSource.CLOSED) {
-      showToast("Соединение с потоком событий прервано");
-    }
-    stream.close();
+    if (terminalSeen || recoveryPending) return;
+    recoveryPending = true;
+    void api<Payload>(`/api/tasks/${encodeURIComponent(taskId)}`)
+      .then((status) => {
+        const statusName = text(status.status);
+        if (terminal.has(statusName)) {
+          const terminalData =
+            status.terminal && typeof status.terminal === "object"
+              ? (status.terminal as Payload)
+              : {};
+          terminalSeen = true;
+          handler(statusName, terminalData);
+          stream.close();
+          return;
+        }
+        showToast("Поток прерван; выполняется автоматическое переподключение");
+      })
+      .catch(() => {
+        showToast("Не удалось проверить состояние задачи; поток переподключается");
+      })
+      .finally(() => {
+        recoveryPending = false;
+      });
   };
   return stream;
 }

@@ -3,6 +3,52 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Durable failure journal 0.18.0 — 2026-08-30
+
+| Этап 0.18.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Durable SQLite | Завершён | `diagnostics.sqlite3`, WAL, schema v2 migration, request/provider/task records |
+| Privacy/retention | Завершён | off/metadata/redacted/full, SHA-256, truncation, deterministic redaction, bounded cleanup |
+| Runtime rollback | Завершён | Provider/tool evidence, rollback counts, filesystem-side-effect flag, dual-failure chain |
+| Web/CLI | Завершён | list/show/export/purge, safe DTO, correlation IDs, terminal SSE replay после restart |
+| Process log | Завершён | Rotating JSONL, safe fields, Windows benign reset policy сохранена |
+| Physical deletion | Завершён | Checkpoint `secure_delete=ON` и WAL truncate после rollback исключают deleted-prompt residue |
+| Финальный контур | Завершён | Python/TS/package, GLM/OpenAI live, failover, controlled failure, restart/redaction PASS |
+
+Финальные evidence 0.18.0:
+
+- Ruff check/format, mypy и compileall — PASS; pytest — 234 passed, 1 planned
+  Windows symlink skip до финальной packaging-проверки;
+- TypeScript `tsc --noEmit`, bundle regression и esbuild — PASS, bundle 38 012
+  bytes;
+- `zhipu/glm-5.3` и `openai/gpt-5.6-sol` doctor live — `OK`; реальный
+  failover `lmstudio(unavailable) → zhipu` вернул `LIVE_FALLBACK_84217` и
+  записал `fallback_triggered/fallback_success`;
+- controlled Web failure сохранил request `25f31e45c6ec4f93aff42c0b4ffe5889`,
+  `rollback_success=true`; после restart status/SSE replay вернулся за 85 ms;
+- fake credential отсутствует в diagnostics/checkpoints/context/JSONL/export,
+  failed conversation history пуста, redacted marker и полный SHA-256 сохранены.
+- wheel 0.18.0 содержит 24 файла, runtime SQLite/JSONL отсутствуют, target-install
+  вернул 0.18.0; SHA-256
+  `7AA2F146B68374C84D71DBAD7DDD91875624DD454985955F897C496AC177F319`.
+
+## Active-context recovery 0.17.0 — 2026-08-30
+
+| Этап 0.17.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Root cause | Завершён | Thread `web`: 174 messages, 452 525 chars, 75 ToolMessage; terminal detail не сохранялся после SSE |
+| Runtime compaction | Завершён | Transient copy, threshold 80k tokens, latest 8 tool results, original checkpoint/archive preserved |
+| Web recovery | Завершён | Safe error codes, terminal status/replay, client reconnect reconciliation |
+| Windows logging | Завершён | Только exact Proactor `_call_connection_lost` + WinError 10054 считается benign |
+| Документация/version | Завершён | Release/global/system prompts, main/Web ТЗ, env/README/changelog, 0.17.0 |
+| Финальный контур | Завершён | Проверен совместно с полным контуром release 0.18.0 |
+
+Промежуточные evidence 0.17.0:
+
+- реальный checkpoint: 452 525 → 154 874 model-input chars, очищено 67 старых
+  tool bodies, original cleared count = 0;
+- targeted Python tests и mypy — PASS; TypeScript/build/bundle — PASS.
+
 ## Bounded stale-edit recovery 0.16.0 — 2026-08-29
 
 | Этап 0.16.0 | Статус | Реализация/проверка |

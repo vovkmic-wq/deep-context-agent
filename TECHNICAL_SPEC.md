@@ -371,6 +371,60 @@
    structured error, не exception. Hard budget не более восьми context-window
    вызовов на user turn не может быть расширен prompt-ом.
 
+## 2.5. Active-context recovery 0.17.0
+
+1. Постоянный контекст имеет два уровня: полный SQLite/FTS5/checkpoint archive
+   и ограниченный model input. Наличие 1 000 000+ строк не означает отправку
+   всего корпуса или всей tool-history в каждый model call.
+2. `AGENT_ACTIVE_CONTEXT_MAX_TOKENS` задаёт приблизительный порог transient
+   context editing. При превышении старые `ToolMessage` и соответствующие
+   большие tool arguments заменяются маркерами в глубокой копии запроса.
+   Исходные LangGraph messages, checkpoint и searchable archive не меняются.
+3. Не менее восьми последних tool results остаются полными, чтобы текущая
+   audit/code пачка сохраняла рабочие evidence. Встроенная Deep Agents
+   summarization остаётся вторым уровнем защиты для длинной human/assistant
+   истории.
+4. Failover получает уже ограниченный model request, поэтому резервный
+   провайдер не повторяет переполненный prompt. Завершённые tools при failover
+   по-прежнему не запускаются повторно.
+5. Web классифицирует ожидаемые agent/provider failures стабильными safe-кодами
+   без raw exception: context window, quota, rate limit, authentication,
+   timeout, availability, graph step limit и generic provider-chain failure.
+6. Фоновая задача хранит bounded terminal event в process memory. Read-only
+   status endpoint и повторное SSE-подключение после завершения возвращают
+   этот terminal event; секретное содержимое в нём запрещено.
+7. Windows loop handler может игнорировать только `ConnectionResetError` с
+   `WinError 10054` из точного Proactor `_call_connection_lost` callback.
+   Любая иная loop exception передаётся предыдущему/default handler.
+
+## 2.6. Durable failure journal 0.18.0
+
+1. Неуспешный graph turn остаётся транзакционно откатываемым, но имеет запись в
+   отдельной `diagnostics.sqlite3`, не входящей в checkpoint rollback и FTS5.
+2. Запись создаётся до model call и получает stable request/task/thread IDs,
+   provider priority, query hash/size/mode и baseline checkpoint. На завершении
+   сохраняются provider attempts, bounded tool audit, duration, safe exception
+   chain, rollback result и необратимые filesystem side effects.
+3. Режимы query logging: `off`, `metadata`, `redacted` (default), `full`.
+   `full` требует явного opt-in. Любой режим имеет max bytes, SHA-256,
+   truncation flag, retention days и max rows.
+4. Journal, WAL/SHM, exports и structured rotated logs исключаются из context
+   indexing, workspace tools, Git и distributable artifacts.
+5. `in_progress` после restart становится `interrupted`; повтор создаёт новую
+   связанную попытку. Схема версионируется и мигрирует идемпотентно.
+6. Persistent terminal task event читается Web status/SSE после restart.
+   Browser никогда не получает raw query/exception/traceback/credential без
+   отдельного разрешённого operator export.
+7. Structured process log использует UTC и correlation IDs. Raw traceback
+   допустим только explicit debug mode после redaction; benign Windows
+   Proactor reset не считается неудачным LLM-запросом.
+8. Acceptance включает контролируемый failed request, rollback, restart,
+   terminal replay, redaction fixture, retention/concurrency/migration и полный
+   offline/live/package contour.
+9. Checkpoint SQLite использует `secure_delete`; после failed-turn rollback WAL
+   принудительно checkpoint/truncate. Секрет провалившегося запроса не должен
+   оставаться даже в свободных страницах или WAL при побайтовой проверке.
+
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import json
 from io import StringIO
 from pathlib import Path
 
@@ -13,10 +14,12 @@ from context_agent.cli import (
     MAX_PROMPT_FILE_BYTES,
     build_parser,
     configure_standard_streams,
+    main,
     read_chat_query,
     read_prompt_file,
     resolve_ask_query,
 )
+from context_agent.diagnostics import DiagnosticStore
 
 
 class _ConfigurableTextStream(StringIO):
@@ -82,6 +85,108 @@ def test_cli_accepts_model_free_audit_status_and_local_web() -> None:
     assert status.json is True
     assert web.host == "127.0.0.1"
     assert web.port == 9000
+
+
+def test_cli_accepts_diagnostics_operator_commands() -> None:
+    listing = build_parser().parse_args(
+        ["diagnostics", "list", "--status", "failed", "--json"]
+    )
+    export = build_parser().parse_args(
+        [
+            "diagnostics",
+            "export",
+            "request-1",
+            "--output",
+            "report.json",
+            "--include-query",
+        ]
+    )
+    purge = build_parser().parse_args(
+        [
+            "diagnostics",
+            "purge",
+            "--request-id",
+            "request-1",
+            "--confirm",
+            "PURGE",
+        ]
+    )
+
+    assert listing.command == "diagnostics"
+    assert listing.status == "failed"
+    assert export.output == Path("report.json")
+    assert export.include_query is True
+    assert purge.confirm == "PURGE"
+
+
+def test_cli_lists_exports_and_purges_diagnostics_without_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_DATA_DIR", str(data_dir))
+    with DiagnosticStore(data_dir / "diagnostics.sqlite3") as store:
+        request_id = store.start_request(
+            query="FAILED_CLI_91824",
+            thread_id="cli-test",
+            operation_kind="ask",
+            source="cli",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            request_id="request-cli",
+        )
+        assert request_id is not None
+        store.fail_request(
+            request_id,
+            exc=TimeoutError("timeout"),
+            provider_attempts=[],
+            tool_audit=[],
+            duration_ms=1,
+            rollback_attempted=True,
+            rollback_success=True,
+            rollback_checkpoint_rows=0,
+            rollback_write_rows=0,
+            filesystem_side_effects=False,
+        )
+
+    assert main(["diagnostics", "list", "--json"]) == 0
+    listing = json.loads(capsys.readouterr().out)
+    assert listing[0]["request_id"] == "request-cli"
+    assert "FAILED_CLI_91824" not in json.dumps(listing)
+
+    report = tmp_path / "diagnostic-export.json"
+    assert (
+        main(
+            [
+                "diagnostics",
+                "export",
+                "request-cli",
+                "--output",
+                str(report),
+                "--include-query",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert "FAILED_CLI_91824" in report.read_text(encoding="utf-8")
+    assert (
+        main(
+            [
+                "diagnostics",
+                "purge",
+                "--request-id",
+                "request-cli",
+                "--confirm",
+                "PURGE",
+            ]
+        )
+        == 0
+    )
+    assert "deleted=1" in capsys.readouterr().out
 
 
 def test_chat_paste_mode_returns_one_multiline_query(

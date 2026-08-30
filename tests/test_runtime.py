@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 from conftest import SequenceChatModel
+from langchain.agents.middleware import ClearToolUsesEdit, ContextEditingMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -628,8 +629,12 @@ def test_runtime_fails_over_and_sticks_to_successful_provider(
         model=primary,
         fallback_models=(fallback,),
     ) as runtime:
-        answer = runtime.ask("Report trusted runtime information")
+        answer = runtime.ask(
+            "Report trusted runtime information",
+            diagnostic_request_id="fallback-success",
+        )
         metadata = runtime._provider_failover_middleware.runtime_metadata()
+        journal = runtime.diagnostic_store.request("fallback-success")
 
     assert answer.startswith("fallback complete")
     assert primary.generation_attempts == 1
@@ -645,6 +650,11 @@ def test_runtime_fails_over_and_sticks_to_successful_provider(
     first_system_message = message_text(fallback.received_message_batches[0][0])
     assert "<active_llm_provider>" in first_system_message
     assert "provider: zhipu" in first_system_message
+    assert [item["outcome"] for item in journal["provider_attempts"]] == [
+        "fallback_triggered",
+        "fallback_success",
+        "fallback_success",
+    ]
 
 
 def test_runtime_reports_sanitized_error_when_all_providers_fail(
@@ -665,22 +675,29 @@ def test_runtime_reports_sanitized_error_when_all_providers_fail(
         model_retry_max_delay=0,
     )
 
-    with (
-        AgentRuntime(
-            app_config,
-            _provider_config(),
-            fallback_provider_configs=(_fallback_provider_config(),),
-            model=primary,
-            fallback_models=(fallback,),
-        ) as runtime,
-        pytest.raises(AgentError) as error,
-    ):
-        runtime.ask("ALL_PROVIDERS_FAIL")
+    with AgentRuntime(
+        app_config,
+        _provider_config(),
+        fallback_provider_configs=(_fallback_provider_config(),),
+        model=primary,
+        fallback_models=(fallback,),
+    ) as runtime:
+        with pytest.raises(AgentError) as error:
+            runtime.ask(
+                "ALL_PROVIDERS_FAIL",
+                diagnostic_request_id="all-providers-fail",
+            )
+        journal = runtime.diagnostic_store.request("all-providers-fail")
 
     message = str(error.value)
     assert "lmstudio/test-model (TimeoutError)" in message
     assert "zhipu/glm-5.3 (TimeoutError)" in message
     assert "transient model timeout" not in message
+    assert [item["provider"] for item in journal["provider_attempts"]] == [
+        "lmstudio",
+        "zhipu",
+    ]
+    assert all(item["outcome"] == "failed" for item in journal["provider_attempts"])
 
 
 def test_mutation_answer_without_tool_has_explicit_unverified_report() -> None:
@@ -1345,6 +1362,61 @@ def test_sequential_middleware_omits_unsupported_parallel_setting() -> None:
 
     assert response.result[0].content == "done"
     assert "parallel_tool_calls" not in captured
+
+
+def test_active_context_clears_old_tool_bodies_without_mutating_history() -> None:
+    model = SequenceChatModel(responses=[AIMessage(content="done")])
+    messages: list[HumanMessage | AIMessage | ToolMessage] = [
+        HumanMessage(content="old request")
+    ]
+    for index in range(8):
+        call = {
+            "name": "read_file",
+            "args": {"file_path": f"/workspace/{index}.txt"},
+            "id": f"call-{index}",
+            "type": "tool_call",
+        }
+        messages.extend(
+            (
+                AIMessage(content="", tool_calls=[call]),
+                ToolMessage(
+                    content=f"RESULT-{index}-" + ("x" * 16_000),
+                    tool_call_id=call["id"],
+                    name=call["name"],
+                ),
+            )
+        )
+    messages.append(HumanMessage(content="current request"))
+    request = ModelRequest(model=model, messages=messages, tools=[])
+    captured: list[object] = []
+
+    def handler(current: ModelRequest) -> ModelResponse:
+        captured.extend(current.messages)
+        return ModelResponse(result=[AIMessage(content="done")])
+
+    middleware = ContextEditingMiddleware(
+        edits=(
+            ClearToolUsesEdit(
+                trigger=16_000,
+                keep=2,
+                clear_tool_inputs=True,
+            ),
+        )
+    )
+    response = middleware.wrap_model_call(request, handler)
+    edited_tools = [item for item in captured if isinstance(item, ToolMessage)]
+    original_tools = [item for item in messages if isinstance(item, ToolMessage)]
+
+    assert isinstance(response, ModelResponse)
+    assert len(edited_tools) == 8
+    assert all(
+        item.response_metadata.get("context_editing", {}).get("cleared") is True
+        for item in edited_tools[:-2]
+    )
+    assert message_text(edited_tools[-2]).startswith("RESULT-6-")
+    assert message_text(edited_tools[-1]).startswith("RESULT-7-")
+    assert all("RESULT-" in message_text(item) for item in original_tools)
+    assert message_text(captured[-1]) == "current request"
 
 
 def test_budget_precedes_sequential_normalization_for_empty_toolset() -> None:
@@ -2853,6 +2925,117 @@ def test_failed_turn_is_removed_from_checkpoint_before_next_request(
     assert "FAILED_TURN_MARKER" not in final_messages
 
 
+def test_failed_turn_is_durably_journaled_outside_checkpoint_rollback(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[AIMessage(content="unused")],
+        failures_remaining=1,
+    )
+    app_config = replace(
+        _app_config(tmp_path),
+        model_call_retries=0,
+        model_retry_initial_delay=0,
+        model_retry_max_delay=0,
+        failure_log_mode="redacted",
+    )
+    fixture_key = "sk-" + "proj-" + "fixture-secret-80412"
+    query = f"FAILED_DURABLE_80412 OPENAI_API_KEY={fixture_key}"
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        with pytest.raises(AgentError, match="transient model timeout"):
+            runtime.ask(
+                query,
+                thread_id="durable-rollback",
+                diagnostic_source="web",
+                diagnostic_task_id="task-durable",
+                diagnostic_request_id="request-durable",
+            )
+        assert runtime.last_request_id == "request-durable"
+        item = runtime.diagnostic_store.request(
+            "request-durable",
+            include_query=True,
+        )
+        archived = runtime.context_store.thread_messages("durable-rollback")
+
+    serialized = json.dumps(item, ensure_ascii=False)
+    assert item["status"] == "failed"
+    assert item["task_id"] == "task-durable"
+    assert item["source"] == "web"
+    assert item["error_code"] == "provider_timeout"
+    assert item["rollback_attempted"] is True
+    assert item["rollback_success"] is True
+    assert item["provider_attempts"][0]["error_type"] == "TimeoutError"
+    assert item["provider_attempts"][0]["retry_count"] == 0
+    assert item["provider_attempts"][0]["outcome"] == "failed"
+    assert "FAILED_DURABLE_80412" in str(item["query"])
+    assert "fixture-secret-80412" not in serialized
+    assert archived == []
+    checkpoint_artifacts = list(app_config.data_dir.glob("checkpoints.sqlite3*"))
+    assert all(
+        fixture_key.encode() not in artifact.read_bytes()
+        for artifact in checkpoint_artifacts
+    )
+
+
+def test_successful_turn_records_provider_outcome(tmp_path: Path) -> None:
+    model = SequenceChatModel(responses=[AIMessage(content="journal success")])
+
+    with AgentRuntime(
+        _app_config(tmp_path), _provider_config(), model=model
+    ) as runtime:
+        answer = runtime.ask(
+            "SUCCESS_DURABLE_19375",
+            diagnostic_request_id="request-success",
+        )
+        item = runtime.diagnostic_store.request("request-success")
+
+    assert answer == "journal success"
+    assert item["status"] == "completed"
+    assert item["rollback_attempted"] is False
+    assert item["provider_attempts"][-1]["status"] == "success"
+    assert item["provider_attempts"][-1]["provider"] == "lmstudio"
+
+
+def test_request_and_rollback_failure_preserve_both_causes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = SequenceChatModel(
+        responses=[AIMessage(content="unused")],
+        failures_remaining=1,
+    )
+    app_config = replace(
+        _app_config(tmp_path),
+        model_call_retries=0,
+        model_retry_initial_delay=0,
+        model_retry_max_delay=0,
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+
+        def fail_rollback(*_args: object, **_kwargs: object) -> tuple[int, int]:
+            raise RuntimeError("rollback fixture failure")
+
+        monkeypatch.setattr(runtime, "_rollback_failed_turn", fail_rollback)
+        with pytest.raises(AgentError, match="rollback also failed"):
+            runtime.ask(
+                "FAILED_ROLLBACK_40918",
+                diagnostic_request_id="request-rollback-failed",
+            )
+        item = runtime.diagnostic_store.request("request-rollback-failed")
+
+    assert item["status"] == "failed"
+    assert item["error_code"] == "checkpoint_rollback_failed"
+    assert item["rollback_attempted"] is True
+    assert item["rollback_success"] is False
+    assert [entry["type"] for entry in item["exception_chain"]] == [
+        "ExceptionGroup",
+        "TimeoutError",
+        "RuntimeError",
+    ]
+
+
 def test_failed_turn_rolls_back_to_previous_successful_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -2956,6 +3139,8 @@ def test_failure_after_tool_reports_non_transactional_filesystem_side_effect(
             )
             is None
         )
+        assert runtime.last_request_id is not None
+        journal = runtime.diagnostic_store.request(runtime.last_request_id)
 
     assert (app_config.workspace / "partial.txt").read_text(encoding="utf-8") == (
         "PARTIAL_WRITE"
@@ -2963,6 +3148,16 @@ def test_failure_after_tool_reports_non_transactional_filesystem_side_effect(
     assert "write_file /workspace/partial.txt: success" in str(error.value)
     assert "side effect was not reversed" in str(error.value)
     assert "PARTIAL_WRITE" not in str(error.value)
+    assert journal["filesystem_side_effects"] is True
+    assert journal["tool_audit"] == [
+        {
+            "content_sha256": hashlib.sha256(b"PARTIAL_WRITE").hexdigest(),
+            "name": "write_file",
+            "path": "/workspace/partial.txt",
+            "result_count": None,
+            "status": "success",
+        }
+    ]
 
 
 class _RuntimeSearchClient:

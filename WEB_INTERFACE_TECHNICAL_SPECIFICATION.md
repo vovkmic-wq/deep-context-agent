@@ -351,3 +351,41 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 3. Invalid `read_context_window` arguments и runaway budget exhaustion
    отображаются как safe tool status; Web task не падает с raw
    `ValueError` и не реализует browser-side retry.
+
+### 13.10. Long-task recovery and diagnostics 0.17.0
+
+1. Chat/audit model input применяет общий runtime active-context budget;
+   браузер не обрезает историю и не создаёт собственную memory ветку.
+2. `GET /api/tasks/{task_id}` возвращает `running` либо bounded terminal
+   status/data. Raw provider exception, credential и physical path запрещены.
+3. Завершённая задача сохраняет terminal event для повторного
+   `GET /api/events/{task_id}`. Reconnect после сетевого разрыва не должен
+   зависать или возвращать немой пустой результат.
+4. Failure DTO использует стабильные коды `context_window_exceeded`,
+   `quota_exhausted`, `rate_limited`, `authentication_failed`,
+   `provider_timeout`, `provider_unavailable`, `agent_step_limit` либо
+   `provider_chain_failed` и даёт краткое действие оператору.
+5. Закрытие браузером/SSE Windows-соединения не засоряет server log известным
+   Proactor reset 10054. Иные asyncio exceptions не подавляются.
+
+### 13.11. Persistent failed-request diagnostics 0.18.0
+
+1. Web task и failed request имеют общий `request_id`; sanitized terminal event
+   хранится в `diagnostics.sqlite3` и доступен после restart.
+2. Список diagnostics серверно пагинируется и по умолчанию возвращает только
+   UTC, IDs, kind, safe code, provider attempts, duration и rollback status.
+3. Текст запроса зависит от server mode `off|metadata|redacted|full`. Клиент не
+   может переключить режим на `full` и не передаёт credentials.
+4. Просмотр/export сохранённого query требует local/authenticated operator,
+   явного include-query, CSRF для мутаций и отображения retention/privacy warning.
+5. Purge удаляет точный диапазон/ID после подтверждения; UI не выполняет VACUUM
+   в request thread и отображает фактическое число удалённых записей.
+6. Raw SDK response, exception, traceback, SQL, environment и physical path не
+   сериализуются. Все ответы содержат request ID для корреляции с локальным
+   structured log.
+7. Browser acceptance воспроизводит failed turn, перезапускает app, получает
+   terminal state, находит diagnostic summary и доказывает отсутствие fixture
+   secret во всех API/exports.
+8. Rollback использует secure checkpoint deletion и WAL truncate; browser/live
+   acceptance дополнительно сканирует DB/WAL/JSONL/export побайтово, чтобы
+   удалённый failed prompt не оставался физическим артефактом.

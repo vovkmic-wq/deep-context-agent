@@ -316,6 +316,7 @@ class AppConfig:
     context_top_k: int = 8
     auto_context_max_chars: int = 12_000
     auto_context_query_max_chars: int = 2_000
+    active_context_max_tokens: int = 80_000
     chunk_size: int = 4_000
     chunk_overlap: int = 400
     max_file_bytes: int = 2 * 1024 * 1024 * 1024
@@ -331,8 +332,21 @@ class AppConfig:
     audit_exclude: tuple[str, ...] = ()
     project_check_timeout_seconds: int = 300
     project_check_output_max_chars: int = 20_000
+    failure_log_mode: str = "redacted"
+    failure_log_retention_days: int = 30
+    failure_log_max_rows: int = 10_000
+    failure_log_query_max_bytes: int = 65_536
 
     def __post_init__(self) -> None:
+        resolved_workspace = self.workspace.resolve()
+        resolved_data_dir = self.data_dir.resolve()
+        if resolved_data_dir == resolved_workspace or resolved_data_dir.is_relative_to(
+            resolved_workspace
+        ):
+            raise ConfigurationError(
+                "AGENT_DATA_DIR must be outside AGENT_WORKSPACE so journals and "
+                "credentials cannot be exposed through /workspace"
+            )
         if self.context_top_k <= 0:
             raise ConfigurationError("AGENT_CONTEXT_TOP_K must be positive")
         if self.auto_context_max_chars <= 0:
@@ -340,6 +354,10 @@ class AppConfig:
         if self.auto_context_query_max_chars <= 0:
             raise ConfigurationError(
                 "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS must be positive"
+            )
+        if not 16_000 <= self.active_context_max_tokens <= 500_000:
+            raise ConfigurationError(
+                "AGENT_ACTIVE_CONTEXT_MAX_TOKENS must be between 16000 and 500000"
             )
         if self.chunk_size <= 0:
             raise ConfigurationError("AGENT_CONTEXT_CHUNK_SIZE must be positive")
@@ -389,6 +407,22 @@ class AppConfig:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS must be between 1000 and 100000"
             )
+        if self.failure_log_mode not in {"off", "metadata", "redacted", "full"}:
+            raise ConfigurationError(
+                "AGENT_FAILURE_LOG_MODE must be off, metadata, redacted, or full"
+            )
+        if not 1 <= self.failure_log_retention_days <= 3_650:
+            raise ConfigurationError(
+                "AGENT_FAILURE_LOG_RETENTION_DAYS must be between 1 and 3650"
+            )
+        if not 100 <= self.failure_log_max_rows <= 1_000_000:
+            raise ConfigurationError(
+                "AGENT_FAILURE_LOG_MAX_ROWS must be between 100 and 1000000"
+            )
+        if not 1_024 <= self.failure_log_query_max_bytes <= 2 * 1024 * 1024:
+            raise ConfigurationError(
+                "AGENT_FAILURE_LOG_QUERY_MAX_BYTES must be between 1024 and 2097152"
+            )
 
     @property
     def context_database(self) -> Path:
@@ -404,6 +438,12 @@ class AppConfig:
     def project_audit_database(self) -> Path:
         """Return the persistent project-audit manifest database path."""
         return self.data_dir / "project_audit.sqlite3"
+
+    @property
+    def diagnostics_database(self) -> Path:
+        """Return the failure journal database outside LangGraph rollback."""
+
+        return self.data_dir / "diagnostics.sqlite3"
 
     @classmethod
     def from_env(
@@ -443,6 +483,11 @@ class AppConfig:
                 values,
                 "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS",
                 2_000,
+            ),
+            active_context_max_tokens=_int_setting(
+                values,
+                "AGENT_ACTIVE_CONTEXT_MAX_TOKENS",
+                80_000,
             ),
             chunk_size=_int_setting(values, "AGENT_CONTEXT_CHUNK_SIZE", 4_000),
             chunk_overlap=_int_setting(
@@ -504,6 +549,24 @@ class AppConfig:
                 values,
                 "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS",
                 20_000,
+            ),
+            failure_log_mode=values.get("AGENT_FAILURE_LOG_MODE", "redacted")
+            .strip()
+            .casefold(),
+            failure_log_retention_days=_int_setting(
+                values,
+                "AGENT_FAILURE_LOG_RETENTION_DAYS",
+                30,
+            ),
+            failure_log_max_rows=_int_setting(
+                values,
+                "AGENT_FAILURE_LOG_MAX_ROWS",
+                10_000,
+            ),
+            failure_log_query_max_bytes=_int_setting(
+                values,
+                "AGENT_FAILURE_LOG_QUERY_MAX_BYTES",
+                65_536,
             ),
         )
 

@@ -6,9 +6,10 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +19,8 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import (
     AgentMiddleware,
+    ClearToolUsesEdit,
+    ContextEditingMiddleware,
     ModelRetryMiddleware,
     TodoListMiddleware,
 )
@@ -30,8 +33,14 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from context_agent import __version__
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore, SearchHit
+from context_agent.diagnostics import (
+    DiagnosticStore,
+    classify_failure,
+    configured_secret_values,
+)
 from context_agent.errors import AgentError, PathSecurityError
 from context_agent.paths import resolve_inside
 from context_agent.project_audit import (
@@ -470,6 +479,18 @@ class ProviderFailure:
     provider: str
     model: str
     error_type: str
+    duration_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAttempt:
+    """Sanitized timing and outcome of one provider model call."""
+
+    provider: str
+    model: str
+    status: str
+    duration_ms: int
+    error_type: str | None = None
 
 
 _ACTIVE_PROVIDER_BLOCK_PATTERN = re.compile(
@@ -500,6 +521,7 @@ class ProviderFailoverMiddleware(AgentMiddleware):
 
         self._active_index = 0
         self.failures: list[ProviderFailure] = []
+        self.attempts: list[ProviderAttempt] = []
 
     def runtime_metadata(self) -> dict[str, Any]:
         """Return dynamic, non-secret provider chain diagnostics."""
@@ -566,19 +588,39 @@ class ProviderFailoverMiddleware(AgentMiddleware):
         last_exception: Exception | None = None
         for target_index in range(self._active_index, len(self.targets)):
             target = self.targets[target_index]
+            started_at = time.monotonic()
             try:
                 response = handler(self._request_for_target(request, target_index))
             except Exception as exc:
                 last_exception = exc
+                duration_ms = int((time.monotonic() - started_at) * 1_000)
                 failure = ProviderFailure(
                     provider=target.config.name,
                     model=target.config.model,
                     error_type=type(exc).__name__,
+                    duration_ms=duration_ms,
                 )
                 self.failures.append(failure)
                 turn_failures.append(failure)
+                self.attempts.append(
+                    ProviderAttempt(
+                        provider=target.config.name,
+                        model=target.config.model,
+                        status="error",
+                        error_type=type(exc).__name__,
+                        duration_ms=duration_ms,
+                    )
+                )
                 continue
             self._active_index = target_index
+            self.attempts.append(
+                ProviderAttempt(
+                    provider=target.config.name,
+                    model=target.config.model,
+                    status="success",
+                    duration_ms=int((time.monotonic() - started_at) * 1_000),
+                )
+            )
             return response
 
         if len(self.targets) == 1 and last_exception is not None:
@@ -2734,10 +2776,22 @@ class AgentRuntime:
             timeout_seconds=self.app_config.project_check_timeout_seconds,
             output_max_chars=self.app_config.project_check_output_max_chars,
         )
+        self.diagnostic_store = DiagnosticStore(
+            self.app_config.diagnostics_database,
+            mode=cast(Any, self.app_config.failure_log_mode),
+            retention_days=self.app_config.failure_log_retention_days,
+            max_rows=self.app_config.failure_log_max_rows,
+            query_max_bytes=self.app_config.failure_log_query_max_bytes,
+            known_secrets=(
+                *(config.api_key for config in self.provider_configs),
+                *configured_secret_values(),
+            ),
+        )
         self._checkpoint_connection = sqlite3.connect(
             self.app_config.checkpoint_database,
             check_same_thread=False,
         )
+        self._checkpoint_connection.execute("PRAGMA secure_delete=ON")
         checkpointer = SqliteSaver(self._checkpoint_connection)
         checkpointer.setup()
         self.checkpointer = checkpointer
@@ -2827,6 +2881,15 @@ class AgentRuntime:
                     tool_call_policy_middleware,
                     ExactReadPathMiddleware(),
                     ProjectAuditBatchMiddleware(),
+                    ContextEditingMiddleware(
+                        edits=(
+                            ClearToolUsesEdit(
+                                trigger=self.app_config.active_context_max_tokens,
+                                keep=8,
+                                clear_tool_inputs=True,
+                            ),
+                        ),
+                    ),
                     provider_failover_middleware,
                     ModelRetryMiddleware(
                         max_retries=self.app_config.model_call_retries,
@@ -2839,6 +2902,7 @@ class AgentRuntime:
             ),
         )
         self.last_tool_audit: tuple[ToolAuditEntry, ...] = ()
+        self.last_request_id: str | None = None
         self._closed = False
 
     def _record_thread_head(self, thread_id: str, checkpoint_id: str) -> None:
@@ -2905,7 +2969,21 @@ class AgentRuntime:
         self,
         thread_id: str,
         snapshot: _ThreadCheckpointSnapshot,
-    ) -> None:
+    ) -> tuple[int, int]:
+        current_checkpoint_count = int(
+            self._checkpoint_connection.execute(
+                "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+        )
+        current_write_count = int(
+            self._checkpoint_connection.execute(
+                "SELECT COUNT(*) FROM writes WHERE thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+        )
+        added_checkpoint_rows = max(
+            0, current_checkpoint_count - len(snapshot.checkpoint_rows)
+        )
+        added_write_rows = max(0, current_write_count - len(snapshot.write_rows))
         with self._checkpoint_connection:
             self._checkpoint_connection.execute(
                 "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
@@ -2946,6 +3024,53 @@ class AgentRuntime:
                     """,
                     (thread_id, snapshot.head_checkpoint_id),
                 )
+        self._checkpoint_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return added_checkpoint_rows, added_write_rows
+
+    def _diagnostic_provider_attempts(
+        self,
+        *,
+        successful: bool,
+    ) -> list[dict[str, object]]:
+        """Return non-secret provider outcomes for the current user turn."""
+
+        records: list[dict[str, object]] = []
+        primary_provider = self.provider_configs[0].name
+        for index, attempt in enumerate(
+            self._provider_failover_middleware.attempts,
+            start=1,
+        ):
+            if attempt.status == "success":
+                outcome = (
+                    "active_success"
+                    if attempt.provider == primary_provider
+                    else "fallback_success"
+                )
+            elif successful:
+                outcome = "fallback_triggered"
+            else:
+                outcome = "failed"
+            records.append(
+                {
+                    "ordinal": index,
+                    **asdict(attempt),
+                    "retry_count": (
+                        self.app_config.model_call_retries
+                        if attempt.status == "error"
+                        else 0
+                    ),
+                    "outcome": outcome,
+                }
+            )
+        return records
+
+    @staticmethod
+    def _diagnostic_tool_audit(
+        audit: Sequence[ToolAuditEntry],
+    ) -> list[dict[str, object]]:
+        """Convert already-sanitized tool evidence to JSON-safe records."""
+
+        return [asdict(entry) for entry in audit]
 
     def _update_successful_thread_head(self, thread_id: str) -> None:
         checkpoint = self.checkpointer.get_tuple(
@@ -2968,6 +3093,8 @@ class AgentRuntime:
         report_file: Path | None = None,
         report_format: str = "text",
         progress_callback: Callable[[AuditProgress, int, int], None] | None = None,
+        diagnostic_source: str = "cli",
+        diagnostic_task_id: str | None = None,
     ) -> str:
         """Run or resume a bounded, evidence-backed project audit."""
 
@@ -3041,6 +3168,8 @@ class AgentRuntime:
                     request,
                     thread_id=batch_thread_id,
                     auto_context=False,
+                    diagnostic_source=diagnostic_source,
+                    diagnostic_task_id=diagnostic_task_id,
                 )
             except Exception:
                 self.project_audit_store.release_batch(batch)
@@ -3111,6 +3240,10 @@ class AgentRuntime:
         *,
         thread_id: str = "default",
         auto_context: bool = True,
+        diagnostic_source: str = "cli",
+        diagnostic_task_id: str | None = None,
+        diagnostic_request_id: str | None = None,
+        parent_request_id: str | None = None,
     ) -> str:
         """Retrieve context, invoke the agent, and archive the completed turn."""
         clean_query = query.strip()
@@ -3163,6 +3296,8 @@ class AgentRuntime:
             return self.run_project_audit(
                 clean_query,
                 thread_id=clean_thread_id,
+                diagnostic_source=diagnostic_source,
+                diagnostic_task_id=diagnostic_task_id,
             )
         hits = []
         if auto_context and not should_skip_automatic_retrieval(
@@ -3182,6 +3317,27 @@ class AgentRuntime:
             clean_thread_id,
             baseline_checkpoint_id,
         )
+        started_at = time.monotonic()
+        request_id = self.diagnostic_store.start_request(
+            query=clean_query,
+            thread_id=clean_thread_id,
+            operation_kind="ask",
+            source=diagnostic_source,
+            app_version=__version__,
+            provider_priority=[
+                {
+                    "provider": config.name,
+                    "model": config.model,
+                    "base_url": config.base_url,
+                }
+                for config in self.provider_configs
+            ],
+            baseline_checkpoint_id=baseline_checkpoint_id,
+            task_id=diagnostic_task_id,
+            request_id=diagnostic_request_id,
+            parent_request_id=parent_request_id,
+        )
+        self.last_request_id = request_id
         configurable: dict[str, str] = {"thread_id": clean_thread_id}
         if baseline_checkpoint_id is not None:
             configurable["checkpoint_id"] = baseline_checkpoint_id
@@ -3195,7 +3351,61 @@ class AgentRuntime:
             )
         except Exception as exc:
             self.last_tool_audit = tuple(self._tool_audit_middleware.entries)
-            self._rollback_failed_turn(clean_thread_id, checkpoint_snapshot)
+            rollback_success = False
+            rollback_checkpoint_rows = 0
+            rollback_write_rows = 0
+            try:
+                (
+                    rollback_checkpoint_rows,
+                    rollback_write_rows,
+                ) = self._rollback_failed_turn(
+                    clean_thread_id,
+                    checkpoint_snapshot,
+                )
+                rollback_success = True
+            except Exception as rollback_exc:
+                self.diagnostic_store.fail_request(
+                    request_id,
+                    exc=ExceptionGroup(
+                        "Agent request and checkpoint rollback failed",
+                        [exc, rollback_exc],
+                    ),
+                    provider_attempts=self._diagnostic_provider_attempts(
+                        successful=False
+                    ),
+                    tool_audit=self._diagnostic_tool_audit(self.last_tool_audit),
+                    duration_ms=int((time.monotonic() - started_at) * 1_000),
+                    rollback_attempted=True,
+                    rollback_success=False,
+                    rollback_checkpoint_rows=0,
+                    rollback_write_rows=0,
+                    filesystem_side_effects=any(
+                        entry.name in MUTATING_FILESYSTEM_TOOLS
+                        and entry.status == "success"
+                        for entry in self.last_tool_audit
+                    ),
+                    error_code="checkpoint_rollback_failed",
+                )
+                raise AgentError(
+                    "Agent request failed and checkpoint rollback also failed"
+                ) from exc
+            self.diagnostic_store.fail_request(
+                request_id,
+                exc=exc,
+                provider_attempts=self._diagnostic_provider_attempts(successful=False),
+                tool_audit=self._diagnostic_tool_audit(self.last_tool_audit),
+                duration_ms=int((time.monotonic() - started_at) * 1_000),
+                rollback_attempted=True,
+                rollback_success=rollback_success,
+                rollback_checkpoint_rows=rollback_checkpoint_rows,
+                rollback_write_rows=rollback_write_rows,
+                filesystem_side_effects=any(
+                    entry.name in MUTATING_FILESYSTEM_TOOLS
+                    and entry.status == "success"
+                    for entry in self.last_tool_audit
+                ),
+                error_code=classify_failure(exc),
+            )
             message = redact_marked_secrets(
                 f"Agent request failed ({type(exc).__name__}): {exc}"
             )
@@ -3236,6 +3446,12 @@ class AgentRuntime:
         answer = append_acceptance_guard(answer, self.last_tool_audit, clean_query)
         self.context_store.archive_message(clean_thread_id, "user", clean_query)
         self.context_store.archive_message(clean_thread_id, "assistant", answer)
+        self.diagnostic_store.complete_request(
+            request_id,
+            provider_attempts=self._diagnostic_provider_attempts(successful=True),
+            tool_audit=self._diagnostic_tool_audit(self.last_tool_audit),
+            duration_ms=int((time.monotonic() - started_at) * 1_000),
+        )
         return answer
 
     def close(self) -> None:
@@ -3243,6 +3459,7 @@ class AgentRuntime:
         if not self._closed:
             self.project_audit_store.close()
             self.context_store.close()
+            self.diagnostic_store.close()
             self._checkpoint_connection.close()
             self._closed = True
 

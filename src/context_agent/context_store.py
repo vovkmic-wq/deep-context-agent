@@ -20,6 +20,7 @@ from context_agent.paths import resolve_inside
 _TOKEN_PATTERN = re.compile(r"[^\W_]{2,}", flags=re.UNICODE)
 _SKIPPED_DIRECTORIES = {
     ".agent_data",
+    ".diagnostic-exports",
     ".cache",
     ".deps",
     ".git",
@@ -50,8 +51,20 @@ _SKIPPED_DIRECTORY_PREFIXES = (
     "edge-profile",
 )
 _SKIPPED_DIRECTORY_SUFFIXES = (".egg-info",)
-_SKIPPED_FILENAMES = {".coverage", ".env", ".env.local"}
-_SKIPPED_FILENAME_PREFIXES = (".coverage.",)
+_SKIPPED_FILENAMES = {
+    ".coverage",
+    ".env",
+    ".env.local",
+    "context-agent-server.jsonl",
+    "diagnostics.sqlite3",
+    "diagnostics.sqlite3-shm",
+    "diagnostics.sqlite3-wal",
+}
+_SKIPPED_FILENAME_PREFIXES = (
+    ".coverage.",
+    "context-agent-server.jsonl.",
+    "diagnostic-export",
+)
 _TEXT_EXTENSIONS = {
     "",
     ".cfg",

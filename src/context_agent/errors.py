@@ -17,5 +17,9 @@ class ContextStoreError(AgentError):
     """Raised when context storage or indexing fails."""
 
 
+class DiagnosticStoreError(AgentError):
+    """Raised when the durable diagnostic journal cannot be updated safely."""
+
+
 class WebSearchError(AgentError):
     """Raised when an internet search cannot be completed."""

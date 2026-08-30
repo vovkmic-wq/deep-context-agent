@@ -3,6 +3,72 @@
 Формат основан на Keep a Changelog. Проект использует семантическое
 версионирование.
 
+## [Unreleased]
+
+Изменений пока нет.
+
+## [0.18.0] — 2026-08-30
+
+### Добавлено
+
+- Отдельная версионируемая `diagnostics.sqlite3` с request/provider/Web-task
+  records, retention, crash recovery и persistent terminal SSE replay.
+- Режимы `off`, `metadata`, `redacted` и explicit `full`, полный SHA-256,
+  исходный размер, bounded prompt и нейтральный metadata preview.
+- Model-free CLI `diagnostics list/show/export/purge` и безопасные Web API.
+- Rotating structured JSONL с correlation IDs и очищенными полями.
+
+### Исправлено
+
+- Неудачный turn больше не теряется вместе с checkpoint rollback: сохраняются
+  provider attempts, tool evidence, rollback rows/result и filesystem side effects.
+- Terminal Web error содержит stable code, `request_id` и `retryable`, а replay
+  после перезапуска не ждёт heartbeat timeout.
+- Включены SQLite `secure_delete` и WAL truncate после checkpoint rollback,
+  поэтому удалённый failed prompt не остаётся в свободных страницах базы.
+
+### Безопасность
+
+- Journal повторно фильтрует tool/provider payload на границе БД, не хранит raw
+  tool results/physical paths и скрывает ключи, cookies и authorization headers.
+- `AGENT_DATA_DIR` запрещено размещать внутри `AGENT_WORKSPACE`; journal,
+  WAL/SHM и rotated logs исключены из индексации и Web file browser.
+
+### Проверено
+
+- Полный Python/TypeScript/package-контур, реальные GLM/OpenAI запросы,
+  успешный failover и controlled Web failure с rollback/restart/redaction.
+
+## [0.17.0] — 2026-08-30
+
+### Добавлено
+
+- Валидируемый `AGENT_ACTIVE_CONTEXT_MAX_TOKENS` и transient context editing:
+  старые тела/аргументы tools компактируются в копии model request, а полная
+  SQLite/checkpoint/FTS5-история остаётся неизменной.
+- Safe-классификация Web-ошибок, read-only task status и повтор terminal event
+  при SSE reconnect.
+- Production-промпт 0.17.0 и синхронизированные глобальный промпт, основное и
+  Web-ТЗ.
+
+### Исправлено
+
+- Длинный thread больше не пересылает сотни килобайт старых ToolMessage каждому
+  провайдеру. Последние восемь результатов текущей рабочей пачки сохраняются.
+- Web-клиент после разрыва SSE сверяет фактический terminal status вместо
+  вечного pending-состояния.
+- Из server log убран только известный Windows Proactor reset 10054 от закрытого
+  browser/SSE socket; другие asyncio exceptions не подавляются.
+
+### Проверено
+
+- Регрессии подтверждают неизменность исходного checkpoint, safe terminal
+  replay/status, error classification и узкую фильтрацию WinError 10054.
+- На реальном thread `web` transient model input уменьшен с 452 525 до
+  154 874 символов; 67 старых ToolMessage компактированы, original state не
+  изменён.
+- Полные offline/package/live evidence приведены в `IMPLEMENTATION_STATUS.md`.
+
 ## [0.16.0] — 2026-08-29
 
 ### Добавлено

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,9 +10,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from context_agent.config import AppConfig, ProviderConfig
+from context_agent.diagnostics import DiagnosticStore
 from context_agent.errors import AgentError
 from context_agent.project_audit import ProjectAuditStore
-from context_agent.web import create_app
+from context_agent.web import (
+    _agent_failure_code,
+    _is_benign_windows_pipe_reset,
+    create_app,
+)
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -281,6 +287,205 @@ def test_expected_agent_error_has_safe_operator_guidance(
 
     assert "Проверьте их live-статус" in events.text
     assert "private provider detail" not in events.text
+
+
+def test_failed_task_keeps_sanitized_terminal_status_and_replays_sse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingRuntime:
+        def __enter__(self) -> _FailingRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AgentError("maximum context length exceeded; PRIVATE_PROVIDER_DETAIL")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _FailingRuntime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={"query": "test", "thread_id": "terminal-error"},
+        headers={"x-csrf-token": csrf},
+    )
+    task_id = started.json()["task_id"]
+    first_stream = client.get(f"/api/events/{task_id}")
+    status = client.get(f"/api/tasks/{task_id}")
+    replay = client.get(f"/api/events/{task_id}")
+
+    assert '"error_type": "context_window_exceeded"' in first_stream.text
+    assert status.json()["status"] == "failed"
+    assert status.json()["terminal"]["error_type"] == "context_window_exceeded"
+    assert "event: failed" in replay.text
+    assert "PRIVATE_PROVIDER_DETAIL" not in first_stream.text + replay.text
+
+
+def test_terminal_task_replays_after_web_process_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingRuntime:
+        def __enter__(self) -> _FailingRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AgentError("provider timeout PRIVATE_RESTART_DETAIL")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _FailingRuntime(),
+    )
+    config = _config(tmp_path)
+    first_app = create_app(config, (_provider(),))
+    with TestClient(first_app) as first:
+        csrf = str(first.get("/api/runtime").json()["csrf_token"])
+        started = first.post(
+            "/api/chat",
+            json={"query": "restart", "thread_id": "restart-failure"},
+            headers={"x-csrf-token": csrf},
+        )
+        task_id = str(started.json()["task_id"])
+        assert "event: failed" in first.get(f"/api/events/{task_id}").text
+
+    second_app = create_app(config, (_provider(),))
+    with TestClient(second_app) as second:
+        status = second.get(f"/api/tasks/{task_id}")
+        replay = second.get(f"/api/events/{task_id}")
+
+    assert status.status_code == 200
+    assert status.json()["status"] == "failed"
+    assert status.json()["terminal"]["request_id"] == task_id
+    assert status.json()["terminal"]["retryable"] is True
+    assert "event: failed" in replay.text
+    assert "PRIVATE_RESTART_DETAIL" not in replay.text
+
+
+def test_diagnostic_api_hides_query_by_default_and_purges_explicit_id(
+    tmp_path: Path,
+) -> None:
+    fixture_key = "sk-" + "proj-" + "hidden-fixture-58213"
+    config = _config(tmp_path)
+    config.prepare_directories()
+    with DiagnosticStore(config.diagnostics_database) as store:
+        request_id = store.start_request(
+            query=f"FAILED_API_58213 OPENAI_API_KEY={fixture_key}",
+            thread_id="api-failure",
+            operation_kind="ask",
+            source="web",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            request_id="diagnostic-api-request",
+        )
+        assert request_id is not None
+        store.fail_request(
+            request_id,
+            exc=TimeoutError(f"timeout {fixture_key}"),
+            provider_attempts=[],
+            tool_audit=[],
+            duration_ms=1,
+            rollback_attempted=True,
+            rollback_success=True,
+            rollback_checkpoint_rows=1,
+            rollback_write_rows=1,
+            filesystem_side_effects=False,
+        )
+
+    client, csrf, _config_value = _client(tmp_path)
+    listing = client.get("/api/diagnostics")
+    details = client.get("/api/diagnostics/diagnostic-api-request")
+    disclosed = client.get("/api/diagnostics/diagnostic-api-request?include_query=true")
+    purged = client.request(
+        "DELETE",
+        "/api/diagnostics",
+        json={"confirm": "PURGE", "request_id": "diagnostic-api-request"},
+        headers={"x-csrf-token": csrf},
+    )
+
+    combined = listing.text + details.text + disclosed.text
+    assert listing.status_code == 200
+    assert "query" not in details.json()["item"]
+    assert "FAILED_API_58213" in disclosed.json()["item"]["query"]
+    assert "hidden-fixture-58213" not in combined
+    assert purged.json()["deleted"] == 1
+
+
+def test_structured_web_log_contains_safe_correlation_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingRuntime:
+        def __enter__(self) -> _FailingRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AgentError("SECRET_LOG_DETAIL_75291")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _FailingRuntime(),
+    )
+    client, csrf, config = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={"query": "log", "thread_id": "structured-log"},
+        headers={"x-csrf-token": csrf},
+    )
+    task_id = str(started.json()["task_id"])
+    client.get(f"/api/events/{task_id}")
+    log = (config.data_dir / "context-agent-server.jsonl").read_text(encoding="utf-8")
+
+    record = json.loads(log.splitlines()[-1])
+    assert record["event_code"] == "provider_chain_failed"
+    assert record["fields"]["task_id"] == task_id
+    assert "SECRET_LOG_DETAIL_75291" not in log
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (AgentError("credit_balance_exhausted"), "quota_exhausted"),
+        (AgentError("RateLimitError: rate limit"), "rate_limited"),
+        (AgentError("GraphRecursionError"), "agent_step_limit"),
+        (AgentError("unexpected provider failure"), "provider_chain_failed"),
+    ],
+)
+def test_agent_failure_classification_is_stable(
+    error: AgentError,
+    code: str,
+) -> None:
+    assert _agent_failure_code(error) == code
+
+
+def test_only_known_windows_proactor_reset_is_benign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset = ConnectionResetError("closed")
+    monkeypatch.setattr(reset, "winerror", 10054, raising=False)
+    monkeypatch.setattr("context_agent.web.os.name", "nt")
+    known = {
+        "exception": reset,
+        "message": (
+            "Exception in callback "
+            "_ProactorBasePipeTransport._call_connection_lost(None)"
+        ),
+    }
+
+    assert _is_benign_windows_pipe_reset(known)
+    assert not _is_benign_windows_pipe_reset(
+        {"exception": reset, "message": "unrelated network operation"}
+    )
 
 
 def test_context_index_uses_virtual_workspace_root_and_reports_result(

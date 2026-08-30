@@ -10,6 +10,10 @@ __pycache__/
 .coverage
 htmlcov/
 .agent_data/
+diagnostics.sqlite3*
+context-agent-server.jsonl*
+diagnostic-export*.json
+.diagnostic-exports/
 agent_workspace/
 langchain-master-v0/
 dist/

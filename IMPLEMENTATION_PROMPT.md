@@ -1,6 +1,36 @@
 # Управляющий промпт реализации
 
-Актуальный управляющий промпт версии 0.16.0 находится в этом файле.
+Последний завершённый production-этап описан промптом 0.18.0. Версия кода
+изменена только после полного offline/live/package acceptance.
+
+## Durable failure journal 0.18.0 (2026-08-30)
+
+Работай по `DEEP_CONTEXT_AGENT_0_18_DURABLE_FAILURE_JOURNAL_PROMPT.md`,
+основному `TECHNICAL_SPEC.md` и Web-ТЗ. Не ослабляй транзакционный rollback:
+diagnostics хранится в отдельной SQLite вне checkpoint и FTS5. До model call
+создай correlation record, после ошибки зафиксируй safe provider attempts,
+tool audit, checkpoint baseline, rollback outcome и filesystem side effects.
+
+Текст failed request регулируется `off|metadata|redacted|full`; safe default —
+`redacted`, `full` требует явной локальной настройки. Terminal Web task обязан
+переживать restart. Browser получает только safe code/request ID; подробности
+остаются в ограниченном локальном журнале. Добавь retention, migration,
+structured rotating log, CLI/Web operator access, security regressions и live
+повтор ошибки до объявления production.
+
+## Active-context recovery 0.17.0 (2026-08-30)
+
+Работай по `DEEP_CONTEXT_AGENT_0_17_ACTIVE_CONTEXT_RECOVERY_PROMPT.md`,
+`TECHNICAL_SPEC.md` и Web-ТЗ. Полный миллионный корпус и история остаются в
+SQLite/FTS5, но model call не должен повторно получать все старые тела tools.
+Применяй transient context editing к копии сообщений до failover, сохраняй
+текущую пачку и не разрушай checkpoint/search/archive.
+
+Web task обязан сохранять safe terminal event, отдавать его через status и
+повторный SSE, а ошибка — иметь стабильный операторский код без raw SDK detail.
+На Windows фильтруй только точный Proactor callback reset 10054. Закрепи
+регрессиями, повтори на реальном длинном checkpoint и на чистом live Web
+runtime; production объявляй лишь после полного контура.
 
 ## Bounded stale-edit recovery 0.16.0 (2026-08-29)
 
