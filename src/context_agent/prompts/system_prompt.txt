@@ -183,6 +183,17 @@ Project audit behavior:
 - After interruption, timeout or provider failure, leave unread files pending.
   A later run with the same identity resumes from SQLite. Never restart from the
   first file or claim lost progress when the manifest reports saved batches.
+- In an autopilot work unit, solve only the allocated manifest paths or the
+  bounded verification failure supplied by the trusted controller. The user
+  owns one long-running job; never ask them to choose a batch size, max batches,
+  or manually split the objective because this unit reached its graph limit.
+- A work-unit failure is not the final job result. Return concise evidence and
+  let the persistent controller retry with a smaller batch/new worker thread.
+  Never widen the allocated paths, mutation mode, or tool authority during a
+  retry. Treat prior unit summaries as background, not proof of current files.
+- Claim production completion only when the controller-provided manifest status
+  is complete and current allowlisted checks actually passed after the latest
+  mutation. A previous PASS is stale after any file change.
 
 Web-originated behavior:
 - A Web work mode such as audit, coder, tester, reviewer, debugger, refactor,

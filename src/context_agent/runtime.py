@@ -34,6 +34,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from context_agent import __version__
+from context_agent.autopilot import AutopilotProgress, AutopilotStore
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore, SearchHit
 from context_agent.diagnostics import (
@@ -215,6 +216,7 @@ _BUDGET_COUNT_TOKEN = (
 _AUDIT_METADATA_KEY = "context_agent_audit"
 _MAX_AUDIT_HASH_BYTES = 16 * 1024 * 1024
 _PROJECT_AUDIT_BATCH_MARKER = "<project_audit_batch>"
+_AUTOPILOT_WORK_UNIT_MARKER = "<autopilot_work_unit>"
 _BROAD_PROJECT_AUDIT_PATTERN = re.compile(
     r"(?isu)(?:"
     r"(?:\b(?:full|complete|entire|whole|all)\b|пол(?:ный|ностью)|весь|всю|все)"
@@ -229,6 +231,15 @@ _BROAD_PROJECT_SCOPE_PATTERN = re.compile(
     r"(?iu)(?:\b(?:project|repository|repo|codebase|workspace|all\s+files)\b|"
     r"проект|репозитор|кодов\w*\s+баз|рабоч\w*\s+(?:каталог|директор)|"
     r"все\s+файл|всю\s+директор|весь\s+каталог)"
+)
+_AUTOPILOT_ACTION_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:implement|fix|repair|complete|deliver|build|test)\b|"
+    r"реализ|исправ|устран|выполн|доработ|довед|протест|сделай|создай)"
+)
+_AUTOPILOT_COMPLEXITY_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:specification|requirements|production|tests?|modules?|"
+    r"end[- ]to[- ]end)\b|технич\w*\s+задан|\bтз\b|промп?т|продакшн|"
+    r"тест|модул|все\s+пункт|по\s+пункт)"
 )
 
 
@@ -2354,6 +2365,16 @@ def is_broad_project_audit_request(query: str) -> bool:
     )
 
 
+def is_long_running_project_request(query: str) -> bool:
+    """Detect a project objective that should become a persistent Web job."""
+
+    return is_broad_project_audit_request(query) or bool(
+        _BROAD_PROJECT_SCOPE_PATTERN.search(query)
+        and _AUTOPILOT_ACTION_PATTERN.search(query)
+        and _AUTOPILOT_COMPLEXITY_PATTERN.search(query)
+    )
+
+
 def normalize_virtual_path(path: str) -> str:
     """Normalize a virtual workspace path for exact comparisons."""
 
@@ -2771,6 +2792,7 @@ class AgentRuntime:
         self.project_audit_store = ProjectAuditStore(
             self.app_config.project_audit_database
         )
+        self.autopilot_store = AutopilotStore(self.app_config.autopilot_database)
         self.project_check_runner = ProjectCheckRunner(
             workspace=self.app_config.workspace,
             timeout_seconds=self.app_config.project_check_timeout_seconds,
@@ -3095,6 +3117,7 @@ class AgentRuntime:
         progress_callback: Callable[[AuditProgress, int, int], None] | None = None,
         diagnostic_source: str = "cli",
         diagnostic_task_id: str | None = None,
+        worker_thread_id: str | None = None,
     ) -> str:
         """Run or resume a bounded, evidence-backed project audit."""
 
@@ -3149,7 +3172,7 @@ class AgentRuntime:
             if batch is None:
                 progress = self.project_audit_store.progress(progress.run_id)
                 break
-            batch_thread_id = (
+            batch_thread_id = worker_thread_id or (
                 f"{clean_thread_id}:audit:{progress.run_id}:{batch.number}"
             )
             request = _build_project_audit_batch_request(
@@ -3234,6 +3257,551 @@ class AgentRuntime:
             response += "\n" + report_note
         return response
 
+    def run_autopilot_job(
+        self,
+        objective: str,
+        *,
+        thread_id: str = "default",
+        allow_write: bool = False,
+        include_patterns: Sequence[str] | None = None,
+        exclude_patterns: Sequence[str] | None = None,
+        report_file: Path | None = None,
+        progress_callback: Callable[
+            [AutopilotProgress, AuditProgress | None, str], None
+        ]
+        | None = None,
+        diagnostic_source: str = "cli",
+        diagnostic_task_id: str | None = None,
+    ) -> str:
+        """Run one user objective as durable, adaptively sized work units."""
+
+        clean_objective = objective.strip()
+        clean_thread_id = thread_id.strip()
+        if not clean_objective:
+            raise ValueError("Autopilot objective cannot be empty")
+        if not clean_thread_id:
+            raise ValueError("thread_id cannot be empty")
+        selected_include = tuple(
+            self.app_config.audit_include
+            if include_patterns is None
+            else include_patterns
+        )
+        selected_exclude = tuple(
+            self.app_config.audit_exclude
+            if exclude_patterns is None
+            else exclude_patterns
+        )
+        if len(selected_include) > 100 or len(selected_exclude) > 100:
+            raise ValueError("Autopilot include/exclude supports at most 100 patterns")
+
+        job_progress, lease = self.autopilot_store.start_or_resume(
+            thread_id=clean_thread_id,
+            objective=clean_objective,
+            workspace=self.app_config.workspace,
+            allow_write=allow_write,
+            batch_size=self.app_config.audit_batch_size,
+            include_patterns=selected_include,
+            exclude_patterns=selected_exclude,
+            lease_seconds=self.app_config.autopilot_lease_seconds,
+        )
+        if job_progress.status == "complete":
+            if report_file is not None:
+                details = self.autopilot_store.details(
+                    job_progress.job_id, unit_limit=1
+                )
+                report_file.parent.mkdir(parents=True, exist_ok=True)
+                report_file.write_text(
+                    str(details.get("report") or "") + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+            return self._format_autopilot_response(job_progress)
+
+        rules = AuditSelectionRules(
+            include=selected_include,
+            exclude=selected_exclude,
+        )
+        audit_progress = self.project_audit_store.start_or_resume(
+            thread_id=clean_thread_id,
+            objective=clean_objective,
+            workspace=self.app_config.workspace,
+            batch_size=job_progress.batch_size,
+            allow_write=allow_write,
+            selection_rules=rules,
+        )
+        self.autopilot_store.set_audit_run(lease, audit_progress.run_id)
+        self._emit_autopilot_progress(
+            progress_callback,
+            self.autopilot_store.progress(lease.job_id),
+            audit_progress,
+            "started",
+        )
+        consecutive_failures = 0
+
+        for _ in range(self.app_config.autopilot_max_work_units):
+            job_progress = self.autopilot_store.progress(lease.job_id)
+            audit_progress = self.project_audit_store.progress(audit_progress.run_id)
+            if job_progress.requested_status in {"paused", "cancelled"}:
+                job_progress = self.autopilot_store.honor_requested_control(lease)
+                self._emit_autopilot_progress(
+                    progress_callback,
+                    job_progress,
+                    audit_progress,
+                    job_progress.status,
+                )
+                return self._format_autopilot_response(job_progress, audit_progress)
+            if job_progress.status in {"paused", "cancelled"}:
+                return self._format_autopilot_response(job_progress, audit_progress)
+            if audit_progress.complete:
+                break
+            self.autopilot_store.renew_lease(
+                lease,
+                self.app_config.autopilot_lease_seconds,
+            )
+            unit_id, sequence, unit_thread_id = self.autopilot_store.begin_unit(
+                lease,
+                phase="audit",
+                batch_size=job_progress.batch_size,
+            )
+            before_reviewed = audit_progress.reviewed + audit_progress.partial
+            try:
+                answer = self.run_project_audit(
+                    clean_objective,
+                    thread_id=clean_thread_id,
+                    max_batches=1,
+                    allow_write=allow_write,
+                    include_patterns=selected_include,
+                    exclude_patterns=selected_exclude,
+                    batch_size=job_progress.batch_size,
+                    diagnostic_source=diagnostic_source,
+                    diagnostic_task_id=diagnostic_task_id,
+                    worker_thread_id=unit_thread_id,
+                )
+            except AgentError as exc:
+                error_code = classify_failure(exc)
+                self.autopilot_store.fail_unit(
+                    lease,
+                    unit_id,
+                    error_code=error_code,
+                    summary=f"Work unit {sequence} failed safely.",
+                )
+                consecutive_failures += 1
+                adaptive = error_code in {
+                    "agent_step_limit",
+                    "context_window_exceeded",
+                }
+                transient = error_code in {
+                    "provider_timeout",
+                    "provider_unavailable",
+                    "rate_limited",
+                    "provider_chain_failed",
+                }
+                if adaptive or (
+                    transient
+                    and consecutive_failures <= self.app_config.autopilot_retry_attempts
+                ):
+                    next_batch_size = (
+                        max(1, job_progress.batch_size // 2)
+                        if adaptive
+                        else job_progress.batch_size
+                    )
+                    if (
+                        next_batch_size == 1
+                        and job_progress.batch_size == 1
+                        and consecutive_failures
+                        > self.app_config.autopilot_retry_attempts
+                    ):
+                        return self._block_autopilot(
+                            lease,
+                            audit_progress,
+                            error_code="unit_retry_exhausted",
+                            safe_message=(
+                                "Один файл повторно исчерпал безопасный лимит; "
+                                "прогресс сохранён."
+                            ),
+                            callback=progress_callback,
+                        )
+                    job_progress = self.autopilot_store.replan(
+                        lease,
+                        batch_size=next_batch_size,
+                        error_code=error_code,
+                        safe_message=(
+                            "Внутренняя единица перезапланирована и будет "
+                            "повторена в новом потоке."
+                        ),
+                    )
+                    if job_progress.replans > self.app_config.autopilot_max_replans:
+                        return self._block_autopilot(
+                            lease,
+                            audit_progress,
+                            error_code="replan_limit_exhausted",
+                            safe_message=(
+                                "Исчерпаны безопасные стратегии автоматического "
+                                "перепланирования; прогресс сохранён."
+                            ),
+                            callback=progress_callback,
+                        )
+                    self.project_audit_store.start_or_resume(
+                        thread_id=clean_thread_id,
+                        objective=clean_objective,
+                        workspace=self.app_config.workspace,
+                        batch_size=next_batch_size,
+                        allow_write=allow_write,
+                        selection_rules=rules,
+                    )
+                    self._emit_autopilot_progress(
+                        progress_callback,
+                        job_progress,
+                        audit_progress,
+                        "replanned",
+                    )
+                    continue
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code=error_code,
+                    safe_message=(
+                        "Внешний провайдер или его учётная запись требуют "  # noqa: RUF001
+                        "вмешательства оператора; прогресс сохранён."
+                    ),
+                    callback=progress_callback,
+                )
+            except Exception:
+                self.autopilot_store.fail_unit(
+                    lease,
+                    unit_id,
+                    error_code="internal_work_unit_failed",
+                    summary=f"Work unit {sequence} failed at an internal boundary.",
+                )
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code="internal_work_unit_failed",
+                    safe_message=(
+                        "Внутренняя единица завершилась непредвиденной ошибкой; "
+                        "прогресс и диагностика сохранены."
+                    ),
+                    callback=progress_callback,
+                )
+
+            audit_progress = self.project_audit_store.progress(audit_progress.run_id)
+            after_reviewed = audit_progress.reviewed + audit_progress.partial
+            processed = max(0, after_reviewed - before_reviewed)
+            self.autopilot_store.complete_unit(
+                lease,
+                unit_id,
+                f"Worker {unit_thread_id} processed {processed} file(s). "
+                f"{answer[:1_000]}",
+            )
+            if processed == 0:
+                consecutive_failures += 1
+                next_batch_size = max(1, job_progress.batch_size // 2)
+                if (
+                    next_batch_size == 1
+                    and job_progress.batch_size == 1
+                    and consecutive_failures > self.app_config.autopilot_retry_attempts
+                ):
+                    return self._block_autopilot(
+                        lease,
+                        audit_progress,
+                        error_code="no_verified_progress",
+                        safe_message=(
+                            "Модель не предоставила проверяемого файлового "
+                            "прогресса после ограниченных повторов."
+                        ),
+                        callback=progress_callback,
+                    )
+                job_progress = self.autopilot_store.replan(
+                    lease,
+                    batch_size=next_batch_size,
+                    error_code="no_verified_progress",
+                    safe_message=(
+                        "Пачка не дала ToolMessage-доказательств и уменьшена."
+                    ),
+                )
+                if job_progress.replans > self.app_config.autopilot_max_replans:
+                    return self._block_autopilot(
+                        lease,
+                        audit_progress,
+                        error_code="replan_limit_exhausted",
+                        safe_message=(
+                            "Исчерпаны безопасные стратегии автоматического "
+                            "перепланирования; прогресс сохранён."
+                        ),
+                        callback=progress_callback,
+                    )
+                self.project_audit_store.start_or_resume(
+                    thread_id=clean_thread_id,
+                    objective=clean_objective,
+                    workspace=self.app_config.workspace,
+                    batch_size=next_batch_size,
+                    allow_write=allow_write,
+                    selection_rules=rules,
+                )
+                event = "replanned"
+            else:
+                consecutive_failures = 0
+                event = "progress"
+            self._emit_autopilot_progress(
+                progress_callback,
+                self.autopilot_store.progress(lease.job_id),
+                audit_progress,
+                event,
+            )
+        else:
+            return self._block_autopilot(
+                lease,
+                audit_progress,
+                error_code="work_unit_limit_exhausted",
+                safe_message=(
+                    "Достигнут операторский предел work units; прогресс сохранён."
+                ),
+                callback=progress_callback,
+            )
+
+        if allow_write:
+            verification = self._run_autopilot_verification(
+                lease=lease,
+                objective=clean_objective,
+                callback=progress_callback,
+                audit_progress=audit_progress,
+                diagnostic_source=diagnostic_source,
+                diagnostic_task_id=diagnostic_task_id,
+            )
+            if verification is not None:
+                return verification
+
+        report = self.project_audit_store.render_report(
+            audit_progress.run_id,
+            "text",
+        ).replace(str(self.app_config.workspace), "/workspace")
+        if allow_write:
+            details = self.autopilot_store.details(lease.job_id, unit_limit=1)
+            raw_results = details.get("verification_results")
+            results = raw_results if isinstance(raw_results, list) else []
+            verification_lines = ["", "Production verification:"]
+            verification_lines.extend(
+                f"- {item.get('check')}: {item.get('status')}"
+                for item in results
+                if isinstance(item, Mapping)
+            )
+            report += "\n".join(verification_lines)
+        job_progress = self.autopilot_store.mark_complete(lease, report)
+        if report_file is not None:
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_file.write_text(report + "\n", encoding="utf-8", newline="\n")
+        self._emit_autopilot_progress(
+            progress_callback,
+            job_progress,
+            audit_progress,
+            "complete",
+        )
+        return self._format_autopilot_response(job_progress, audit_progress)
+
+    def _run_autopilot_verification(
+        self,
+        *,
+        lease: Any,
+        objective: str,
+        callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
+        audit_progress: AuditProgress,
+        diagnostic_source: str,
+        diagnostic_task_id: str | None,
+    ) -> str | None:
+        """Run allowlisted checks and bounded repair turns until they pass."""
+
+        for repair_cycle in range(self.app_config.autopilot_repair_cycles + 1):
+            current = self.autopilot_store.progress(lease.job_id)
+            unit_id, _, _ = self.autopilot_store.begin_unit(
+                lease,
+                phase="verify",
+                batch_size=current.batch_size,
+            )
+            results = self.project_check_runner.run()
+            serialized: list[dict[str, object]] = [
+                {
+                    "check": result.check,
+                    "status": result.status,
+                    "return_code": result.return_code,
+                    "duration_seconds": round(result.duration_seconds, 3),
+                    "output": result.output.replace(
+                        str(self.app_config.workspace),
+                        "/workspace",
+                    )[:4_000],
+                }
+                for result in results
+            ]
+            passed = bool(results) and all(
+                result.status == "passed" for result in results
+            )
+            self.autopilot_store.complete_unit(
+                lease,
+                unit_id,
+                "Production checks passed."
+                if passed
+                else "Production checks found failures.",
+            )
+            job_progress = self.autopilot_store.record_verification(
+                lease,
+                status="passed" if passed else "failed",
+                results=serialized,
+            )
+            self._emit_autopilot_progress(
+                callback,
+                job_progress,
+                audit_progress,
+                "verification",
+            )
+            if passed:
+                return None
+            if repair_cycle >= self.app_config.autopilot_repair_cycles:
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code="verification_failed",
+                    safe_message=(
+                        "Production checks остаются красными после ограниченных "
+                        "repair cycles; подробности сохранены в job."
+                    ),
+                    callback=callback,
+                )
+
+            repair_id, sequence, repair_thread = self.autopilot_store.begin_unit(
+                lease,
+                phase="repair",
+                batch_size=job_progress.batch_size,
+            )
+            repair_request = self._build_autopilot_repair_request(
+                objective,
+                serialized,
+                repair_cycle + 1,
+            )
+            try:
+                answer = self.ask(
+                    repair_request,
+                    thread_id=repair_thread,
+                    auto_context=False,
+                    diagnostic_source=diagnostic_source,
+                    diagnostic_task_id=diagnostic_task_id,
+                )
+            except AgentError as exc:
+                code = classify_failure(exc)
+                self.autopilot_store.fail_unit(
+                    lease,
+                    repair_id,
+                    error_code=code,
+                    summary=f"Repair unit {sequence} failed safely.",
+                )
+                if code not in {
+                    "agent_step_limit",
+                    "context_window_exceeded",
+                    "provider_timeout",
+                    "provider_unavailable",
+                    "rate_limited",
+                }:
+                    return self._block_autopilot(
+                        lease,
+                        audit_progress,
+                        error_code=code,
+                        safe_message=(
+                            "Repair unit остановлена внешней ошибкой; прогресс "
+                            "и результаты проверок сохранены."
+                        ),
+                        callback=callback,
+                    )
+                continue
+            self.autopilot_store.complete_unit(
+                lease,
+                repair_id,
+                f"Repair worker {repair_thread} completed. {answer[:1_000]}",
+            )
+        return None
+
+    @staticmethod
+    def _build_autopilot_repair_request(
+        objective: str,
+        results: Sequence[Mapping[str, object]],
+        cycle: int,
+    ) -> str:
+        bounded = json.dumps(results, ensure_ascii=False, sort_keys=True)[:12_000]
+        return (
+            f"{_AUTOPILOT_WORK_UNIT_MARKER}\n"
+            f'{{"phase":"repair","cycle":{cycle},'
+            f'"mutation_authorized":true}}\n'
+            "</autopilot_work_unit>\n\n"
+            "Это ограниченная repair unit доверенного persistent controller. "
+            "Исправь только подтверждённые текущими проверками причины внутри "
+            "/workspace/. Сначала прочитай каждый изменяемый файл; не удаляй "
+            "данные, секреты или корень. Не запускай произвольный shell.\n\n"  # noqa: RUF001
+            f"Исходная цель:\n{objective[:4_000]}\n\n"
+            f"Текущие результаты allowlisted checks:\n{bounded}"
+        )
+
+    def _block_autopilot(
+        self,
+        lease: Any,
+        audit_progress: AuditProgress,
+        *,
+        error_code: str,
+        safe_message: str,
+        callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
+    ) -> str:
+        report = self.project_audit_store.render_report(
+            audit_progress.run_id,
+            "text",
+        ).replace(str(self.app_config.workspace), "/workspace")
+        progress = self.autopilot_store.mark_blocked(
+            lease,
+            error_code=error_code,
+            safe_message=safe_message,
+            report=report,
+        )
+        self._emit_autopilot_progress(
+            callback,
+            progress,
+            audit_progress,
+            "blocked",
+        )
+        return self._format_autopilot_response(progress, audit_progress, safe_message)
+
+    @staticmethod
+    def _emit_autopilot_progress(
+        callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
+        job_progress: AutopilotProgress,
+        audit_progress: AuditProgress | None,
+        event: str,
+    ) -> None:
+        if callback is not None:
+            callback(job_progress, audit_progress, event)
+
+    @staticmethod
+    def _format_autopilot_response(
+        progress: AutopilotProgress,
+        audit: AuditProgress | None = None,
+        message: str = "",
+    ) -> str:
+        parts = [
+            f"Autopilot job {progress.status}.",
+            f"job_id={progress.job_id}",
+            f"phase={progress.phase}",
+            f"mode={progress.mode}",
+            f"units={progress.completed_units}/{progress.attempts}",
+            f"replans={progress.replans}",
+            f"verification={progress.verification_status}",
+        ]
+        if audit is not None:
+            parts.extend(
+                (
+                    f"files={audit.reviewed + audit.partial}/{audit.total}",
+                    f"pending={audit.pending}",
+                )
+            )
+        if progress.last_error_code:
+            parts.append(f"error_code={progress.last_error_code}")
+        if message:
+            parts.append(message)
+        return "\n".join(parts)
+
     def ask(
         self,
         query: str,
@@ -3291,6 +3859,7 @@ class AgentRuntime:
             return answer
         if (
             _PROJECT_AUDIT_BATCH_MARKER not in clean_query
+            and _AUTOPILOT_WORK_UNIT_MARKER not in clean_query
             and is_broad_project_audit_request(clean_query)
         ):
             return self.run_project_audit(
@@ -3457,6 +4026,7 @@ class AgentRuntime:
     def close(self) -> None:
         """Close persistent resources owned by this runtime."""
         if not self._closed:
+            self.autopilot_store.close()
             self.project_audit_store.close()
             self.context_store.close()
             self.diagnostic_store.close()

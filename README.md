@@ -76,6 +76,12 @@ AGENT_AUDIT_MAX_READS_PER_FILE=4
 AGENT_AUDIT_INCLUDE=
 AGENT_AUDIT_EXCLUDE=
 AGENT_AUDIT_MAX_READS_PER_FILE=4
+# Внутренние safety ceilings Autopilot; пользователю не нужно подбирать их:
+AGENT_AUTOPILOT_MAX_WORK_UNITS=200
+AGENT_AUTOPILOT_MAX_REPLANS=12
+AGENT_AUTOPILOT_RETRY_ATTEMPTS=3
+AGENT_AUTOPILOT_REPAIR_CYCLES=3
+AGENT_AUTOPILOT_LEASE_SECONDS=900
 AGENT_PROJECT_CHECK_TIMEOUT_SECONDS=300
 AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS=20000
 AGENT_FAILURE_LOG_MODE=redacted
@@ -242,6 +248,16 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 # Проверка persisted-прогресса не вызывает LLM
 .\.venv\Scripts\context-agent.exe audit-status --run-id RUN_ID --json
 
+# Рекомендуемый режим большой задачи: автоматическое дробление, resume,
+# проверки и итоговый отчёт. Batch size/max batches вводить не нужно.
+.\.venv\Scripts\context-agent.exe --thread ozon-production job `
+  --file .\ozon-project-improvement-prompt.txt `
+  --allow-write `
+  --report-file .\reports\ozon-production.txt
+
+# Проверка сохранённой job без вызова LLM
+.\.venv\Scripts\context-agent.exe job-status --job-id JOB_ID --json
+
 # Локальный Web UI (браузер автоматически не открывается)
 .\.venv\Scripts\context-agent.exe web --host 127.0.0.1 --port 8765
 ```
@@ -255,11 +271,19 @@ Get-Content .\prompt.txt -Raw | .\.venv\Scripts\context-agent.exe --provider ope
 
 Обычный широкий запрос `ask` автоматически переводится в пакетный режим и
 обрабатывает не более `AGENT_AUDIT_MAX_BATCHES_PER_REQUEST` за процесс. Команда
-`audit` предназначена для явного продолжительного запуска; повтор с тем же
+`audit` сохранена как низкоуровневый операторский режим; повтор с тем же
 `thread ID`, workspace и неизменной целью продолжает сохранённый manifest.
 `--max-batches 100` — жёсткий предел, а не обещание модели. Текущий прогресс
 доступен LLM через `project_audit_status` и физически хранится в
 `AGENT_DATA_DIR/project_audit.sqlite3`.
+
+Для обычной большой задачи используйте `job`. Контроллер хранит job/work units
+в `AGENT_DATA_DIR/autopilot.sqlite3`, обрабатывает по одной manifest batch,
+фиксирует ToolMessage evidence и при `agent_step_limit`/переполнении контекста
+автоматически уменьшает внутреннюю пачку и продолжает в новом worker thread.
+При явном `--allow-write` после файловых изменений выполняются фиксированные
+Ruff/format/pytest-проверки и ограниченный repair/recheck. Поэтому безопасный
+лимит одного graph остаётся защитой, но больше не требует вручную делить задачу.
 Слова «исправь», `fix` или `update` внутри цели никогда не дают право записи:
 без `--allow-write` middleware блокирует все mutating tools. Режим входит в
 identity запуска, поэтому read-only и allow-write используют разные manifests.
@@ -399,7 +423,7 @@ SaaS, tenant isolation и совместное редактирование не
 - Явно оборванная изменяющая команда отклоняется до модели и tools; отсутствующее
   содержимое не угадывается.
 
-Версия 0.18.0 предназначена для production-эксплуатации как локальный
+Версия 0.19.0 предназначена для production-эксплуатации как локальный
 однопользовательский CLI/Web UI в границах `AGENT_WORKSPACE`. Для
 многопользовательского сервиса добавьте
 процессную изоляцию workspace, аутентификацию, лимиты запросов, централизованные

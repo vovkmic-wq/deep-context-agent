@@ -330,6 +330,11 @@ class AppConfig:
     audit_max_reads_per_file: int = 4
     audit_include: tuple[str, ...] = ()
     audit_exclude: tuple[str, ...] = ()
+    autopilot_max_work_units: int = 200
+    autopilot_max_replans: int = 12
+    autopilot_retry_attempts: int = 3
+    autopilot_repair_cycles: int = 3
+    autopilot_lease_seconds: int = 900
     project_check_timeout_seconds: int = 300
     project_check_output_max_chars: int = 20_000
     failure_log_mode: str = "redacted"
@@ -399,6 +404,26 @@ class AppConfig:
                 raise ConfigurationError(
                     f"{name} supports at most 100 patterns of 500 characters"
                 )
+        if not 1 <= self.autopilot_max_work_units <= 10_000:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_MAX_WORK_UNITS must be between 1 and 10000"
+            )
+        if not 1 <= self.autopilot_max_replans <= 100:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_MAX_REPLANS must be between 1 and 100"
+            )
+        if not 1 <= self.autopilot_retry_attempts <= 20:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_RETRY_ATTEMPTS must be between 1 and 20"
+            )
+        if not 0 <= self.autopilot_repair_cycles <= 20:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_REPAIR_CYCLES must be between 0 and 20"
+            )
+        if not 30 <= self.autopilot_lease_seconds <= 3_600:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_LEASE_SECONDS must be between 30 and 3600"
+            )
         if not 10 <= self.project_check_timeout_seconds <= 3_600:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS must be between 10 and 3600"
@@ -444,6 +469,12 @@ class AppConfig:
         """Return the failure journal database outside LangGraph rollback."""
 
         return self.data_dir / "diagnostics.sqlite3"
+
+    @property
+    def autopilot_database(self) -> Path:
+        """Return the durable long-running job database path."""
+
+        return self.data_dir / "autopilot.sqlite3"
 
     @classmethod
     def from_env(
@@ -540,6 +571,31 @@ class AppConfig:
             ),
             audit_include=_pattern_setting(values, "AGENT_AUDIT_INCLUDE"),
             audit_exclude=_pattern_setting(values, "AGENT_AUDIT_EXCLUDE"),
+            autopilot_max_work_units=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_MAX_WORK_UNITS",
+                200,
+            ),
+            autopilot_max_replans=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_MAX_REPLANS",
+                12,
+            ),
+            autopilot_retry_attempts=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_RETRY_ATTEMPTS",
+                3,
+            ),
+            autopilot_repair_cycles=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_REPAIR_CYCLES",
+                3,
+            ),
+            autopilot_lease_seconds=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_LEASE_SECONDS",
+                300,
+            ),
             project_check_timeout_seconds=_int_setting(
                 values,
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS",

@@ -389,3 +389,25 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 8. Rollback использует secure checkpoint deletion и WAL truncate; browser/live
    acceptance дополнительно сканирует DB/WAL/JSONL/export побайтово, чтобы
    удалённый failed prompt не оставался физическим артефактом.
+
+### 13.12. Автопилот длительных задач / Long-running autopilot 0.19.0
+
+1. Раздел «Аудиты» становится «Автопилот / Autopilot»: оператор вводит цель,
+   выбирает read-only/allow-write и при необходимости include/exclude. Поля
+   batch size и max batches отсутствуют в основном UX.
+2. `POST /api/jobs` создаёт или возобновляет persistent job и возвращает
+   `job_id`, `task_id`, mode. `GET /api/jobs` и `/api/jobs/{id}` доступны без
+   LLM; control endpoints защищены CSRF/auth.
+3. SSE передаёт `job_progress`, `job_replanned`, `job_verification`, result и
+   terminal. После reconnect terminal и последний persistent progress доступны
+   через task/job status.
+4. Карточка показывает phase, reviewed/total, pending, attempts, replans,
+   внутренний current batch как диагностику и safe blocker. Raw exception,
+   credential, provider payload и физический путь запрещены.
+5. Pause/cancel вступают в силу между атомарными units. Resume не меняет
+   read-only/allow-write mode и продолжает тот же manifest/hash progress.
+6. После Web restart interrupted unit восстанавливается в pending; job можно
+   автоматически или одной кнопкой продолжить без повторного ввода цели.
+7. Browser acceptance воспроизводит прежний broad Ozon request: UI не требует
+   ручного деления, несколько work units видны в прогрессе, step-limit unit
+   вызывает replan, а terminal соответствует сохранённой SQLite job.

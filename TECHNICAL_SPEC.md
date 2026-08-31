@@ -676,6 +676,36 @@ Coding Plan пользователь явно задаёт
     страницы учитываются в `file_reads`, файл — в `partial`, а не `reviewed`.
 42. Повтор одинаковой audit-страницы отклоняется без backend read, но новая
     страница с другим offset выполняется и учитывается ровно один раз.
+43. Одна broad job проходит все manifest batches без ручных `max_batches` и не
+    возвращает пользователю просьбу самостоятельно разбить задачу.
+44. Искусственный `agent_step_limit` возвращает текущую batch в pending,
+    уменьшает batch size, создаёт новый worker thread и сохраняет уже reviewed.
+45. Повторный `agent_step_limit` на batch size 1 завершается bounded `blocked`
+    с safe code; SQLite progress и durable diagnostic остаются доступны.
+46. Restart процесса переводит незавершённую work unit в resumable состояние;
+    повторная команда с той же identity продолжает, а не создаёт дубликат.
+47. Allow-write job получает `complete` только после фактического PASS
+    allowlisted production checks; FAIL создаёт bounded repair/recheck cycle.
+48. CLI и Web не требуют пользовательского batch size. Web SSE повторно
+    воспроизводит job progress/terminal event после разрыва соединения.
+49. Read-only identity нельзя повысить до allow-write через resume; новый режим
+    имеет отдельную identity и требует явного trusted authorization.
+50. Job и work units изолированы по workspace; raw provider errors, secrets и
+    physical paths не попадают в API, SSE и итоговый компактный отчёт.
+
+## 7.13. Persistent autopilot jobs (0.19.0)
+
+Полный нормативный алгоритм, схема состояния, retry/split, verification/repair,
+CLI/Web контракт и live acceptance заданы в
+`DEEP_CONTEXT_AGENT_0_19_AUTOPILOT_ORCHESTRATOR_PROMPT.md`. Реализация обязана
+использовать существующие `ProjectAuditStore`, ToolMessage evidence,
+`ProjectCheckRunner`, diagnostics и provider failover. Параллельная обходная
+система чтения файлов, shell execution или browser-only state запрещены.
+
+SQLite `autopilot.sqlite3` хранится в `AGENT_DATA_DIR`. Один model graph является
+work unit, а не job. В prompt не помещается весь проект или история units:
+controller передаёт только manifest batch, применимые требования, summaries и
+bounded результат последней проверки.
 
 ## 8. Этапы
 
@@ -689,6 +719,10 @@ Coding Plan пользователь явно задаёт
 ## 9. Первичные источники
 
 - https://docs.langchain.com/oss/python/deepagents/overview
+- https://docs.langchain.com/oss/python/deepagents/context-engineering
+- https://docs.langchain.com/oss/python/langgraph/overview
+- https://docs.langchain.com/oss/python/langgraph/persistence
+- https://docs.langchain.com/oss/python/langgraph/thinking-in-langgraph
 - https://docs.langchain.com/oss/python/deepagents/backends
 - https://github.com/langchain-ai/langchain
 - https://developers.openai.com/api/reference/overview

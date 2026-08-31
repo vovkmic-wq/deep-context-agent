@@ -3,6 +3,41 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Persistent Autopilot 0.19.0 — 2026-08-31
+
+| Этап 0.19.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Root cause/context | Завершён | Graph recursion отделён от million-line retrieval; применены durable execution/context isolation patterns LangGraph/Deep Agents |
+| Durable job state | Завершён | `autopilot.sqlite3`, stable identity, lease, work units, pause/cancel/resume, WAL/migration |
+| Adaptive execution | Завершён | One batch/unit, new worker thread, split `2 → 1`, transient retry, bounded blocked states |
+| Verification/repair | Завершён | Fixed allowlisted checks, safe output, bounded repair/recheck, current PASS gate |
+| CLI/Web | Завершён | `job`, `job-status`, `/api/jobs`, SSE progress/replan/verification, no batch field, complex Web-chat routing |
+| Security | Завершён | Trusted allow-write identity, workspace confinement, secret-free subprocess, physical path hidden in Web DTO |
+| Tests/package/live | Завершён | Полный Python/TypeScript/package-контур, реальный GLM job, restart/resume и Web API smoke PASS |
+
+Финальные evidence 0.19.0:
+
+- Ruff check/format, mypy, compileall и `pip check` — PASS; pytest — 242 passed,
+  1 planned Windows symlink skip; проверено 50 Python-файлов и 16 mypy source
+  files;
+- deterministic regression воспроизводит `GraphRecursionError`: batch
+  автоматически уменьшается `2 → 1`, два новых worker threads завершают
+  manifest без ручного продолжения;
+- TypeScript check, bundle regression и esbuild — PASS; production bundle
+  38 449 bytes;
+- `doctor --live` на `zhipu/glm-5.3` с резервным
+  `openai/gpt-5.6-sol` — `live_response=OK`;
+- первый реальный read-only job обработал три независимых файла и обнаружил
+  collision job/audit ID и physical path в отчёте; после исправления повторный
+  clean-DB job обработал 2/2 файла, получил разные job/audit IDs, завершился в
+  новом процессе со status `complete` и не раскрыл physical workspace;
+- Web API smoke на `127.0.0.1:8768`: health/runtime/index/jobs/details/report —
+  HTTP 200, версия 0.19.0, форма «Автопилот» присутствует, сохранённый job
+  доступен после restart, physical path отсутствует в DTO и отчёте;
+- wheel 0.19.0 содержит 25 файлов, запрещённые SQLite/JSONL/env artifacts
+  отсутствуют, изолированная target-install вернула 0.19.0; SHA-256
+  `10689C5EB6E895B2C280E5277ADBF0790749518F3D368701DF5C691C22E9140B`.
+
 ## Durable failure journal 0.18.0 — 2026-08-30
 
 | Этап 0.18.0 | Статус | Реализация/проверка |

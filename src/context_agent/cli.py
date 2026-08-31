@@ -14,6 +14,7 @@ from typing import Any, TextIO, cast
 
 from dotenv import load_dotenv
 
+from context_agent.autopilot import AutopilotProgress, AutopilotStore
 from context_agent.config import SUPPORTED_PROVIDERS, AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
 from context_agent.diagnostics import DiagnosticStore, configured_secret_values
@@ -112,6 +113,50 @@ def build_parser() -> argparse.ArgumentParser:
             "Without this flag every audit is read-only."
         ),
     )
+
+    job_parser = subparsers.add_parser(
+        "job",
+        help="Run one objective to completion with persistent adaptive work units.",
+    )
+    job_parser.add_argument(
+        "query",
+        nargs="?",
+        help="Job objective, or '-' to read it from stdin.",
+    )
+    job_parser.add_argument(
+        "--file",
+        type=Path,
+        help="Read one UTF-8 job objective from a file (max 2 MiB).",
+    )
+    job_parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Explicitly permit bounded changes inside AGENT_WORKSPACE.",
+    )
+    job_parser.add_argument(
+        "--report-file",
+        type=Path,
+        help="Write the final UTF-8 evidence report to this path.",
+    )
+    job_parser.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="Optional include glob; repeat the option for multiple patterns.",
+    )
+    job_parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help="Optional exclude glob; repeat the option for multiple patterns.",
+    )
+
+    job_status_parser = subparsers.add_parser(
+        "job-status",
+        help="Read persistent autopilot status without invoking an LLM.",
+    )
+    job_status_parser.add_argument("--job-id", required=True)
+    job_status_parser.add_argument("--json", action="store_true")
     audit_parser.add_argument(
         "--report-file",
         type=Path,
@@ -273,6 +318,7 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"workspace={app_config.workspace}")
     print(f"context_database={app_config.context_database}")
     print(f"project_audit_database={app_config.project_audit_database}")
+    print(f"autopilot_database={app_config.autopilot_database}")
     print(f"diagnostics_database={app_config.diagnostics_database}")
     print(f"failure_log_mode={app_config.failure_log_mode}")
     if app_config.failure_log_mode == "full":
@@ -283,6 +329,8 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"recursion_limit={app_config.recursion_limit}")
     print(f"audit_batch_size={app_config.audit_batch_size}")
     print(f"audit_max_reads_per_file={app_config.audit_max_reads_per_file}")
+    print(f"autopilot_max_work_units={app_config.autopilot_max_work_units}")
+    print(f"autopilot_max_replans={app_config.autopilot_max_replans}")
     print("audit_mode_default=read-only")
     print(
         "audit_include="
@@ -485,6 +533,55 @@ def _run_audit_status(args: argparse.Namespace, base_dir: Path) -> int:
     return 0
 
 
+def _run_job(args: argparse.Namespace, base_dir: Path) -> int:
+    def report_progress(
+        progress: AutopilotProgress,
+        audit: AuditProgress | None,
+        event: str,
+    ) -> None:
+        payload: dict[str, object] = {"event": event, **progress.as_dict()}
+        if audit is not None:
+            payload["audit"] = audit.as_dict()
+        print(
+            "JOB_PROGRESS " + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            flush=True,
+        )
+
+    with _runtime(args, base_dir) as runtime:
+        print(
+            runtime.run_autopilot_job(
+                resolve_ask_query(args),
+                thread_id=args.thread,
+                allow_write=args.allow_write,
+                include_patterns=args.include,
+                exclude_patterns=args.exclude,
+                report_file=args.report_file,
+                progress_callback=report_progress,
+            )
+        )
+    return 0
+
+
+def _run_job_status(args: argparse.Namespace, base_dir: Path) -> int:
+    config = _app_config(base_dir)
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(args.job_id)
+    if args.json:
+        print(json.dumps(details, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        progress = details["progress"]
+        if not isinstance(progress, dict):
+            raise ValueError("Stored autopilot progress is invalid")
+        print(
+            f"job_id={details['id']} status={details['status']} "
+            f"phase={details['phase']} mode={details['mode']} "
+            f"units={progress['completed_units']}/{progress['attempts']} "
+            f"replans={progress['replans']} "
+            f"verification={progress['verification_status']}"
+        )
+    return 0
+
+
 def _run_web(args: argparse.Namespace, base_dir: Path) -> int:
     loopback_hosts = {"127.0.0.1", "localhost", "::1"}
     if not 1 <= args.port <= 65_535:
@@ -662,6 +759,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "doctor": _run_doctor,
         "diagnostics": _run_diagnostics,
         "index": _run_index,
+        "job": _run_job,
+        "job-status": _run_job_status,
         "search": _run_search,
         "web": _run_web,
     }

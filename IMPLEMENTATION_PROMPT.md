@@ -342,6 +342,12 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
 16. После Ozon `GraphRecursionError` реализуй 0.12.0: manifest-backed batches,
     SHA resume, summaries/AST, безопасные project checks, настраиваемую recursion
     depth и отдельные короткие graph turns; повтори corpus и live-регрессии.
+17. После durable diagnostics 0.18.0 реализуй 0.19.0 по
+    `DEEP_CONTEXT_AGENT_0_19_AUTOPILOT_ORCHESTRATOR_PROMPT.md`: одна широкая
+    пользовательская задача становится persistent job; внутренний step limit
+    вызывает автоматическое сохранение, уменьшение batch и новый worker thread,
+    а не просьбу вручную делить задачу. Добавь CLI/Web lifecycle, crash resume,
+    проверку/repair loop и повтор прежнего live-сценария.
 
 Инженерные ограничения:
 
@@ -375,6 +381,14 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
 - явный exact-once контракт означает одну фактическую попытку: завершённый tool
   исключается из следующего model request, а устаревший повтор не исполняется;
 - не объявляй этап завершённым без команды или теста, подтверждающего результат.
+- не перекладывай на пользователя выбор batch size/max batches; это внутренняя
+  адаптивная политика persistent autopilot job;
+- `agent_step_limit` одной work unit не является терминальным результатом job:
+  сначала должны быть исчерпаны безопасные split/retry стратегии;
+- каждый повтор work unit использует новый namespaced thread ID, а завершённый
+  прогресс и ToolMessage evidence коммитятся атомарно до следующего шага;
+- allow-write, pause, resume и cancel берутся только из доверенных CLI/API полей,
+  не из текста задачи.
 
 Финальный результат: устанавливаемый Python-проект, рабочий CLI Deep Agent,
 пройденные тесты и заполненный `IMPLEMENTATION_STATUS.md` с трассировкой всех

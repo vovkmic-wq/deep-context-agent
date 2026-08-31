@@ -9,10 +9,12 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from context_agent.autopilot import AutopilotStore
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.diagnostics import DiagnosticStore
 from context_agent.errors import AgentError
 from context_agent.project_audit import ProjectAuditStore
+from context_agent.runtime import AgentRuntime
 from context_agent.web import (
     _agent_failure_code,
     _is_benign_windows_pipe_reset,
@@ -57,6 +59,59 @@ def test_web_health_static_bundle_and_security_headers(tmp_path: Path) -> None:
     assert "default-src 'self'" in health.headers["content-security-policy"]
     assert page.status_code == 200
     assert "Deep Context Agent" in page.text
+    assert "Автопилот / Autopilot" in page.text
+
+
+def test_autopilot_job_api_returns_identity_and_persistent_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, csrf, config = _client(tmp_path)
+    config.prepare_directories()
+
+    def fake_job(self: AgentRuntime, objective: str, **kwargs: object) -> str:
+        del self, objective, kwargs
+        return "Autopilot job complete."
+
+    monkeypatch.setattr(AgentRuntime, "run_autopilot_job", fake_job)
+    body = {
+        "objective": "Perform a complete project audit.",
+        "thread_id": "web-job-test",
+        "allow_write": False,
+        "include_patterns": ["src/**"],
+        "exclude_patterns": [],
+    }
+    created = client.post(
+        "/api/jobs",
+        json=body,
+        headers={"x-csrf-token": csrf},
+    )
+    assert created.status_code == 202
+    assert created.json()["job_id"] == AutopilotStore.job_id_for(
+        thread_id="web-job-test",
+        objective="Perform a complete project audit.",
+        workspace=config.workspace,
+        allow_write=False,
+        include_patterns=("src/**",),
+    )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        progress, lease = store.start_or_resume(
+            thread_id="stored",
+            objective="Stored objective",
+            workspace=config.workspace,
+            allow_write=False,
+            batch_size=8,
+        )
+        store.mark_complete(lease, f"persistent report {config.workspace}")
+    listed = client.get("/api/jobs")
+    details = client.get(f"/api/jobs/{progress.job_id}")
+    report = client.get(f"/api/jobs/{progress.job_id}/report")
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["id"] == progress.job_id
+    assert details.json()["job"]["progress"]["status"] == "complete"
+    assert report.text == "persistent report /workspace"
+    assert str(config.workspace) not in details.text + report.text
 
 
 def test_web_mutations_require_csrf_and_reject_foreign_origin(tmp_path: Path) -> None:
@@ -287,6 +342,53 @@ def test_expected_agent_error_has_safe_operator_guidance(
 
     assert "Проверьте их live-статус" in events.text
     assert "private provider detail" not in events.text
+
+
+def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    class _AutopilotRuntime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+
+        def __enter__(self) -> _AutopilotRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("complex request must not use one graph turn")
+
+        def run_autopilot_job(self, *_args: object, **kwargs: object) -> str:
+            calls.append(bool(kwargs["allow_write"]))
+            return "Autopilot job complete."
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _AutopilotRuntime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": (
+                "Выполни пункты ТЗ для недостающих модулей проекта и проведи "  # noqa: RUF001
+                "полные тесты."
+            ),
+            "thread_id": "web-autopilot",
+            "allow_write": True,
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+    assert started.status_code == 202
+    assert calls == [True]
+    assert "Autopilot job complete" in events.text
 
 
 def test_failed_task_keeps_sanitized_terminal_status_and_replays_sse(

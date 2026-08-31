@@ -7,6 +7,45 @@
 
 Изменений пока нет.
 
+## [0.19.0] — 2026-08-31
+
+### Добавлено
+
+- Persistent Autopilot: одна широкая цель хранится в отдельной
+  `autopilot.sqlite3` и выполняется независимыми work units с lease, resume,
+  pause/cancel, stable job ID и bounded отчётом.
+- CLI `job`/`job-status`, Web `/api/jobs`, progress/replan/verification SSE и
+  форма «Автопилот» без пользовательского batch size/max batches.
+- Автоматическая маршрутизация сложной проектной задачи из Web-чата в
+  persistent job с отдельным trusted `allow_write`.
+- Production prompt 0.19.0 и синхронизированные global/system prompts,
+  основное и Web-ТЗ.
+
+### Исправлено
+
+- `GraphRecursionError` одной внутренней пачки больше не завершает всю задачу:
+  подтверждённый прогресс сохраняется, batch уменьшается, а повтор получает
+  новый namespaced worker thread.
+- Нулевой ToolMessage-прогресс, transient provider failure и повторный
+  context/step limit используют ограниченный retry/replan; исчерпание стратегий
+  создаёт durable `blocked`, а не бесконечный цикл или потерю состояния.
+- Allow-write job после manifest запускает фиксированные Ruff/pytest checks;
+  FAIL создаёт bounded repair/recheck cycle, и только актуальный PASS разрешает
+  terminal `complete`.
+
+### Безопасность
+
+- Режим записи является частью job identity и не повышается через resume.
+- Work units не расширяют manifest paths; Web DTO скрывает physical workspace,
+  а subprocess по-прежнему использует только существующий allowlist без API keys.
+
+### Проверено
+
+- Детерминированная регрессия воспроизводит `GraphRecursionError`, уменьшает
+  batch `2 → 1`, меняет worker thread и автоматически завершает два файла.
+- Store/CLI/Web/routing/CSRF, полный Python/TypeScript/package и live provider
+  acceptance перечислены в `IMPLEMENTATION_STATUS.md`.
+
 ## [0.18.0] — 2026-08-30
 
 ### Добавлено

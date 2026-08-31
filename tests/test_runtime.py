@@ -39,6 +39,7 @@ from context_agent.runtime import (
     format_acceptance_evaluation,
     is_broad_project_audit_request,
     is_incomplete_mutation_request,
+    is_long_running_project_request,
     limit_retrieved_hits,
     message_text,
     parse_acceptance_manifest,
@@ -115,6 +116,13 @@ def test_exact_file_or_non_audit_request_is_not_routed_to_project_audit(
     query: str,
 ) -> None:
     assert not is_broad_project_audit_request(query)
+
+
+def test_complex_project_implementation_is_routed_to_persistent_job() -> None:
+    assert is_long_running_project_request(
+        "Выполни пункты ТЗ для недостающих модулей проекта и проведи тесты."  # noqa: RUF001
+    )
+    assert not is_long_running_project_request("Объясни архитектуру проекта кратко.")
 
 
 def test_project_audit_manifest_paths_are_strict_and_bounded() -> None:

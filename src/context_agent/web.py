@@ -40,6 +40,7 @@ from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from context_agent import __version__
+from context_agent.autopilot import AutopilotProgress, AutopilotStore
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
 from context_agent.diagnostics import (
@@ -56,7 +57,11 @@ from context_agent.errors import (
 from context_agent.paths import resolve_inside
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
-from context_agent.runtime import AgentRuntime, message_text
+from context_agent.runtime import (
+    AgentRuntime,
+    is_long_running_project_request,
+    message_text,
+)
 from context_agent.structured_logging import configure_structured_logger
 
 _STATIC_ROOT = Path(__file__).parent / "static"
@@ -73,6 +78,9 @@ _SECRET_NAMES = frozenset(
         "diagnostics.sqlite3",
         "diagnostics.sqlite3-shm",
         "diagnostics.sqlite3-wal",
+        "autopilot.sqlite3",
+        "autopilot.sqlite3-shm",
+        "autopilot.sqlite3-wal",
     }
 )
 _SETTINGS = {
@@ -154,6 +162,7 @@ class ChatRequest(BaseModel):
     thread_id: str = Field(default="web", min_length=1, max_length=100)
     auto_context: bool = True
     mode: WorkMode = "general"
+    allow_write: bool = False
 
 
 class AuditRequest(BaseModel):
@@ -162,6 +171,14 @@ class AuditRequest(BaseModel):
     allow_write: bool = False
     max_batches: int | None = Field(default=None, ge=1, le=100)
     batch_size: int | None = Field(default=None, ge=1, le=25)
+    include_patterns: list[str] = Field(default_factory=list, max_length=100)
+    exclude_patterns: list[str] = Field(default_factory=list, max_length=100)
+
+
+class JobRequest(BaseModel):
+    objective: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+    thread_id: str = Field(default="web-job", min_length=1, max_length=100)
+    allow_write: bool = False
     include_patterns: list[str] = Field(default_factory=list, max_length=100)
     exclude_patterns: list[str] = Field(default_factory=list, max_length=100)
 
@@ -1030,14 +1047,46 @@ def create_app(
                 if cancelled.is_set():
                     raise _TaskCancelledError
                 mode_instruction = _WORK_MODES[body.mode]
-                answer = runtime.ask(
-                    f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}",
-                    thread_id=body.thread_id,
-                    auto_context=body.auto_context,
-                    diagnostic_source="web",
-                    diagnostic_task_id=task_id,
-                    diagnostic_request_id=task_id,
-                )
+                query = f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}"
+                if is_long_running_project_request(body.query):
+
+                    def chat_job_progress(
+                        progress: AutopilotProgress,
+                        audit: AuditProgress | None,
+                        event: str,
+                    ) -> None:
+                        payload: dict[str, object] = progress.as_dict()
+                        if audit is not None:
+                            payload["audit"] = audit.as_dict()
+                        event_name = {
+                            "replanned": "job_replanned",
+                            "verification": "job_verification",
+                        }.get(event, "job_progress")
+                        emit(event_name, payload)
+                        if cancelled.is_set() and not progress.terminal:
+                            with AutopilotStore(config.autopilot_database) as store:
+                                store.set_control_status(
+                                    progress.job_id,
+                                    "cancelled",
+                                )
+
+                    answer = runtime.run_autopilot_job(
+                        query,
+                        thread_id=body.thread_id,
+                        allow_write=body.allow_write,
+                        progress_callback=chat_job_progress,
+                        diagnostic_source="web",
+                        diagnostic_task_id=task_id,
+                    )
+                else:
+                    answer = runtime.ask(
+                        query,
+                        thread_id=body.thread_id,
+                        auto_context=body.auto_context,
+                        diagnostic_source="web",
+                        diagnostic_task_id=task_id,
+                        diagnostic_request_id=task_id,
+                    )
                 metadata = runtime._provider_failover_middleware.runtime_metadata()
                 emit("message", {"text": answer, "runtime": metadata})
                 return {"answer": answer, "runtime": metadata}
@@ -1273,6 +1322,165 @@ def create_app(
             items=[
                 {"chunk_index": hit.chunk_index, "content": hit.content} for hit in hits
             ],
+        )
+
+    def submit_job(body: JobRequest) -> tuple[str, str]:
+        task_id = uuid4().hex
+        include = tuple(body.include_patterns)
+        exclude = tuple(body.exclude_patterns)
+        job_id = AutopilotStore.job_id_for(
+            thread_id=body.thread_id,
+            objective=body.objective,
+            workspace=config.workspace,
+            allow_write=body.allow_write,
+            include_patterns=include,
+            exclude_patterns=exclude,
+        )
+
+        def operation(
+            emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            def progress_callback(
+                progress: AutopilotProgress,
+                audit: AuditProgress | None,
+                event: str,
+            ) -> None:
+                payload: dict[str, object] = progress.as_dict()
+                if audit is not None:
+                    payload["audit"] = audit.as_dict()
+                event_name = {
+                    "replanned": "job_replanned",
+                    "verification": "job_verification",
+                }.get(event, "job_progress")
+                emit(event_name, payload)
+                if cancelled.is_set() and not progress.terminal:
+                    with AutopilotStore(config.autopilot_database) as store:
+                        store.set_control_status(progress.job_id, "cancelled")
+
+            current_providers = provider_registry.snapshot()
+            with _runtime_factory(config, current_providers) as runtime:
+                return runtime.run_autopilot_job(
+                    body.objective,
+                    thread_id=body.thread_id,
+                    allow_write=body.allow_write,
+                    include_patterns=include,
+                    exclude_patterns=exclude,
+                    progress_callback=progress_callback,
+                    diagnostic_source="web",
+                    diagnostic_task_id=task_id,
+                )
+
+        tasks.submit(
+            "autopilot",
+            operation,
+            task_id=task_id,
+            request_id=task_id,
+        )
+        return job_id, task_id
+
+    @app.get("/api/jobs")
+    def jobs(request: Request, limit: int = Query(50, ge=1, le=100)):
+        with AutopilotStore(config.autopilot_database) as store:
+            items = store.list_jobs(workspace=config.workspace, limit=limit)
+        return _request_payload(request, items=items)
+
+    @app.post("/api/jobs", status_code=202)
+    def create_job(request: Request, body: JobRequest):
+        job_id, task_id = submit_job(body)
+        return _request_payload(
+            request,
+            job_id=job_id,
+            task_id=task_id,
+            mode="allow-write" if body.allow_write else "read-only",
+        )
+
+    @app.get("/api/jobs/{job_id}")
+    def job_details(request: Request, job_id: str):
+        with AutopilotStore(config.autopilot_database) as store:
+            try:
+                details = store.details(job_id)
+            except ValueError as exc:
+                raise HTTPException(404, "Autopilot job not found") from exc
+        physical_workspace = str(config.workspace)
+        details["workspace"] = "/workspace"
+        for key in ("objective", "last_error_message", "report"):
+            value = details.get(key)
+            if isinstance(value, str):
+                details[key] = value.replace(physical_workspace, "/workspace")
+        for collection_key in ("verification_results", "work_units"):
+            collection = details.get(collection_key)
+            if isinstance(collection, list):
+                for item in collection:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("output", "summary"):
+                        value = item.get(key)
+                        if isinstance(value, str):
+                            item[key] = value.replace(
+                                physical_workspace,
+                                "/workspace",
+                            )
+        return _request_payload(request, job=details)
+
+    @app.post("/api/jobs/{job_id}/pause")
+    def pause_job(request: Request, job_id: str):
+        with AutopilotStore(config.autopilot_database) as store:
+            try:
+                progress = store.set_control_status(job_id, "paused")
+            except ValueError as exc:
+                raise HTTPException(404, "Autopilot job not found") from exc
+        return _request_payload(request, progress=progress.as_dict())
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(request: Request, job_id: str):
+        with AutopilotStore(config.autopilot_database) as store:
+            try:
+                progress = store.set_control_status(job_id, "cancelled")
+            except ValueError as exc:
+                raise HTTPException(404, "Autopilot job not found") from exc
+        return _request_payload(request, progress=progress.as_dict())
+
+    @app.post("/api/jobs/{job_id}/resume", status_code=202)
+    def resume_job(request: Request, job_id: str):
+        with AutopilotStore(config.autopilot_database) as store:
+            try:
+                details = store.details(job_id)
+            except ValueError as exc:
+                raise HTTPException(404, "Autopilot job not found") from exc
+        raw_include = details.get("include_patterns")
+        raw_exclude = details.get("exclude_patterns")
+        body = JobRequest(
+            objective=str(details["objective"]),
+            thread_id=str(details["thread_id"]),
+            allow_write=details["mode"] == "allow-write",
+            include_patterns=(
+                [str(item) for item in raw_include]
+                if isinstance(raw_include, list)
+                else []
+            ),
+            exclude_patterns=(
+                [str(item) for item in raw_exclude]
+                if isinstance(raw_exclude, list)
+                else []
+            ),
+        )
+        resumed_job_id, task_id = submit_job(body)
+        return _request_payload(request, job_id=resumed_job_id, task_id=task_id)
+
+    @app.get("/api/jobs/{job_id}/report")
+    def job_report(request: Request, job_id: str):
+        with AutopilotStore(config.autopilot_database) as store:
+            try:
+                details = store.details(job_id, unit_limit=1)
+            except ValueError as exc:
+                raise HTTPException(404, "Autopilot job not found") from exc
+        return PlainTextResponse(
+            str(details.get("report") or "").replace(
+                str(config.workspace),
+                "/workspace",
+            ),
+            headers={"X-Request-ID": request.state.request_id},
         )
 
     def submit_audit(body: AuditRequest) -> str:

@@ -20,7 +20,7 @@
           <button data-panel="overview" aria-current="page"><span>⌂</span>Обзор</button>
           <button data-panel="chat"><span>◫</span>Чат</button>
           <button data-panel="context"><span>⌕</span>Контекст</button>
-          <button data-panel="audits"><span>✓</span>Аудиты</button>
+          <button data-panel="audits"><span>✓</span>Автопилот</button>
           <button data-panel="files"><span>▱</span>Файлы</button>
           <button data-panel="providers"><span>⌁</span>Провайдеры</button>
           <button data-panel="settings"><span>⚙</span>Настройки</button>
@@ -79,6 +79,7 @@
                     <div class="composer-options">
                       <label class="toggle"><input id="auto-context" type="checkbox" checked> Автоконтекст</label>
                       <label class="toggle"><input id="enter-send" type="checkbox"> Enter отправляет</label>
+                      <label class="toggle warning"><input id="chat-write" type="checkbox"> Разрешить правки</label>
                     </div>
                     <div class="composer-actions"><button id="cancel-chat" type="button" class="icon-button" disabled aria-label="Остановить">■</button><button type="submit" class="send-button" aria-label="Отправить">↑</button></div>
                   </div>
@@ -104,18 +105,17 @@
           </section>
 
           <section id="audits" class="panel" aria-labelledby="audits-title">
-            <div class="section-heading"><div><h2 id="audits-title">Пакетный аудит / Batch audit</h2><p>Большой проект проверяется небольшими возобновляемыми группами файлов.</p></div></div>
+            <div class="section-heading"><div><h2 id="audits-title">Автопилот / Autopilot</h2><p>Опишите конечный результат одной задачей. Агент сам делит работу, сохраняет прогресс, проверяет изменения и продолжает после безопасного лимита шага.</p></div></div>
             <form id="audit-form" class="surface form-grid">
-              <label>ID задачи / Thread ID<input id="audit-thread" value="web-audit" maxlength="100"><span class="help">Имя независимой истории аудита.</span></label>
+              <label>ID задачи / Thread ID<input id="audit-thread" value="web-job" maxlength="100"><span class="help">Имя независимой долговечной задачи.</span></label>
               <label class="full">Цель и техническое задание / Objective<textarea id="audit-objective" rows="7" required></textarea></label>
               <label>Включить файлы / Include glob<input id="audit-include" placeholder="src/**, tests/**"><span class="help">Необязательно. Какие пути проверять; пусто — весь безопасный проект.</span></label>
               <label>Исключить файлы / Exclude glob<input id="audit-exclude" placeholder="docs/generated/**"><span class="help">Необязательно. Дополнительные пути, которые нужно пропустить.</span></label>
-              <label>Файлов в пакете / Batch size<input id="audit-batch-size" type="number" min="1" max="25" value="8"><span class="help">Сколько файлов получает LLM за один шаг. 8 — безопасный баланс.</span></label>
               <label class="toggle warning full"><input id="audit-write" type="checkbox"> Разрешить изменение файлов / Allow write<span class="help">Выключено по умолчанию. Текст задачи сам не даёт право записи.</span></label>
-              <div class="form-actions full"><button type="submit">Запустить аудит</button><button id="refresh-audits" type="button" class="secondary">Обновить список</button></div>
+              <div class="form-actions full"><button type="submit">Выполнить до результата</button><button id="refresh-audits" type="button" class="secondary">Обновить список</button></div>
             </form>
-            <div id="audit-progress" class="operation-status" aria-live="polite">Нет активного аудита.</div>
-            <div class="table-wrap"><table><thead><tr><th>Запуск / Run ID</th><th>Режим / Mode</th><th>Статус / Status</th><th>Обновлён / Updated</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
+            <div id="audit-progress" class="operation-status" aria-live="polite">Нет активной job.</div>
+            <div class="table-wrap"><table><thead><tr><th>Задача / Job ID</th><th>Режим / Mode</th><th>Статус / Status</th><th>Обновлена / Updated</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
           </section>
 
           <section id="files" class="panel" aria-labelledby="files-title">

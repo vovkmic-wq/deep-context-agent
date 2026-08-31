@@ -7,7 +7,7 @@ const pageTitles: Record<string, string> = {
   overview: "Обзор",
   chat: "Чат",
   context: "Контекст",
-  audits: "Аудиты",
+  audits: "Автопилот",
   files: "Файлы",
   providers: "Провайдеры",
   settings: "Настройки",
@@ -92,6 +92,9 @@ function streamTask(
     "started",
     "message",
     "audit_progress",
+    "job_progress",
+    "job_replanned",
+    "job_verification",
     "result",
     "completed",
     "cancelled",
@@ -250,8 +253,9 @@ async function sendChatMessage(): Promise<void> {
       body: JSON.stringify({
         query,
         thread_id: currentThread,
-        auto_context: checked("auto-context"),
-        mode: value("chat-mode"),
+      auto_context: checked("auto-context"),
+      mode: value("chat-mode"),
+      allow_write: checked("chat-write"),
       }),
     });
     activeChatTask = text(result.task_id);
@@ -286,7 +290,7 @@ async function refreshAudits(): Promise<void> {
   const rows = element<HTMLTableSectionElement>("audit-rows");
   rows.replaceChildren();
   const result = await api<{ items: Payload[]; request_id: string }>(
-    "/api/audits",
+    "/api/jobs",
   );
   for (const item of result.items) {
     const row = document.createElement("tr");
@@ -815,13 +819,12 @@ element("index-workspace").addEventListener("click", async () => {
 element<HTMLFormElement>("audit-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    const result = await api<Payload>("/api/audits", {
+    const result = await api<Payload>("/api/jobs", {
       method: "POST",
       body: JSON.stringify({
         objective: value("audit-objective"),
         thread_id: value("audit-thread"),
         allow_write: checked("audit-write"),
-        batch_size: Number(value("audit-batch-size")),
         include_patterns: value("audit-include")
           .split(",")
           .map((item) => item.trim())
@@ -832,12 +835,25 @@ element<HTMLFormElement>("audit-form").addEventListener("submit", async (event) 
           .filter(Boolean),
       }),
     });
-    setOperationStatus("audit-progress", "Аудит запущен…");
+    setOperationStatus(
+      "audit-progress",
+      `Автопилот запущен. Job ID: ${text(result.job_id)}`,
+    );
     streamTask(text(result.task_id), (name, data) => {
-      if (name === "audit_progress") {
+      if (["job_progress", "job_replanned", "job_verification"].includes(name)) {
+        const audit =
+          data.audit && typeof data.audit === "object"
+            ? (data.audit as Payload)
+            : {};
+        const prefix =
+          name === "job_replanned"
+            ? "Перепланирование"
+            : name === "job_verification"
+              ? "Проверка"
+              : "Выполнение";
         setOperationStatus(
           "audit-progress",
-          `Пакет ${text(data.batch_number)}: проверено ${text(data.reviewed)}/${text(data.total)}; ожидают ${text(data.pending)}; исключено ${text(data.excluded)}.`,
+          `${prefix}: фаза ${text(data.phase)}, файлы ${text(audit.reviewed)}/${text(audit.total)}, ожидают ${text(audit.pending)}, units ${text(data.completed_units)}/${text(data.attempts)}, replans ${text(data.replans)}.`,
         );
       }
       if (name === "result") {
@@ -851,7 +867,7 @@ element<HTMLFormElement>("audit-form").addEventListener("submit", async (event) 
   } catch (error) {
     setOperationStatus(
       "audit-progress",
-      error instanceof Error ? error.message : "Ошибка аудита",
+      error instanceof Error ? error.message : "Ошибка автопилота",
       "error",
     );
   }

@@ -87,6 +87,34 @@ def test_cli_accepts_model_free_audit_status_and_local_web() -> None:
     assert web.port == 9000
 
 
+def test_cli_accepts_autopilot_job_without_manual_batch_controls() -> None:
+    job = build_parser().parse_args(
+        [
+            "--thread",
+            "production-job",
+            "job",
+            "--file",
+            "objective.txt",
+            "--allow-write",
+            "--include",
+            "src/**",
+            "--exclude",
+            "dist/**",
+            "--report-file",
+            "job-report.txt",
+        ]
+    )
+    status = build_parser().parse_args(["job-status", "--job-id", "abc123", "--json"])
+    assert job.command == "job"
+    assert job.file == Path("objective.txt")
+    assert job.allow_write is True
+    assert job.include == ["src/**"]
+    assert job.exclude == ["dist/**"]
+    assert not hasattr(job, "max_batches")
+    assert status.command == "job-status"
+    assert status.json is True
+
+
 def test_cli_accepts_diagnostics_operator_commands() -> None:
     listing = build_parser().parse_args(
         ["diagnostics", "list", "--status", "failed", "--json"]
