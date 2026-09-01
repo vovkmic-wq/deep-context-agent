@@ -3,6 +3,39 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Chat-integrated Autopilot 0.19.1 — 2026-09-01
+
+| Этап 0.19.1 | Статус | Реализация/проверка |
+|---|---|---|
+| Root cause | Завершён | Production query не содержал прежний action verb; `/api/chat` выбрал ordinary turn и получил `agent_step_limit` |
+| Backend routing | Завершён | explicit auto/autopilot/single-turn, расширенный classifier, automatic step/context fallback |
+| Chat UX | Завершён | Отдельная вкладка удалена; execution selector, inline SSE progress и job history находятся в чате |
+| Persistence/security | Завершён | Parent-thread archive, user/human roles, trusted allow-write и существующая SQLite job identity сохранены |
+| Tests/package/live | Завершён | Полный Python/TypeScript/package-контур и два chat live-прогона PASS |
+
+Финальные evidence 0.19.1:
+
+- диагностика task `ee02592d8eb643a4854ea3bb72ec302f`: kind `chat`, status
+  `failed`, error `agent_step_limit`; исходная body-фраза не прошла classifier;
+- targeted backend regressions для точной проблемной фразы, explicit short
+  Autopilot, automatic step-limit fallback и single-turn negative — PASS;
+- TypeScript check, production build и bundle regression без отдельной вкладки
+  Autopilot — PASS, bundle 39 223 bytes;
+- Ruff check/format, mypy, compileall и `pip check` — PASS; pytest — 245 passed,
+  1 planned Windows symlink skip;
+- реальный `/api/chat` с точной проблемной фразой получил task
+  `695815966ff24695837c9b0026043455`, kind `chat_autopilot`, события
+  execution + 4 job_progress, terminal `complete`; job
+  `3ab2fa8c8c0360922c856d88` завершена, parent thread содержит user/assistant;
+- diagnostics подтверждает 5 успешных model attempts через `zhipu`; отдельный
+  `doctor --live` для `glm-5.3` с fallback `gpt-5.6-sol` вернул `OK`;
+- повтор той же chat job после завершения вернул execution/job_progress и
+  `complete` за 79 ms без нового полного прохода; production HTML показывает
+  chat execution selector и не содержит `data-panel="audits"`/`audit-form`;
+- wheel 0.19.1 содержит 25 файлов, запрещённые SQLite/JSONL/env artifacts
+  отсутствуют, изолированная target-install вернула 0.19.1; SHA-256
+  `CC9F5CF0B3942FA9A71DDC3BFCDE7866A6A792AEEBF83E214EA8964E3E95AD15`.
+
 ## Persistent Autopilot 0.19.0 — 2026-08-31
 
 | Этап 0.19.0 | Статус | Реализация/проверка |

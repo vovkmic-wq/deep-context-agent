@@ -22,6 +22,9 @@ for (const required of [
   "/api/providers/priority",
   '"/api/providers"',
   "dca_enter_send",
+  "dca_chat_execution",
+  "job_progress",
+  "chat-job-list",
   "files-back",
   "custom-provider-form",
   "expected_sha256",
@@ -29,5 +32,12 @@ for (const required of [
   if (!source.includes(required)) {
     throw new Error(`Production bundle is missing feature: ${required}`);
   }
+}
+const htmlSource = await readFile(html, "utf8");
+if (htmlSource.includes('data-panel="audits"') || htmlSource.includes('id="audit-form"')) {
+  throw new Error("Separate Autopilot tab must not be present");
+}
+if (!htmlSource.includes('id="chat-execution"')) {
+  throw new Error("Chat execution mode selector is missing");
 }
 console.log(`bundle_ok bytes=${total}`);

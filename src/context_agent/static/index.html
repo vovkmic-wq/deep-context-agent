@@ -20,7 +20,6 @@
           <button data-panel="overview" aria-current="page"><span>⌂</span>Обзор</button>
           <button data-panel="chat"><span>◫</span>Чат</button>
           <button data-panel="context"><span>⌕</span>Контекст</button>
-          <button data-panel="audits"><span>✓</span>Автопилот</button>
           <button data-panel="files"><span>▱</span>Файлы</button>
           <button data-panel="providers"><span>⌁</span>Провайдеры</button>
           <button data-panel="settings"><span>⚙</span>Настройки</button>
@@ -62,6 +61,8 @@
               <aside class="thread-sidebar" aria-label="Задачи чата">
                 <button id="new-thread" class="primary wide" type="button">＋ Новая задача</button>
                 <div id="thread-list" class="thread-list"></div>
+                <small class="eyebrow">Задачи Autopilot</small>
+                <div id="chat-job-list" class="thread-list"></div>
               </aside>
               <div class="chat-main">
                 <div class="chat-header">
@@ -71,7 +72,13 @@
                       <option value="general">Универсальный</option><option value="audit">Аудитор</option><option value="coder">Кодер</option><option value="tester">Тестировщик</option><option value="reviewer">Code reviewer</option><option value="debugger">Отладчик</option><option value="refactor">Рефакторинг</option><option value="security">Безопасность</option><option value="architect">Архитектор</option><option value="docs">Документация</option>
                     </select>
                   </label>
+                  <label class="compact-label">Выполнение / Execution
+                    <select id="chat-execution">
+                      <option value="auto">Авто — большие задачи в Autopilot</option><option value="autopilot">Autopilot — выполнить до результата</option><option value="single-turn">Обычный ответ — один ход</option>
+                    </select>
+                  </label>
                 </div>
+                <div id="chat-job-status" class="operation-status" aria-live="polite" hidden></div>
                 <div id="chat-output" class="conversation" aria-live="polite"><div class="empty-state"><strong>Готов к работе</strong><span>Опишите задачу, приложите путь или попросите проверить проект.</span></div></div>
                 <form id="chat-form" class="composer">
                   <textarea id="chat-query" rows="2" required aria-label="Сообщение" placeholder="Сообщение агенту…"></textarea>
@@ -102,20 +109,6 @@
               <button type="submit">Найти</button>
             </form>
             <div id="context-output" class="cards" aria-live="polite"></div>
-          </section>
-
-          <section id="audits" class="panel" aria-labelledby="audits-title">
-            <div class="section-heading"><div><h2 id="audits-title">Автопилот / Autopilot</h2><p>Опишите конечный результат одной задачей. Агент сам делит работу, сохраняет прогресс, проверяет изменения и продолжает после безопасного лимита шага.</p></div></div>
-            <form id="audit-form" class="surface form-grid">
-              <label>ID задачи / Thread ID<input id="audit-thread" value="web-job" maxlength="100"><span class="help">Имя независимой долговечной задачи.</span></label>
-              <label class="full">Цель и техническое задание / Objective<textarea id="audit-objective" rows="7" required></textarea></label>
-              <label>Включить файлы / Include glob<input id="audit-include" placeholder="src/**, tests/**"><span class="help">Необязательно. Какие пути проверять; пусто — весь безопасный проект.</span></label>
-              <label>Исключить файлы / Exclude glob<input id="audit-exclude" placeholder="docs/generated/**"><span class="help">Необязательно. Дополнительные пути, которые нужно пропустить.</span></label>
-              <label class="toggle warning full"><input id="audit-write" type="checkbox"> Разрешить изменение файлов / Allow write<span class="help">Выключено по умолчанию. Текст задачи сам не даёт право записи.</span></label>
-              <div class="form-actions full"><button type="submit">Выполнить до результата</button><button id="refresh-audits" type="button" class="secondary">Обновить список</button></div>
-            </form>
-            <div id="audit-progress" class="operation-status" aria-live="polite">Нет активной job.</div>
-            <div class="table-wrap"><table><thead><tr><th>Задача / Job ID</th><th>Режим / Mode</th><th>Статус / Status</th><th>Обновлена / Updated</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
           </section>
 
           <section id="files" class="panel" aria-labelledby="files-title">

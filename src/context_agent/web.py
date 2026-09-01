@@ -155,6 +155,7 @@ WorkMode = Literal[
     "docs",
     "architect",
 ]
+ChatExecutionMode = Literal["auto", "autopilot", "single-turn"]
 
 
 class ChatRequest(BaseModel):
@@ -163,6 +164,7 @@ class ChatRequest(BaseModel):
     auto_context: bool = True
     mode: WorkMode = "general"
     allow_write: bool = False
+    execution_mode: ChatExecutionMode = "auto"
 
 
 class AuditRequest(BaseModel):
@@ -1037,6 +1039,10 @@ def create_app(
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
         task_id = uuid4().hex
+        detected_autopilot = is_long_running_project_request(body.query)
+        use_autopilot = body.execution_mode == "autopilot" or (
+            body.execution_mode == "auto" and detected_autopilot
+        )
 
         def operation(
             emit: Callable[[str, Mapping[str, object]], None],
@@ -1048,29 +1054,40 @@ def create_app(
                     raise _TaskCancelledError
                 mode_instruction = _WORK_MODES[body.mode]
                 query = f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}"
-                if is_long_running_project_request(body.query):
+                active_job_id = ""
 
-                    def chat_job_progress(
-                        progress: AutopilotProgress,
-                        audit: AuditProgress | None,
-                        event: str,
-                    ) -> None:
-                        payload: dict[str, object] = progress.as_dict()
-                        if audit is not None:
-                            payload["audit"] = audit.as_dict()
-                        event_name = {
-                            "replanned": "job_replanned",
-                            "verification": "job_verification",
-                        }.get(event, "job_progress")
-                        emit(event_name, payload)
-                        if cancelled.is_set() and not progress.terminal:
-                            with AutopilotStore(config.autopilot_database) as store:
-                                store.set_control_status(
-                                    progress.job_id,
-                                    "cancelled",
-                                )
+                def chat_job_progress(
+                    progress: AutopilotProgress,
+                    audit: AuditProgress | None,
+                    event: str,
+                ) -> None:
+                    nonlocal active_job_id
+                    active_job_id = progress.job_id
+                    payload: dict[str, object] = progress.as_dict()
+                    if audit is not None:
+                        payload["audit"] = audit.as_dict()
+                    event_name = {
+                        "replanned": "job_replanned",
+                        "verification": "job_verification",
+                    }.get(event, "job_progress")
+                    emit(event_name, payload)
+                    if cancelled.is_set() and not progress.terminal:
+                        with AutopilotStore(config.autopilot_database) as store:
+                            store.set_control_status(
+                                progress.job_id,
+                                "cancelled",
+                            )
 
-                    answer = runtime.run_autopilot_job(
+                def run_chat_autopilot(reason: str) -> str:
+                    emit(
+                        "execution",
+                        {
+                            "mode": "autopilot",
+                            "reason": reason,
+                            "allow_write": body.allow_write,
+                        },
+                    )
+                    job_answer = runtime.run_autopilot_job(
                         query,
                         thread_id=body.thread_id,
                         allow_write=body.allow_write,
@@ -1078,21 +1095,78 @@ def create_app(
                         diagnostic_source="web",
                         diagnostic_task_id=task_id,
                     )
-                else:
-                    answer = runtime.ask(
+                    runtime.context_store.archive_message(
+                        body.thread_id,
+                        "user",
                         query,
-                        thread_id=body.thread_id,
-                        auto_context=body.auto_context,
-                        diagnostic_source="web",
-                        diagnostic_task_id=task_id,
-                        diagnostic_request_id=task_id,
                     )
+                    runtime.context_store.archive_message(
+                        body.thread_id,
+                        "assistant",
+                        job_answer,
+                    )
+                    return job_answer
+
+                resolved_execution = "autopilot" if use_autopilot else "single-turn"
+                if use_autopilot:
+                    reason = (
+                        "explicit"
+                        if body.execution_mode == "autopilot"
+                        else "auto-detected"
+                    )
+                    answer = run_chat_autopilot(reason)
+                else:
+                    emit(
+                        "execution",
+                        {
+                            "mode": "single-turn",
+                            "reason": (
+                                "explicit"
+                                if body.execution_mode == "single-turn"
+                                else "auto-short-task"
+                            ),
+                            "allow_write": body.allow_write,
+                        },
+                    )
+                    try:
+                        answer = runtime.ask(
+                            query,
+                            thread_id=body.thread_id,
+                            auto_context=body.auto_context,
+                            diagnostic_source="web",
+                            diagnostic_task_id=task_id,
+                            diagnostic_request_id=task_id,
+                        )
+                    except AgentError as exc:
+                        fallback_code = classify_failure(exc)
+                        if body.execution_mode != "auto" or fallback_code not in {
+                            "agent_step_limit",
+                            "context_window_exceeded",
+                        }:
+                            raise
+                        resolved_execution = "autopilot"
+                        answer = run_chat_autopilot(
+                            f"automatic-fallback:{fallback_code}"
+                        )
                 metadata = runtime._provider_failover_middleware.runtime_metadata()
-                emit("message", {"text": answer, "runtime": metadata})
-                return {"answer": answer, "runtime": metadata}
+                emit(
+                    "message",
+                    {
+                        "text": answer,
+                        "runtime": metadata,
+                        "execution_mode": resolved_execution,
+                        "job_id": active_job_id or None,
+                    },
+                )
+                return {
+                    "answer": answer,
+                    "runtime": metadata,
+                    "execution_mode": resolved_execution,
+                    "job_id": active_job_id or None,
+                }
 
         tasks.submit(
-            "chat",
+            "chat_autopilot" if use_autopilot else "chat",
             operation,
             task_id=task_id,
             request_id=task_id,

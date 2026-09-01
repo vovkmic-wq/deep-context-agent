@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from context_agent.autopilot import AutopilotStore
+from context_agent.autopilot import AutopilotProgress, AutopilotStore
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.diagnostics import DiagnosticStore
 from context_agent.errors import AgentError
@@ -59,7 +59,10 @@ def test_web_health_static_bundle_and_security_headers(tmp_path: Path) -> None:
     assert "default-src 'self'" in health.headers["content-security-policy"]
     assert page.status_code == 200
     assert "Deep Context Agent" in page.text
-    assert "Автопилот / Autopilot" in page.text
+    assert 'id="chat-execution"' in page.text
+    assert "Autopilot — выполнить до результата" in page.text
+    assert 'data-panel="audits"' not in page.text
+    assert 'id="audit-form"' not in page.text
 
 
 def test_autopilot_job_api_returns_identity_and_persistent_details(
@@ -349,10 +352,16 @@ def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[bool] = []
+    archived: list[tuple[str, str, str]] = []
 
     class _AutopilotRuntime:
         _provider_failover_middleware = SimpleNamespace(
             runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+        context_store = SimpleNamespace(
+            archive_message=lambda thread_id, role, content: archived.append(
+                (thread_id, role, content)
+            )
         )
 
         def __enter__(self) -> _AutopilotRuntime:
@@ -366,6 +375,27 @@ def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
 
         def run_autopilot_job(self, *_args: object, **kwargs: object) -> str:
             calls.append(bool(kwargs["allow_write"]))
+            callback = kwargs["progress_callback"]
+            assert callable(callback)
+            callback(
+                AutopilotProgress(
+                    job_id="job-from-chat",
+                    status="running",
+                    phase="audit",
+                    mode="allow-write",
+                    audit_run_id="audit-from-chat",
+                    batch_size=4,
+                    attempts=1,
+                    replans=0,
+                    completed_units=0,
+                    failed_units=0,
+                    verification_status="not_run",
+                    last_error_code=None,
+                    requested_status=None,
+                ),
+                None,
+                "started",
+            )
             return "Autopilot job complete."
 
     monkeypatch.setattr(
@@ -377,18 +407,158 @@ def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
         "/api/chat",
         json={
             "query": (
-                "Выполни пункты ТЗ для недостающих модулей проекта и проведи "  # noqa: RUF001
-                "полные тесты."
+                "Необходимо разбираться с недостающими модулями проекта "  # noqa: RUF001
+                "в соответствии с промтом и ТЗ."  # noqa: RUF001
             ),
             "thread_id": "web-autopilot",
             "allow_write": True,
+            "execution_mode": "auto",
         },
         headers={"x-csrf-token": csrf},
     )
     events = client.get(f"/api/events/{started.json()['task_id']}")
     assert started.status_code == 202
     assert calls == [True]
+    assert "event: execution" in events.text
+    assert '"mode": "autopilot"' in events.text
+    assert "event: job_progress" in events.text
+    assert "job-from-chat" in events.text
     assert "Autopilot job complete" in events.text
+    assert [item[1] for item in archived] == ["user", "assistant"]
+
+
+def test_explicit_chat_autopilot_routes_even_short_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+        context_store = SimpleNamespace(archive_message=lambda *_args: None)
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("explicit Autopilot must not use direct ask")
+
+        def run_autopilot_job(self, *_args: object, **_kwargs: object) -> str:
+            calls.append("autopilot")
+            return "Explicit Autopilot complete."
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": "Проверь результат.",
+            "thread_id": "explicit-autopilot",
+            "execution_mode": "autopilot",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert calls == ["autopilot"]
+    assert '"reason": "explicit"' in events.text
+    assert "Explicit Autopilot complete" in events.text
+
+
+def test_auto_chat_recovers_step_limit_by_starting_autopilot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+        context_store = SimpleNamespace(archive_message=lambda *_args: None)
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            calls.append("ask")
+            raise AgentError("GraphRecursionError: recursion limit reached")
+
+        def run_autopilot_job(self, *_args: object, **_kwargs: object) -> str:
+            calls.append("autopilot")
+            return "Recovered in Autopilot."
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": "Нестандартная задача без ключевых слов.",
+            "thread_id": "fallback-autopilot",
+            "execution_mode": "auto",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert calls == ["ask", "autopilot"]
+    assert "automatic-fallback:agent_step_limit" in events.text
+    assert "Recovered in Autopilot" in events.text
+
+
+def test_explicit_single_turn_does_not_route_complex_chat_to_autopilot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            return "One turn."
+
+        def run_autopilot_job(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("single-turn must not start Autopilot")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": "Выполни полный аудит всего проекта по ТЗ.",  # noqa: RUF001
+            "thread_id": "single-turn",
+            "execution_mode": "single-turn",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert "One turn" in events.text
+    assert '"mode": "single-turn"' in events.text
 
 
 def test_failed_task_keeps_sanitized_terminal_status_and_replays_sse(
@@ -412,7 +582,11 @@ def test_failed_task_keeps_sanitized_terminal_status_and_replays_sse(
     client, csrf, _config_value = _client(tmp_path)
     started = client.post(
         "/api/chat",
-        json={"query": "test", "thread_id": "terminal-error"},
+        json={
+            "query": "test",
+            "thread_id": "terminal-error",
+            "execution_mode": "single-turn",
+        },
         headers={"x-csrf-token": csrf},
     )
     task_id = started.json()["task_id"]

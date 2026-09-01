@@ -7,7 +7,6 @@ const pageTitles: Record<string, string> = {
   overview: "Обзор",
   chat: "Чат",
   context: "Контекст",
-  audits: "Автопилот",
   files: "Файлы",
   providers: "Провайдеры",
   settings: "Настройки",
@@ -15,6 +14,7 @@ const pageTitles: Record<string, string> = {
 
 let csrfToken = "";
 let activeChatTask = "";
+let activeChatJob = "";
 let currentThread = "web";
 let currentFilePath = "";
 let currentFileSha = "";
@@ -90,6 +90,7 @@ function streamTask(
   let recoveryPending = false;
   for (const name of [
     "started",
+    "execution",
     "message",
     "audit_progress",
     "job_progress",
@@ -186,7 +187,9 @@ function appendMessage(
 }
 
 function visibleArchivedMessage(role: string, content: string): string {
-  if (role !== "human" || !content.startsWith("Режим работы:")) return content;
+  if (!["human", "user"].includes(role) || !content.startsWith("Режим работы:")) {
+    return content;
+  }
   const separator = content.indexOf("\n\n");
   return separator >= 0 ? content.slice(separator + 2) : content;
 }
@@ -202,7 +205,7 @@ async function loadThread(threadId: string): Promise<void> {
   for (const item of result.items) {
     const role = text(item.role);
     appendMessage(
-      role === "human" ? "user" : "agent",
+      ["human", "user"].includes(role) ? "user" : "agent",
       visibleArchivedMessage(role, text(item.content)),
     );
   }
@@ -216,7 +219,7 @@ async function loadThread(threadId: string): Promise<void> {
     empty.append(heading, note);
     output.append(empty);
   }
-  await refreshThreads();
+  await Promise.all([refreshThreads(), refreshChatJobs()]);
 }
 
 async function refreshThreads(): Promise<void> {
@@ -253,16 +256,35 @@ async function sendChatMessage(): Promise<void> {
       body: JSON.stringify({
         query,
         thread_id: currentThread,
-      auto_context: checked("auto-context"),
-      mode: value("chat-mode"),
-      allow_write: checked("chat-write"),
+        auto_context: checked("auto-context"),
+        mode: value("chat-mode"),
+        allow_write: checked("chat-write"),
+        execution_mode: value("chat-execution"),
       }),
     });
     activeChatTask = text(result.task_id);
     streamTask(activeChatTask, (name, data) => {
+      if (name === "execution" && data.mode === "autopilot") {
+        pending.textContent = "Autopilot формирует план и рабочий манифест…";
+        const status = element("chat-job-status");
+        status.hidden = false;
+        setOperationStatus(
+          "chat-job-status",
+          `Autopilot запущен · ${text(data.reason)}`,
+        );
+      }
+      if (["job_progress", "job_replanned", "job_verification"].includes(name)) {
+        activeChatJob = text(data.job_id) || activeChatJob;
+        const progress = formatJobProgress(data, name);
+        pending.textContent = progress;
+        const status = element("chat-job-status");
+        status.hidden = false;
+        setOperationStatus("chat-job-status", progress);
+      }
       if (name === "message") {
         pending.textContent = text(data.text);
         pending.parentElement?.classList.remove("pending");
+        activeChatJob = text(data.job_id) || activeChatJob;
       }
       if (name === "failed") {
         pending.textContent = text(data.message);
@@ -275,7 +297,7 @@ async function sendChatMessage(): Promise<void> {
       if (["completed", "cancelled", "failed"].includes(name)) {
         activeChatTask = "";
         element<HTMLButtonElement>("cancel-chat").disabled = true;
-        void refreshThreads();
+        void Promise.all([refreshThreads(), refreshChatJobs()]);
       }
     });
   } catch (error) {
@@ -286,21 +308,69 @@ async function sendChatMessage(): Promise<void> {
   }
 }
 
-async function refreshAudits(): Promise<void> {
-  const rows = element<HTMLTableSectionElement>("audit-rows");
-  rows.replaceChildren();
+function formatJobProgress(data: Payload, eventName: string): string {
+  const audit =
+    data.audit && typeof data.audit === "object" ? (data.audit as Payload) : {};
+  const prefix =
+    eventName === "job_replanned"
+      ? "Autopilot перепланирует"
+      : eventName === "job_verification"
+        ? "Autopilot проверяет"
+        : "Autopilot выполняет";
+  const reviewed = text(audit.reviewed) || "0";
+  const total = text(audit.total) || "?";
+  const pending = text(audit.pending) || "?";
+  return `${prefix}: фаза ${text(data.phase)}, файлы ${reviewed}/${total}, ожидают ${pending}, units ${text(data.completed_units)}/${text(data.attempts)}, replans ${text(data.replans)}.`;
+}
+
+function showJobSummary(data: Payload): void {
+  const job =
+    data.job && typeof data.job === "object" ? (data.job as Payload) : data;
+  activeChatJob = text(job.id) || activeChatJob;
+  const progress =
+    job.progress && typeof job.progress === "object"
+      ? (job.progress as Payload)
+      : {};
+  const status = element("chat-job-status");
+  status.hidden = false;
+  setOperationStatus(
+    "chat-job-status",
+    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · units ${text(progress.completed_units)}/${text(progress.attempts)} · replans ${text(progress.replans)}.`,
+    job.status === "complete" ? "success" : "normal",
+  );
+}
+
+async function refreshChatJobs(): Promise<void> {
+  const output = element("chat-job-list");
+  output.replaceChildren();
   const result = await api<{ items: Payload[]; request_id: string }>(
     "/api/jobs",
   );
-  for (const item of result.items) {
-    const row = document.createElement("tr");
-    const updated = new Date(Number(item.updated_at) * 1_000).toLocaleString();
-    for (const entry of [item.id, item.mode, item.status, updated]) {
-      const cell = document.createElement("td");
-      cell.textContent = text(entry);
-      row.append(cell);
+  const jobs = result.items
+    .filter((item) => text(item.thread_id) === currentThread)
+    .slice(0, 20);
+  if (!jobs.length) {
+    const empty = document.createElement("small");
+    empty.textContent = "Для этого чата задач пока нет.";
+    output.append(empty);
+    return;
+  }
+  for (const item of jobs) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "thread-item";
+    button.textContent = `${text(item.status)} · ${text(item.id).slice(0, 8)}`;
+    button.title = text(item.objective);
+    button.addEventListener("click", () => {
+      const jobId = text(item.id);
+      void api<Payload>(`/api/jobs/${encodeURIComponent(jobId)}`)
+        .then(showJobSummary)
+        .catch((error: Error) => showToast(error.message));
+    });
+    output.append(button);
+    if (text(item.id) === activeChatJob) {
+      button.classList.add("active");
     }
-    rows.append(row);
   }
 }
 
@@ -686,7 +756,7 @@ async function bootstrap(): Promise<void> {
   const health = await api<Payload>("/api/health");
   element("health").textContent = JSON.stringify(health, null, 2);
   await Promise.all([
-    refreshAudits(),
+    refreshChatJobs(),
     refreshThreads(),
     refreshProviders(),
     loadSettings(),
@@ -703,6 +773,7 @@ document.querySelectorAll<HTMLButtonElement>("nav button").forEach((button) => {
 document.querySelectorAll<HTMLButtonElement>(".mode-card").forEach((button) => {
   button.addEventListener("click", () => {
     element<HTMLSelectElement>("chat-mode").value = text(button.dataset.mode);
+    element<HTMLSelectElement>("chat-execution").value = "autopilot";
     navigate("chat");
     element<HTMLTextAreaElement>("chat-query").focus();
   });
@@ -739,6 +810,17 @@ const enterSend = element<HTMLInputElement>("enter-send");
 enterSend.checked = window.localStorage.getItem("dca_enter_send") === "true";
 enterSend.addEventListener("change", () => {
   window.localStorage.setItem("dca_enter_send", String(enterSend.checked));
+});
+
+const chatExecution = element<HTMLSelectElement>("chat-execution");
+const storedExecution = window.localStorage.getItem("dca_chat_execution") || "auto";
+chatExecution.value = ["auto", "autopilot", "single-turn"].includes(
+  storedExecution,
+)
+  ? storedExecution
+  : "auto";
+chatExecution.addEventListener("change", () => {
+  window.localStorage.setItem("dca_chat_execution", chatExecution.value);
 });
 
 element("cancel-chat").addEventListener("click", async () => {
@@ -814,67 +896,6 @@ element("index-workspace").addEventListener("click", async () => {
       "error",
     );
   }
-});
-
-element<HTMLFormElement>("audit-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  try {
-    const result = await api<Payload>("/api/jobs", {
-      method: "POST",
-      body: JSON.stringify({
-        objective: value("audit-objective"),
-        thread_id: value("audit-thread"),
-        allow_write: checked("audit-write"),
-        include_patterns: value("audit-include")
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
-        exclude_patterns: value("audit-exclude")
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
-      }),
-    });
-    setOperationStatus(
-      "audit-progress",
-      `Автопилот запущен. Job ID: ${text(result.job_id)}`,
-    );
-    streamTask(text(result.task_id), (name, data) => {
-      if (["job_progress", "job_replanned", "job_verification"].includes(name)) {
-        const audit =
-          data.audit && typeof data.audit === "object"
-            ? (data.audit as Payload)
-            : {};
-        const prefix =
-          name === "job_replanned"
-            ? "Перепланирование"
-            : name === "job_verification"
-              ? "Проверка"
-              : "Выполнение";
-        setOperationStatus(
-          "audit-progress",
-          `${prefix}: фаза ${text(data.phase)}, файлы ${text(audit.reviewed)}/${text(audit.total)}, ожидают ${text(audit.pending)}, units ${text(data.completed_units)}/${text(data.attempts)}, replans ${text(data.replans)}.`,
-        );
-      }
-      if (name === "result") {
-        setOperationStatus("audit-progress", text(data.result), "success");
-      }
-      if (name === "completed") void refreshAudits();
-      if (name === "failed") {
-        setOperationStatus("audit-progress", text(data.message), "error");
-      }
-    });
-  } catch (error) {
-    setOperationStatus(
-      "audit-progress",
-      error instanceof Error ? error.message : "Ошибка автопилота",
-      "error",
-    );
-  }
-});
-
-element("refresh-audits").addEventListener("click", () => {
-  void refreshAudits().catch((error: Error) => showToast(error.message));
 });
 
 element<HTMLFormElement>("files-form").addEventListener("submit", (event) => {

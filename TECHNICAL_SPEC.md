@@ -692,6 +692,22 @@ Coding Plan пользователь явно задаёт
     имеет отдельную identity и требует явного trusted authorization.
 50. Job и work units изолированы по workspace; raw provider errors, secrets и
     physical paths не попадают в API, SSE и итоговый компактный отчёт.
+51. В Web UI Autopilot является execution mode основного чата; отдельная
+    вкладка, форма и дублирующее browser state запрещены.
+52. `ChatRequest.execution_mode` принимает `auto`, `autopilot`, `single-turn`.
+    Explicit `autopilot` всегда создаёт/возобновляет job, explicit
+    `single-turn` никогда не повышается эвристикой.
+53. Auto mode распознаёт broad project/spec/module objectives до model call.
+    Если нераспознанный ordinary turn завершается `agent_step_limit` или
+    `context_window_exceeded`, checkpoint сначала откатывается, затем та же цель
+    автоматически продолжается через persistent Autopilot.
+54. Chat SSE передаёт resolved execution mode, job ID, phase, reviewed/total,
+    pending, work-unit attempts и replans; клиент не должен показывать
+    неподвижное «анализирует» во время длительной job.
+55. Успешный Autopilot из чата архивирует исходный user turn и terminal answer
+    в родительский thread. Роли `user` и `human` отображаются как пользователь.
+56. `allow_write` остаётся отдельным trusted boolean и является частью job
+    identity; текст сообщения или execution mode не выдаёт право записи.
 
 ## 7.13. Persistent autopilot jobs (0.19.0)
 
@@ -706,6 +722,15 @@ SQLite `autopilot.sqlite3` хранится в `AGENT_DATA_DIR`. Один model 
 work unit, а не job. В prompt не помещается весь проект или история units:
 controller передаёт только manifest batch, применимые требования, summaries и
 bounded результат последней проверки.
+
+## 7.14. Chat-integrated autopilot (0.19.1)
+
+Web-чат является единой точкой постановки обычных и длительных задач. Backend,
+а не JavaScript, вычисляет auto route и выполняет step-limit fallback. Прямые
+`/api/jobs` остаются стабильным программным API и источником persisted status,
+но отдельной пользовательской вкладки Autopilot нет. Browser отображает
+события той же TaskRegistry/SQLite job и после reload получает job history из
+`/api/jobs`, не создавая параллельное хранилище.
 
 ## 8. Этапы
 

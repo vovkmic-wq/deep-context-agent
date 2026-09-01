@@ -392,8 +392,8 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 
 ### 13.12. Автопилот длительных задач / Long-running autopilot 0.19.0
 
-1. Раздел «Аудиты» становится «Автопилот / Autopilot»: оператор вводит цель,
-   выбирает read-only/allow-write и при необходимости include/exclude. Поля
+1. Persistent Autopilot использует основной чат; отдельная вкладка не нужна.
+   Оператор вводит цель, выбирает read-only/allow-write и execution mode. Поля
    batch size и max batches отсутствуют в основном UX.
 2. `POST /api/jobs` создаёт или возобновляет persistent job и возвращает
    `job_id`, `task_id`, mode. `GET /api/jobs` и `/api/jobs/{id}` доступны без
@@ -411,3 +411,19 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 7. Browser acceptance воспроизводит прежний broad Ozon request: UI не требует
    ручного деления, несколько work units видны в прогрессе, step-limit unit
    вызывает replan, а terminal соответствует сохранённой SQLite job.
+
+### 13.13. Autopilot внутри чата / Chat-integrated autopilot 0.19.1
+
+1. В шапке чата доступен selector `Авто / Autopilot / Обычный ответ`.
+2. Explicit Autopilot не зависит от ключевых слов. Auto использует server-side
+   classifier и после безопасно откатанного step/context limit переключается в
+   persistent job. Explicit single-turn запрещает такое переключение.
+3. События execution/job progress обновляют pending bubble и отдельную строку
+   статуса. Пользователь видит job ID, фазу, files, units и replans.
+4. Список persisted jobs текущего thread находится в боковой панели чата;
+   отдельные nav button, panel и form Autopilot отсутствуют в production HTML.
+5. Завершённый Autopilot архивирует turn в исходный thread, поэтому reload не
+   теряет постановку и итог. UI считает `user` и `human` пользовательскими
+   ролями.
+6. Regression использует точный запрос из production-журнала, explicit short
+   job, automatic step-limit fallback и explicit single-turn negative case.

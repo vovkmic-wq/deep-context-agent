@@ -122,6 +122,10 @@ def test_complex_project_implementation_is_routed_to_persistent_job() -> None:
     assert is_long_running_project_request(
         "Выполни пункты ТЗ для недостающих модулей проекта и проведи тесты."  # noqa: RUF001
     )
+    assert is_long_running_project_request(
+        "Необходимо разбираться с недостающими модулями проекта "  # noqa: RUF001
+        "в соответствии с промтом и ТЗ."  # noqa: RUF001
+    )
     assert not is_long_running_project_request("Объясни архитектуру проекта кратко.")
 
 

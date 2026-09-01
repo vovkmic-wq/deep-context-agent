@@ -234,7 +234,8 @@ _BROAD_PROJECT_SCOPE_PATTERN = re.compile(
 )
 _AUTOPILOT_ACTION_PATTERN = re.compile(
     r"(?iu)(?:\b(?:implement|fix|repair|complete|deliver|build|test)\b|"
-    r"реализ|исправ|устран|выполн|доработ|довед|протест|сделай|создай)"
+    r"реализ|исправ|устран|выполн|доработ|довед|протест|сделай|создай|"
+    r"разбира|разбер|заним|необходим\w*\s+(?:разобра|доработ|исправ|реализ))"
 )
 _AUTOPILOT_COMPLEXITY_PATTERN = re.compile(
     r"(?iu)(?:\b(?:specification|requirements|production|tests?|modules?|"
@@ -3305,6 +3306,12 @@ class AgentRuntime:
             lease_seconds=self.app_config.autopilot_lease_seconds,
         )
         if job_progress.status == "complete":
+            self._emit_autopilot_progress(
+                progress_callback,
+                job_progress,
+                None,
+                "complete",
+            )
             if report_file is not None:
                 details = self.autopilot_store.details(
                     job_progress.job_id, unit_limit=1
