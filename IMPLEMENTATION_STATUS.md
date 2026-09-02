@@ -3,6 +3,55 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Five chat modes 0.21.0 — 2026-09-02
+
+| Этап 0.21.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Mode contract | Завершён | Только Agent/Ask/Plan/Debug/Multitask в Pydantic, runtime metadata, HTML и TypeScript; 11 legacy values получают 422 |
+| Server policy | Завершён | Ask/Plan forced read-only, Ask/Plan/Debug forced single-turn, trusted mutation middleware не зависит от JavaScript |
+| Multitask | Завершён | До четырёх concurrent Web tasks, отдельный child thread/SSE/pending bubble, cancel-all и worktree warning |
+| Context UX | Завершён | Aggregate SQLite usage API, accessible circular estimate и built-in Deep Agents summarization explanation |
+| Browser/live | Завершён | Production bundle открыт на loopback; все mode defaults и meter проверены без console errors; настоящий GLM Ask-turn PASS |
+| Quality/package | Завершён | Ruff/format/mypy/pytest/TypeScript/bundle/compile/package/secret contour выполнен перед release |
+
+Финальные evidence 0.21.0:
+
+- pytest — 268 passed, 1 planned Windows symlink skip; Ruff check/format и
+  mypy — PASS; production JS+CSS bundle — 45 699 bytes;
+- Browser production DOM содержит mode values `agent`, `ask`, `plan`, `debug`,
+  `multitask` и ни одной прежней карточки; Ask/Plan disabled+unchecked write,
+  Debug/Agent trusted-write UI, Multitask safe write default подтверждены;
+- context meter изменился с 0 до 0.5% на 1 600 символах, tooltip сообщает об
+  automatic summary и SQLite archive, browser console errors отсутствуют;
+- реальный Web task `3ba4697d8ed34a49b9a7d8b751179751` через
+  `zhipu/glm-5.3` принял raw `allow_write=true` + `execution_mode=autopilot`, но
+  исполнился как Ask `single-turn`, `allow_write=false`, вернул контрольную
+  строку и terminal completed; отдельный `doctor --live` — `OK`.
+- wheel `deep_context_agent-0.21.0-py3-none-any.whl` содержит 25 файлов,
+  запрещённые SQLite/JSONL/env artifacts отсутствуют, изолированный target
+  вернул 0.21.0; SHA-256
+  `72AD3F5F39947858196121E517A203D73C16F2016F10581A144118BD8C218755`.
+
+## Durable lease orchestration 0.20.0 — 2026-09-02
+
+| Этап 0.20.0 | Статус | Реализация/проверка |
+|---|---|---|
+| Schema/migration | Завершён | Job/unit generation, heartbeat, deadline и interrupted с idempotent migration существующей SQLite |
+| Fencing | Завершён | Все owner transitions проверяют token+generation; mutation guard закрывается при lease loss |
+| Long unit | Завершён | Audit/verify/repair heartbeat действует во время model/check call, batch ≤2, recursion 40, soft deadline 900 s |
+| Recovery | Завершён | Expired running unit становится interrupted; job paused, resume создаёт новую generation/thread |
+| Web progress | Завершён | Persisted heartbeat/deadline/generation/interrupted доступны job DTO и SSE |
+| Tests/live | Завершён | Migration, stale owner, expiry, delayed unit, clean Web job и real provider tests PASS |
+
+Финальные evidence 0.20.0:
+
+- production SQLite миграция сохранила две старые jobs как
+  paused/interrupted и две work units как interrupted без удаления истории;
+- реальная unit дольше 30-second test lease завершилась без premature takeover;
+  clean repeat task `1ad47374e6c54c129218dc557cd11bdd` получил 58 heartbeat
+  events, terminal complete и generation 1;
+- `zhipu/glm-5.3` с fallback `openai/gpt-5.6-sol` прошёл live doctor.
+
 ## Chat-integrated Autopilot 0.19.1 — 2026-09-01
 
 | Этап 0.19.1 | Статус | Реализация/проверка |

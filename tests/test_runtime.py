@@ -38,6 +38,7 @@ from context_agent.runtime import (
     forbidden_read_paths,
     format_acceptance_evaluation,
     is_broad_project_audit_request,
+    is_engineering_execution_request,
     is_incomplete_mutation_request,
     is_long_running_project_request,
     limit_retrieved_hits,
@@ -127,6 +128,14 @@ def test_complex_project_implementation_is_routed_to_persistent_job() -> None:
         "в соответствии с промтом и ТЗ."  # noqa: RUF001
     )
     assert not is_long_running_project_request("Объясни архитектуру проекта кратко.")
+
+
+def test_engineering_execution_requires_two_distinct_signals() -> None:
+    assert is_engineering_execution_request(
+        "Реализуй требования ТЗ и проведи тесты."  # noqa: RUF001
+    )
+    assert not is_engineering_execution_request("test")
+    assert not is_engineering_execution_request("Объясни тест кратко.")
 
 
 def test_project_audit_manifest_paths_are_strict_and_bounded() -> None:
@@ -1288,6 +1297,41 @@ def test_agent_can_create_directory_and_file_inside_workspace(tmp_path: Path) ->
         assert "write_file /workspace/notes/result.txt: success" in answer
     result_path = app_config.workspace / "notes" / "result.txt"
     assert result_path.read_text(encoding="utf-8") == "saved by agent"
+
+
+def test_turn_mutation_policy_denies_write_even_when_model_requests_it(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/mode-denied.txt",
+                            "content": "MUST_NOT_BE_WRITTEN",
+                        },
+                        "id": "mode-policy-write",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Read-only policy respected."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.set_filesystem_mutations_allowed(False)
+        answer = runtime.ask(
+            "Create /workspace/mode-denied.txt with text MUST_NOT_BE_WRITTEN"
+        )
+
+    assert not (app_config.workspace / "mode-denied.txt").exists()
+    assert [entry.status for entry in runtime.last_tool_audit] == ["denied"]
+    assert "write_file /workspace/mode-denied.txt: denied" in answer
 
 
 def test_parallel_model_tool_calls_are_reduced_to_one_per_step(

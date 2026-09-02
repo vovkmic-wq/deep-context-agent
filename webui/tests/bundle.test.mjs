@@ -23,10 +23,14 @@ for (const required of [
   '"/api/providers"',
   "dca_enter_send",
   "dca_chat_execution",
+  "dca_chat_mode",
   "job_progress",
+  "job_heartbeat",
+  "job_deadline",
   "chat-job-list",
   "files-back",
   "custom-provider-form",
+  "context-meter",
   "expected_sha256",
 ]) {
   if (!source.includes(required)) {
@@ -39,5 +43,36 @@ if (htmlSource.includes('data-panel="audits"') || htmlSource.includes('id="audit
 }
 if (!htmlSource.includes('id="chat-execution"')) {
   throw new Error("Chat execution mode selector is missing");
+}
+for (const mode of ["agent", "ask", "plan", "debug", "multitask"]) {
+  if (!htmlSource.includes(`data-mode="${mode}"`)) {
+    throw new Error(`Chat mode card is missing: ${mode}`);
+  }
+  if (!htmlSource.includes(`<option value="${mode}">`)) {
+    throw new Error(`Chat mode option is missing: ${mode}`);
+  }
+}
+for (const legacyMode of [
+  "general",
+  "audit",
+  "coder",
+  "tester",
+  "reviewer",
+  "debugger",
+  "refactor",
+  "security",
+  "docs",
+  "architect",
+  "research",
+]) {
+  if (
+    htmlSource.includes(`data-mode="${legacyMode}"`) ||
+    htmlSource.includes(`<option value="${legacyMode}">`)
+  ) {
+    throw new Error(`Legacy chat mode is still present: ${legacyMode}`);
+  }
+}
+if (!htmlSource.includes('id="context-meter"')) {
+  throw new Error("Context usage meter is missing");
 }
 console.log(`bundle_ok bytes=${total}`);

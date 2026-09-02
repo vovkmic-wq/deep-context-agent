@@ -258,10 +258,9 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 4. Настройка «Enter отправляет» является несекретным device preference в local
    storage и по умолчанию выключена. При включении Enter отправляет сообщение;
    Shift+Enter всегда вставляет перевод строки, IME composition не прерывается.
-5. Режимы `general`, `audit`, `coder`, `tester`, `reviewer`, `debugger`,
-   `refactor`, `security`, `architect`, `docs` доступны на обзоре и в чате.
-   Режим влияет только на краткую инструкцию модели и не расширяет Web или
-   filesystem authority.
+5. Режимы `agent`, `ask`, `plan`, `debug`, `multitask` доступны на обзоре и в
+   чате. Старые названия отсутствуют в production HTML/API. Backend применяет
+   их execution/read-write policy и не полагается на JavaScript.
 
 ### 13.3. Контекст и аудит
 
@@ -427,3 +426,40 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
    ролями.
 6. Regression использует точный запрос из production-журнала, explicit short
    job, automatic step-limit fallback и explicit single-turn negative case.
+
+### 13.14. Durable lease и живой прогресс / Heartbeat and fencing 0.20.0
+
+1. `job_heartbeat` обновляет pending message без создания нового сообщения:
+   отображаются «модель работает», phase, generation и время последней связи.
+2. `job_deadline` означает превышение soft unit deadline, но не ложный terminal;
+   UI сообщает о безопасном завершении текущей unit и последующей переоценке.
+3. `GET /api/jobs/{id}` возвращает safe `lease_generation`,
+   `last_heartbeat_at`, `active_unit_started_at` и interrupted count. Token,
+   physical workspace, raw exception и provider payload не возвращаются.
+4. Reconnect/reload получает те же timestamps из SQLite; browser не генерирует
+   heartbeat и не считается источником состояния владения.
+5. Engineering modes в `auto` сразу используют Autopilot для action +
+   code/spec/test/module задач. Явный `single-turn` не повышается автоматически.
+6. Browser/live regression удерживает unit дольше прежнего lease, видит не менее
+   двух heartbeat, не получает premature failure и после restart видит
+   `interrupted`/новую generation либо корректный terminal result.
+
+### 13.15. Пять режимов чата / Five chat modes 0.21.0
+
+1. `Agent` — основной до результата; `Ask` — только чтение; `Plan` — вопросы и
+   план до одобрения; `Debug` — hypothesis/log/reproduce/analyze; `Multitask` —
+   несколько независимых фоновых задач.
+2. Ask/Plan отключают write в UI и backend. Agent/Debug предлагают write, но
+   trusted boolean и общие filesystem policies остаются обязательными.
+3. Multitask разрешает несколько одновременных composer submissions, показывает
+   отдельный pending bubble/SSE каждой task и кнопку отмены всех активных.
+4. Server присваивает каждой Multitask task child thread; одновременные writes в
+   один checkout требуют внешней worktree isolation и явно предупреждаются UI.
+5. В правой нижней части composer расположен доступный круговой meter с percent,
+   tooltip и `aria-valuenow`. Цвет меняется на warning у границы compacting.
+6. `GET /api/threads/{id}/messages` дополнительно возвращает aggregate
+   `context_usage`; тела сообщений остаются bounded указанной page.
+7. UI поясняет automatic Deep Agents summary. Полная SQLite history не удаляется
+   и остаётся доступной context search после active-context compaction.
+8. Browser/API tests проверяют ровно пять modes, legacy 422, read-only policy,
+   параллельную отправку, child IDs и meter без утечки дополнительной истории.

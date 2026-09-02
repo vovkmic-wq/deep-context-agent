@@ -111,6 +111,10 @@ def classify_failure(exc: BaseException) -> str:
             ),
         ),
         ("agent_step_limit", ("graphrecursionerror", "recursion limit")),
+        (
+            "autopilot_lease_lost",
+            ("autopilot lease ownership", "autopilotleaseerror"),
+        ),
     )
     return next(
         (

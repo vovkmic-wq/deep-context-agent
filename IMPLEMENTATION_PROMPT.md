@@ -1,7 +1,34 @@
 # Управляющий промпт реализации
 
-Последний завершённый production-этап описан промптом 0.18.0. Версия кода
-изменена только после полного offline/live/package acceptance.
+Последний production-этап описан промптом 0.21.0. Версия кода изменяется только
+после полного offline/live/package acceptance.
+
+## Five chat modes 0.21.0 (2026-09-02)
+
+Работай по `DEEP_CONTEXT_AGENT_0_21_CODEX_CHAT_MODES_PROMPT.md`, основному и
+Web-ТЗ. В Web chat допустимы только `Agent`, `Ask`, `Plan`, `Debug`,
+`Multitask`; прежние mode values удалены из HTML/TypeScript/API и отклоняются
+как 422. Политика режима исполняется backend-ом: Ask/Plan всегда read-only,
+Debug single-turn с опциональной trusted диагностикой, Agent до результата,
+Multitask — отдельные child threads в bounded pool. Ни один режим не расширяет
+workspace, provider, MCP, shell или destructive policy.
+
+Добавь круговой bounded estimate активного контекста. Deep Agents
+SummarizationMiddleware автоматически компактирует раннюю историю для модели,
+но SQLite archive/retrieval не удаляется. Проверь API policy, реальный запрет
+write, два конкурентных workers, отсутствие legacy values, production bundle,
+браузерный UX и live provider turn до публикации.
+
+## Durable lease orchestration 0.20.0 (2026-09-02)
+
+Работай по `DEEP_CONTEXT_AGENT_0_20_DURABLE_LEASE_ORCHESTRATION_PROMPT.md`.
+Каждый controller lease содержит token и monotonic generation; все owner
+transitions и filesystem mutation gate проверяют оба. Heartbeat действует во
+время audit/repair/verification unit, expired running unit сохраняется как
+`interrupted`, а recovery создаёт новую generation и повторно сверяет manifest.
+Ограничивай unit batch/recursion/soft deadline программно и показывай persisted
+heartbeat/deadline через тот же SSE. Повтори expired-lease, stale-owner и live
+долгую unit; не объявляй production до полного package acceptance.
 
 ## Durable failure journal 0.18.0 (2026-08-30)
 
@@ -354,6 +381,18 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
     job после `agent_step_limit`, SSE показывает job progress, а завершённый
     результат остаётся в истории исходного thread. Повтори точную проблемную
     русскую формулировку через настоящий `/api/chat`.
+19. После production lease-инцидента 0.19.1 реализуй 0.20.0 по
+    `DEEP_CONTEXT_AGENT_0_20_DURABLE_LEASE_ORCHESTRATION_PROMPT.md`: введи
+    generation fencing, периодический heartbeat внутри долгой unit, явное
+    состояние `interrupted`, bounded unit batch/recursion/deadline и раннюю
+    маршрутизацию инженерных задач из auto chat. Мигрируй существующую SQLite,
+    повтори прежний expired-lease сценарий и запрети stale worker коммитить или
+    продолжать filesystem mutations.
+20. После durable lease 0.20.0 реализуй Web chat 0.21.0 по
+    `DEEP_CONTEXT_AGENT_0_21_CODEX_CHAT_MODES_PROMPT.md`: полностью замени старые
+    роли на Agent/Ask/Plan/Debug/Multitask, обеспечь server-side read/write и
+    execution policies, параллельные изолированные tasks и круговой estimate
+    активного контекста с автоматической summarization Deep Agents.
 
 Инженерные ограничения:
 
@@ -395,6 +434,23 @@ pytest, package/CLI/doctor и полный изолированный OpenAI acc
   прогресс и ToolMessage evidence коммитятся атомарно до следующего шага;
 - allow-write, pause, resume и cancel берутся только из доверенных CLI/API полей,
   не из текста задачи.
+- lease продлевается всё время исполнения audit/repair/verification unit;
+  обновление только перед model call недостаточно;
+- token без monotonically increasing generation не является достаточным fencing:
+  каждая owner mutation проверяет оба значения;
+- аварийно оставшаяся `running` unit сохраняется как `interrupted`, а не
+  маскируется под `pending`; повтор использует новый sequence и worker thread;
+- потерявший lease worker не выполняет новые mutating tools и не записывает
+  terminal state; manifest/hash после recovery проверяется заново;
+- heartbeat/deadline/progress являются server-side persisted execution state и
+  передаются тем же SSE, а не хранятся только в браузере.
+- chat mode policy исполняется backend-ом: Ask/Plan всегда read-only, Plan/Debug
+  являются последовательными interactive turns, а Multitask использует разные
+  child thread IDs и bounded server pool;
+- никакое название режима не обходит workspace/path/destructive/provider/MCP
+  policy; `Agent` означает полный доступ только к реально настроенным tools;
+- круг заполнения контекста показывает bounded estimate, а не точный provider
+  billing; автоматический summary не удаляет SQLite archive/retrieval memory.
 
 Финальный результат: устанавливаемый Python-проект, рабочий CLI Deep Agent,
 пройденные тесты и заполненный `IMPLEMENTATION_STATUS.md` с трассировкой всех

@@ -296,9 +296,9 @@
 2. Chat организован как task/thread: bounded persistent history, новая задача,
    нижний auto-grow composer, cancel/error states. Device preference
    Enter-to-send выключен по умолчанию; Shift+Enter всегда добавляет строку.
-3. Overview и chat поддерживают режимы general/audit/coder/tester/reviewer/
-   debugger/refactor/security/architect/docs. Режим — prompt hint и никогда не
-   предоставляет mutation authority.
+3. Overview и chat поддерживают только `agent`, `ask`, `plan`, `debug`,
+   `multitask`. Старые role names запрещены. Режим задаёт server-side execution
+   policy, но не расширяет workspace/path/destructive/provider/MCP policy.
 4. Context index нормализует virtual `/workspace` ровно один раз, показывает
    lifecycle фоновой задачи и точные итоговые counters либо safe error.
 5. Audit include, exclude и batch size имеют bilingual label и русское
@@ -708,6 +708,36 @@ Coding Plan пользователь явно задаёт
     в родительский thread. Роли `user` и `human` отображаются как пользователь.
 56. `allow_write` остаётся отдельным trusted boolean и является частью job
     identity; текст сообщения или execution mode не выдаёт право записи.
+57. Job lease имеет monotonically increasing `lease_generation`. Все owner
+    transitions проверяют одновременно job ID, opaque token, generation,
+    running status и неистёкший lease.
+58. Длительная work unit продлевает lease heartbeat-ом во время model/tool/check
+    исполнения. Job и активная unit хранят safe timestamp последней пульсации.
+59. После restart/expired lease незавершённая unit получает terminal-like
+    `interrupted` с сохранённой forensic evidence; controller создаёт новую unit
+    и не превращает старую в `pending`.
+60. Stale worker после смены generation не может выполнить новый mutating tool,
+    завершить unit, replan, verification или terminal job transition.
+61. Autopilot использует внутренние batch cap, recursion limit и soft deadline.
+    Они адаптируются контроллером и не требуют решений пользователя.
+62. `job_heartbeat`/`job_deadline` проходят через TaskRegistry/SSE, а persisted
+    job details содержат generation, last heartbeat и active unit timestamp.
+63. В Web engineering mode server-side auto classifier маршрутизирует action +
+    code/spec/test/module objective прямо в job. Explicit `single-turn` всегда
+    сохраняет однократный режим.
+64. Resume повторно хэширует manifest: side effects прерванной unit не являются
+    reviewed evidence без коммита ToolMessage/manifest предыдущим владельцем.
+65. Chat API принимает только Agent/Ask/Plan/Debug/Multitask. Ask и Plan всегда
+    read-only; Plan и Debug — interactive single turns; Agent/Multitask могут
+    использовать persistent Autopilot по server-side classifier.
+66. Multitask создаёт независимый child thread для каждой фоновой task, имеет
+    bounded concurrency и не использует общий in-flight checkpoint namespace.
+67. Thread context usage API возвращает только bounded aggregate estimate:
+    message count, character count, estimated tokens, configured limit, percent
+    и признак automatic summarization; дополнительные message bodies запрещены.
+68. Круговой Web indicator показывает эту оценку и обновляется при вводе.
+    Deep Agents summarization сохраняет compact summary в active conversation,
+    полная SQLite history остаётся доступной retrieval.
 
 ## 7.13. Persistent autopilot jobs (0.19.0)
 
@@ -731,6 +761,33 @@ Web-чат является единой точкой постановки об�
 но отдельной пользовательской вкладки Autopilot нет. Browser отображает
 события той же TaskRegistry/SQLite job и после reload получает job history из
 `/api/jobs`, не создавая параллельное хранилище.
+
+## 7.15. Durable lease heartbeat and fencing (0.20.0)
+
+Нормативная последовательность, миграции и acceptance определены в
+`DEEP_CONTEXT_AGENT_0_20_DURABLE_LEASE_ORCHESTRATION_PROMPT.md`. Lease является
+временным правом одного controller generation, а не таймером общей задачи.
+Heartbeat сохраняет это право, пока выполняется одна bounded unit. Потеря права
+закрывает mutation gate и запрещает stale owner записывать результат.
+
+Recovery не стирает историю: старая running unit становится `interrupted`,
+после чего новый generation повторно сверяет текущие hashes и создаёт новую unit.
+Soft deadline служит наблюдаемой границей и поводом уменьшить следующий batch;
+он не запускает конкурентный replacement, пока прежний worker ещё способен
+изменять workspace.
+
+## 7.16. Five chat modes and context meter (0.21.0)
+
+Нормативное поведение описано в
+`DEEP_CONTEXT_AGENT_0_21_CODEX_CHAT_MODES_PROMPT.md`. `Agent` использует все
+фактически настроенные tools в текущей security boundary; `Ask` и `Plan` не
+мутируют; `Debug` ведёт последовательный hypothesis/reproduction loop;
+`Multitask` создаёт отдельные фоновые tasks/child threads. Это не разрешение на
+произвольный shell, незарегистрированный MCP или запись вне workspace.
+
+Deep Agents built-in summarization остаётся включена. Круг контекста отображает
+оценку архивных conversational tokens относительно
+`AGENT_ACTIVE_CONTEXT_MAX_TOKENS`; он не является точным provider token meter.
 
 ## 8. Этапы
 

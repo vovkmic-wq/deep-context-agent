@@ -42,15 +42,11 @@
               <div><h2 id="overview-title">С чего начнём?</h2><p>Выберите инженерный режим — он откроется в чате с подходящей ролью.</p></div>
             </div>
             <div id="mode-grid" class="mode-grid">
-              <button class="mode-card" data-mode="audit"><span>◎</span><strong>Аудитор</strong><small>Сверка кода с ТЗ и доказательные находки</small></button>
-              <button class="mode-card featured" data-mode="coder"><span>⌘</span><strong>Кодер</strong><small>Реализация функций и безопасные правки</small></button>
-              <button class="mode-card" data-mode="tester"><span>✓</span><strong>Тестировщик</strong><small>Тест-дизайн, запуск и проверка результата</small></button>
-              <button class="mode-card" data-mode="reviewer"><span>◉</span><strong>Code reviewer</strong><small>Корректность, регрессии и качество кода</small></button>
-              <button class="mode-card" data-mode="debugger"><span>⌕</span><strong>Отладчик</strong><small>Поиск первопричины и проверка исправления</small></button>
-              <button class="mode-card" data-mode="refactor"><span>↻</span><strong>Рефакторинг</strong><small>Улучшение структуры без смены поведения</small></button>
-              <button class="mode-card" data-mode="security"><span>◇</span><strong>Безопасность</strong><small>Секреты, пути и границы доверия</small></button>
-              <button class="mode-card" data-mode="architect"><span>△</span><strong>Архитектор</strong><small>Проектирование совместимых изменений</small></button>
-              <button class="mode-card" data-mode="docs"><span>≡</span><strong>Документация</strong><small>ТЗ, инструкции и история изменений</small></button>
+              <button class="mode-card featured" data-mode="agent"><span>⌘</span><strong>Agent</strong><small>Основной режим: выполняет задачу до проверяемого результата</small></button>
+              <button class="mode-card" data-mode="ask"><span>?</span><strong>Ask</strong><small>Только читает код и отвечает, ничего не изменяя</small></button>
+              <button class="mode-card" data-mode="plan"><span>≡</span><strong>Plan</strong><small>Уточняющие вопросы и план до вашего одобрения</small></button>
+              <button class="mode-card" data-mode="debug"><span>⌕</span><strong>Debug</strong><small>Гипотеза, диагностика, воспроизведение и root cause</small></button>
+              <button class="mode-card" data-mode="multitask"><span>⋯</span><strong>Multitask</strong><small>Несколько независимых фоновых задач одновременно</small></button>
             </div>
             <div id="overview-grid" class="metric-grid"></div>
             <details class="diagnostics"><summary>Техническая диагностика / Technical diagnostics</summary><pre id="health" class="output"></pre></details>
@@ -69,7 +65,7 @@
                   <div><p class="eyebrow">Текущая задача</p><h2 id="chat-title">Чат с агентом</h2><small id="current-thread-label">web</small></div>
                   <label class="compact-label">Режим / Mode
                     <select id="chat-mode">
-                      <option value="general">Универсальный</option><option value="audit">Аудитор</option><option value="coder">Кодер</option><option value="tester">Тестировщик</option><option value="reviewer">Code reviewer</option><option value="debugger">Отладчик</option><option value="refactor">Рефакторинг</option><option value="security">Безопасность</option><option value="architect">Архитектор</option><option value="docs">Документация</option>
+                      <option value="agent">Agent — выполнить до результата</option><option value="ask">Ask — только чтение</option><option value="plan">Plan — вопросы и план</option><option value="debug">Debug — гипотезы и воспроизведение</option><option value="multitask">Multitask — параллельные задачи</option>
                     </select>
                   </label>
                   <label class="compact-label">Выполнение / Execution
@@ -78,6 +74,7 @@
                     </select>
                   </label>
                 </div>
+                <small id="mode-help" class="mode-help">Agent использует все настроенные инструменты в пределах workspace и доверенных разрешений.</small>
                 <div id="chat-job-status" class="operation-status" aria-live="polite" hidden></div>
                 <div id="chat-output" class="conversation" aria-live="polite"><div class="empty-state"><strong>Готов к работе</strong><span>Опишите задачу, приложите путь или попросите проверить проект.</span></div></div>
                 <form id="chat-form" class="composer">
@@ -86,9 +83,9 @@
                     <div class="composer-options">
                       <label class="toggle"><input id="auto-context" type="checkbox" checked> Автоконтекст</label>
                       <label class="toggle"><input id="enter-send" type="checkbox"> Enter отправляет</label>
-                      <label class="toggle warning"><input id="chat-write" type="checkbox"> Разрешить правки</label>
+                      <label class="toggle warning"><input id="chat-write" type="checkbox" checked> Разрешить правки</label>
                     </div>
-                    <div class="composer-actions"><button id="cancel-chat" type="button" class="icon-button" disabled aria-label="Остановить">■</button><button type="submit" class="send-button" aria-label="Отправить">↑</button></div>
+                    <div class="composer-actions"><span id="context-meter" class="context-meter" role="progressbar" aria-label="Заполнение активного контекста" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" title="Оценка заполнения контекста; при приближении к пределу Deep Agents автоматически создаёт summary."><span id="context-meter-label">0%</span></span><button id="cancel-chat" type="button" class="icon-button" disabled aria-label="Остановить все активные задачи">■</button><button type="submit" class="send-button" aria-label="Отправить">↑</button></div>
                   </div>
                 </form>
               </div>

@@ -331,6 +331,11 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"audit_max_reads_per_file={app_config.audit_max_reads_per_file}")
     print(f"autopilot_max_work_units={app_config.autopilot_max_work_units}")
     print(f"autopilot_max_replans={app_config.autopilot_max_replans}")
+    print(f"autopilot_lease_seconds={app_config.autopilot_lease_seconds}")
+    print(f"autopilot_heartbeat_seconds={app_config.autopilot_heartbeat_seconds}")
+    print(f"autopilot_unit_timeout_seconds={app_config.autopilot_unit_timeout_seconds}")
+    print(f"autopilot_unit_batch_size={app_config.autopilot_unit_batch_size}")
+    print(f"autopilot_recursion_limit={app_config.autopilot_recursion_limit}")
     print("audit_mode_default=read-only")
     print(
         "audit_include="

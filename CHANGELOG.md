@@ -7,6 +7,60 @@
 
 Изменений пока нет.
 
+## [0.21.0] — 2026-09-02
+
+### Добавлено
+
+- В Web chat введены ровно пять режимов: `Agent`, `Ask`, `Plan`, `Debug`,
+  `Multitask`; переключение находится в composer/overview и меняет серверную
+  execution policy, а не только текст роли.
+- `Multitask` запускает до четырёх независимых background tasks с отдельными
+  child thread ID, SSE и pending-сообщениями; все активные задачи можно
+  отменить одной кнопкой.
+- Добавлен круговой estimate заполнения активного контекста. API возвращает
+  только aggregate message/character/token usage; встроенная Deep Agents
+  summarization продолжает компактировать model context, сохраняя SQLite.
+
+### Изменено
+
+- `Ask` и `Plan` принудительно работают read-only single-turn даже при сыром
+  `allow_write=true`; `Debug` — последовательный hypothesis/reproduction turn;
+  `Agent` и `Multitask` используют Autopilot для сложных инженерных целей.
+- Удалены старые chat-mode values `general`, `audit`, `coder`, `tester`,
+  `reviewer`, `debugger`, `refactor`, `security`, `docs`, `architect` и
+  `research`; API отклоняет их как 422.
+- Версия пакета и Web UI повышена до 0.21.0.
+
+### Проверено
+
+- Ruff check/format, mypy, 268 pytest cases с одним ожидаемым Windows symlink
+  skip, TypeScript check и production bundle.
+- Browser live: ровно пять режимов, Ask/Plan write lock, режимные defaults,
+  context meter и отсутствие console errors.
+- Реальный Web Ask-turn через `zhipu/glm-5.3` подтвердил forced read-only,
+  forced single-turn и terminal SSE; `doctor --live` вернул `OK`.
+
+## [0.20.0] — 2026-09-02
+
+### Добавлено
+
+- Lease generation fencing, периодический heartbeat и persisted
+  `last_heartbeat_at` для job/work unit.
+- Явный `interrupted`, soft unit deadline, bounded unit batch/recursion и
+  heartbeat/deadline SSE.
+
+### Исправлено
+
+- Stale worker после потери lease больше не может вызывать mutating tool,
+  коммитить progress или terminal result.
+- Старые running jobs безопасно мигрируют в paused/interrupted; новый owner
+  получает следующую generation и новый worker thread.
+
+### Проверено
+
+- Migration, expiry/recovery, generation fencing, delayed-unit heartbeat,
+  stale-owner mutation denial и real Web Autopilot acceptance.
+
 ## [0.19.1] — 2026-09-01
 
 ### Исправлено

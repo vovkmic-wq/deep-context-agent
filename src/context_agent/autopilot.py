@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -37,6 +38,10 @@ class AutopilotProgress:
     verification_status: str
     last_error_code: str | None
     requested_status: str | None
+    interrupted_units: int = 0
+    lease_generation: int = 0
+    last_heartbeat_at: float | None = None
+    active_unit_started_at: float | None = None
 
     @property
     def terminal(self) -> bool:
@@ -57,6 +62,10 @@ class AutopilotProgress:
             "verification_status": self.verification_status,
             "last_error_code": self.last_error_code,
             "requested_status": self.requested_status,
+            "interrupted_units": self.interrupted_units,
+            "lease_generation": self.lease_generation,
+            "last_heartbeat_at": self.last_heartbeat_at,
+            "active_unit_started_at": self.active_unit_started_at,
             "terminal": self.terminal,
         }
 
@@ -67,6 +76,102 @@ class AutopilotLease:
 
     job_id: str
     token: str
+    generation: int
+
+
+class AutopilotLeaseError(RuntimeError):
+    """Raised when a controller no longer owns the current job generation."""
+
+
+class AutopilotHeartbeat:
+    """Renew one job lease while a bounded work unit is executing."""
+
+    def __init__(
+        self,
+        store: AutopilotStore,
+        lease: AutopilotLease,
+        *,
+        lease_seconds: int,
+        interval_seconds: float,
+        unit_id: str | None = None,
+        deadline_seconds: float | None = None,
+        on_heartbeat: Callable[[bool], None] | None = None,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("Heartbeat interval must be positive")
+        self._store = store
+        self._lease = lease
+        self._lease_seconds = lease_seconds
+        self._interval_seconds = min(
+            interval_seconds,
+            max(0.1, lease_seconds / 3),
+        )
+        self._unit_id = unit_id
+        self._deadline_seconds = deadline_seconds
+        self._on_heartbeat = on_heartbeat
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._deadline_exceeded = threading.Event()
+        self._error: AutopilotLeaseError | None = None
+        self._started_at = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"autopilot-heartbeat-{lease.job_id[:8]}",
+            daemon=True,
+        )
+
+    @property
+    def deadline_exceeded(self) -> bool:
+        return self._deadline_exceeded.is_set()
+
+    @property
+    def lease_lost(self) -> bool:
+        return self._lost.is_set()
+
+    def __enter__(self) -> AutopilotHeartbeat:
+        self._store.renew_lease(
+            self._lease,
+            self._lease_seconds,
+            unit_id=self._unit_id,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self._interval_seconds + 0.5))
+
+    def ensure_owned(self) -> None:
+        """Fail closed before the caller commits work-unit state."""
+
+        if self._error is not None:
+            raise self._error
+        self._store.assert_lease(self._lease)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            elapsed = time.monotonic() - self._started_at
+            deadline_exceeded = bool(
+                self._deadline_seconds is not None and elapsed >= self._deadline_seconds
+            )
+            if deadline_exceeded:
+                self._deadline_exceeded.set()
+            try:
+                self._store.renew_lease(
+                    self._lease,
+                    self._lease_seconds,
+                    unit_id=self._unit_id,
+                )
+            except AutopilotLeaseError as exc:
+                self._error = exc
+                self._lost.set()
+                return
+            if self._on_heartbeat is not None:
+                try:
+                    self._on_heartbeat(deadline_exceeded)
+                except Exception:
+                    # UI/report callbacks must never stop the ownership heartbeat.
+                    continue
 
 
 class AutopilotStore:
@@ -83,6 +188,7 @@ class AutopilotStore:
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._initialize_schema()
+        self.recover_expired()
 
     def close(self) -> None:
         with self._lock:
@@ -93,6 +199,49 @@ class AutopilotStore:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def recover_expired(self) -> int:
+        """Pause expired jobs and preserve their unfinished units as interrupted."""
+
+        now = time.time()
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id FROM autopilot_jobs
+                WHERE status = 'running' AND lease_token IS NOT NULL
+                    AND COALESCE(lease_until, 0) <= ?
+                """,
+                (now,),
+            ).fetchall()
+            job_ids = [str(row["id"]) for row in rows]
+            for job_id in job_ids:
+                self._connection.execute(
+                    """
+                    UPDATE autopilot_work_units
+                    SET status = 'interrupted',
+                        error_code = COALESCE(error_code, 'worker_interrupted'),
+                        summary = CASE WHEN summary = '' THEN
+                            'Controller lease expired before unit commit.'
+                            ELSE summary END,
+                        finished_at = COALESCE(finished_at, ?)
+                    WHERE job_id = ? AND status = 'running'
+                    """,
+                    (now, job_id),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE autopilot_jobs
+                    SET status = 'paused', phase = 'interrupted',
+                        last_error_code = 'autopilot_lease_expired',
+                        last_error_message =
+                            'Controller lease expired; resume is safe.',
+                        lease_token = NULL, lease_until = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (now, job_id),
+                )
+        return len(job_ids)
 
     def start_or_resume(
         self,
@@ -127,73 +276,103 @@ class AutopilotStore:
         token = uuid4().hex
         now = time.time()
         lease_until = now + lease_seconds
-        with self._lock, self._connection:
-            existing = self._connection.execute(
-                "SELECT status, lease_token, lease_until FROM autopilot_jobs "
-                "WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-            if (
-                existing is not None
-                and str(existing["status"]) == "running"
-                and float(existing["lease_until"] or 0) > now
-                and existing["lease_token"]
-            ):
-                raise RuntimeError("Autopilot job is already running")
-            if existing is not None and str(existing["status"]) == "complete":
-                return self.progress(job_id), AutopilotLease(job_id, "")
-            self._connection.execute(
-                """
-                INSERT INTO autopilot_jobs(
-                    id, thread_id, objective, objective_sha256, workspace, mode,
-                    include_patterns, exclude_patterns,
-                    status, phase, audit_run_id, batch_size, attempts, replans,
-                    verification_status, verification_results, last_error_code,
-                    last_error_message, report, control_requested,
-                    lease_token, lease_until,
-                    created_at, updated_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 'audit', NULL, ?, 0, 0,
-                          'not_run', '[]', NULL, NULL, '', NULL, ?, ?, ?, ?, NULL)
-                ON CONFLICT(id) DO UPDATE SET
-                    status = 'running',
-                    phase = CASE
-                        WHEN autopilot_jobs.phase = 'complete' THEN 'complete'
-                        ELSE autopilot_jobs.phase
-                    END,
-                    batch_size = MIN(autopilot_jobs.batch_size, excluded.batch_size),
-                    lease_token = excluded.lease_token,
-                    lease_until = excluded.lease_until,
-                    last_error_code = NULL,
-                    last_error_message = NULL,
-                    control_requested = NULL,
-                    updated_at = excluded.updated_at,
-                    finished_at = NULL
-                """,
-                (
-                    job_id,
-                    thread_id.strip(),
-                    objective.strip(),
-                    hashlib.sha256(objective.strip().encode("utf-8")).hexdigest(),
-                    str(resolved_workspace),
-                    mode,
-                    json.dumps(include_patterns, ensure_ascii=False),
-                    json.dumps(exclude_patterns, ensure_ascii=False),
-                    batch_size,
-                    token,
-                    lease_until,
-                    now,
-                    now,
-                ),
-            )
-            self._connection.execute(
-                """
-                UPDATE autopilot_work_units
-                SET status = 'pending', finished_at = NULL
-                WHERE job_id = ? AND status = 'running'
-                """,
-                (job_id,),
-            )
-        return self.progress(job_id), AutopilotLease(job_id, token)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._connection.execute(
+                    "SELECT status, lease_token, lease_until, lease_generation "
+                    "FROM autopilot_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if (
+                    existing is not None
+                    and str(existing["status"]) == "running"
+                    and float(existing["lease_until"] or 0) > now
+                    and existing["lease_token"]
+                ):
+                    raise RuntimeError("Autopilot job is already running")
+                if existing is not None and str(existing["status"]) == "complete":
+                    generation = int(existing["lease_generation"] or 0)
+                    self._connection.commit()
+                    return self.progress(job_id), AutopilotLease(
+                        job_id,
+                        "",
+                        generation,
+                    )
+                generation = (
+                    int(existing["lease_generation"] or 0) + 1
+                    if existing is not None
+                    else 1
+                )
+                if existing is not None:
+                    self._connection.execute(
+                        """
+                        UPDATE autopilot_work_units
+                        SET status = 'interrupted',
+                            error_code = COALESCE(error_code, 'worker_interrupted'),
+                            summary = CASE WHEN summary = '' THEN
+                                'Previous controller was interrupted.'
+                                ELSE summary END,
+                            finished_at = COALESCE(finished_at, ?)
+                        WHERE job_id = ? AND status = 'running'
+                        """,
+                        (now, job_id),
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO autopilot_jobs(
+                        id, thread_id, objective, objective_sha256, workspace, mode,
+                        include_patterns, exclude_patterns,
+                        status, phase, audit_run_id, batch_size, attempts, replans,
+                        verification_status, verification_results, last_error_code,
+                        last_error_message, report, control_requested,
+                        lease_token, lease_until, lease_generation, last_heartbeat_at,
+                        created_at, updated_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 'audit', NULL, ?, 0, 0,
+                              'not_run', '[]', NULL, NULL, '', NULL, ?, ?, ?, ?,
+                              ?, ?, NULL)
+                    ON CONFLICT(id) DO UPDATE SET
+                        status = 'running',
+                        phase = CASE
+                            WHEN autopilot_jobs.phase = 'complete' THEN 'complete'
+                            ELSE autopilot_jobs.phase
+                        END,
+                        batch_size = MIN(
+                            autopilot_jobs.batch_size, excluded.batch_size
+                        ),
+                        lease_token = excluded.lease_token,
+                        lease_until = excluded.lease_until,
+                        lease_generation = excluded.lease_generation,
+                        last_heartbeat_at = excluded.last_heartbeat_at,
+                        last_error_code = NULL,
+                        last_error_message = NULL,
+                        control_requested = NULL,
+                        updated_at = excluded.updated_at,
+                        finished_at = NULL
+                    """,
+                    (
+                        job_id,
+                        thread_id.strip(),
+                        objective.strip(),
+                        hashlib.sha256(objective.strip().encode("utf-8")).hexdigest(),
+                        str(resolved_workspace),
+                        mode,
+                        json.dumps(include_patterns, ensure_ascii=False),
+                        json.dumps(exclude_patterns, ensure_ascii=False),
+                        batch_size,
+                        token,
+                        lease_until,
+                        generation,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return self.progress(job_id), AutopilotLease(job_id, token, generation)
 
     @staticmethod
     def job_id_for(
@@ -221,20 +400,53 @@ class AutopilotStore:
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
-    def renew_lease(self, lease: AutopilotLease, lease_seconds: int = 900) -> None:
+    def renew_lease(
+        self,
+        lease: AutopilotLease,
+        lease_seconds: int = 900,
+        *,
+        unit_id: str | None = None,
+    ) -> None:
         if not lease.token:
             return
+        now = time.time()
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """
-                UPDATE autopilot_jobs
-                SET lease_until = ?, updated_at = ?
-                WHERE id = ? AND lease_token = ? AND status = 'running'
+                UPDATE autopilot_jobs SET lease_until = ?, last_heartbeat_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND lease_token = ? AND lease_generation = ?
+                    AND status = 'running' AND lease_until > ?
                 """,
-                (time.time() + lease_seconds, time.time(), lease.job_id, lease.token),
+                (
+                    now + lease_seconds,
+                    now,
+                    now,
+                    lease.job_id,
+                    lease.token,
+                    lease.generation,
+                    now,
+                ),
             )
             if cursor.rowcount == 0:
-                raise RuntimeError("Autopilot job lease was lost")
+                raise AutopilotLeaseError("Autopilot job lease was lost")
+            if unit_id is not None:
+                unit_cursor = self._connection.execute(
+                    """
+                    UPDATE autopilot_work_units SET last_heartbeat_at = ?
+                    WHERE id = ? AND job_id = ? AND lease_generation = ?
+                        AND status = 'running'
+                    """,
+                    (now, unit_id, lease.job_id, lease.generation),
+                )
+                if unit_cursor.rowcount == 0:
+                    raise AutopilotLeaseError("Autopilot work unit lease was lost")
+
+    def assert_lease(self, lease: AutopilotLease) -> None:
+        """Assert ownership for a controller or a mutating tool guard."""
+
+        with self._lock:
+            self._require_lease(lease)
 
     def set_audit_run(self, lease: AutopilotLease, run_id: str) -> None:
         self._leased_update(
@@ -249,6 +461,7 @@ class AutopilotStore:
         *,
         phase: str,
         batch_size: int,
+        deadline_seconds: int | None = None,
     ) -> tuple[str, int, str]:
         """Create one independently retryable unit and return its worker thread."""
 
@@ -276,9 +489,10 @@ class AutopilotStore:
                 """
                 INSERT INTO autopilot_work_units(
                     id, job_id, sequence, phase, status, batch_size,
-                    worker_thread_id, error_code, summary,
-                    created_at, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, '', ?, ?, NULL)
+                    worker_thread_id, lease_generation, error_code, summary,
+                    created_at, started_at, last_heartbeat_at, deadline_at,
+                    finished_at
+                ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, NULL, '', ?, ?, ?, ?, NULL)
                 """,
                 (
                     unit_id,
@@ -287,17 +501,20 @@ class AutopilotStore:
                     phase,
                     batch_size,
                     worker_thread_id,
+                    lease.generation,
                     now,
                     now,
+                    now,
+                    now + deadline_seconds if deadline_seconds else None,
                 ),
             )
             self._connection.execute(
                 """
                 UPDATE autopilot_jobs
                 SET attempts = attempts + 1, phase = ?, updated_at = ?
-                WHERE id = ? AND lease_token = ?
+                WHERE id = ? AND lease_token = ? AND lease_generation = ?
                 """,
-                (phase, now, lease.job_id, lease.token),
+                (phase, now, lease.job_id, lease.token, lease.generation),
             )
         return unit_id, sequence, worker_thread_id
 
@@ -435,10 +652,15 @@ class AutopilotStore:
                 self._connection.execute(
                     """
                     UPDATE autopilot_work_units
-                    SET status = 'pending', finished_at = NULL
+                    SET status = 'interrupted',
+                        error_code = COALESCE(error_code, 'worker_interrupted'),
+                        summary = CASE WHEN summary = '' THEN
+                            'Controller stopped before committing this unit.'
+                            ELSE summary END,
+                        finished_at = COALESCE(finished_at, ?)
                     WHERE job_id = ? AND status = 'running'
                     """,
-                    (job_id,),
+                    (now, job_id),
                 )
         return self.progress(job_id)
 
@@ -461,7 +683,7 @@ class AutopilotStore:
                 SET status = ?, phase = ?, control_requested = NULL,
                     lease_token = NULL, lease_until = NULL,
                     updated_at = ?, finished_at = ?
-                WHERE id = ? AND lease_token = ?
+                WHERE id = ? AND lease_token = ? AND lease_generation = ?
                 """,
                 (
                     requested,
@@ -470,6 +692,7 @@ class AutopilotStore:
                     now if requested == "cancelled" else None,
                     lease.job_id,
                     lease.token,
+                    lease.generation,
                 ),
             )
         return self.progress(lease.job_id)
@@ -480,7 +703,7 @@ class AutopilotStore:
                 """
                 SELECT id, status, phase, mode, audit_run_id, batch_size,
                        attempts, replans, verification_status, last_error_code,
-                       control_requested
+                       control_requested, lease_generation, last_heartbeat_at
                 FROM autopilot_jobs WHERE id = ?
                 """,
                 (job_id,),
@@ -497,6 +720,14 @@ class AutopilotStore:
                     (job_id,),
                 ).fetchall()
             }
+            active = self._connection.execute(
+                """
+                SELECT started_at FROM autopilot_work_units
+                WHERE job_id = ? AND status = 'running'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
         return AutopilotProgress(
             job_id=str(row["id"]),
             status=str(row["status"]),
@@ -515,6 +746,18 @@ class AutopilotStore:
             requested_status=(
                 str(row["control_requested"]) if row["control_requested"] else None
             ),
+            interrupted_units=counts.get("interrupted", 0),
+            lease_generation=int(row["lease_generation"] or 0),
+            last_heartbeat_at=(
+                float(row["last_heartbeat_at"])
+                if row["last_heartbeat_at"] is not None
+                else None
+            ),
+            active_unit_started_at=(
+                float(active["started_at"])
+                if active is not None and active["started_at"] is not None
+                else None
+            ),
         )
 
     def details(self, job_id: str, *, unit_limit: int = 100) -> dict[str, object]:
@@ -529,8 +772,9 @@ class AutopilotStore:
                 for item in self._connection.execute(
                     """
                     SELECT id, sequence, phase, status, batch_size,
-                           worker_thread_id, error_code, summary,
-                           created_at, started_at, finished_at
+                           worker_thread_id, lease_generation, error_code, summary,
+                           created_at, started_at, last_heartbeat_at, deadline_at,
+                           finished_at
                     FROM autopilot_work_units WHERE job_id = ?
                     ORDER BY sequence DESC LIMIT ?
                     """,
@@ -561,7 +805,8 @@ class AutopilotStore:
                 """
                 SELECT id, thread_id, objective_sha256, mode, status, phase,
                        batch_size, attempts, replans, verification_status,
-                       last_error_code, created_at, updated_at, finished_at
+                       last_error_code, lease_generation, last_heartbeat_at,
+                       created_at, updated_at, finished_at
                 FROM autopilot_jobs WHERE workspace = ?
                 ORDER BY updated_at DESC LIMIT ?
                 """,
@@ -583,7 +828,8 @@ class AutopilotStore:
                 """
                 UPDATE autopilot_work_units
                 SET status = ?, error_code = ?, summary = ?, finished_at = ?
-                WHERE id = ? AND job_id = ? AND status = 'running'
+                WHERE id = ? AND job_id = ? AND lease_generation = ?
+                    AND status = 'running'
                 """,
                 (
                     status,
@@ -592,13 +838,17 @@ class AutopilotStore:
                     time.time(),
                     unit_id,
                     lease.job_id,
+                    lease.generation,
                 ),
             )
             if cursor.rowcount == 0:
-                raise RuntimeError("Autopilot work unit is not active")
+                raise AutopilotLeaseError("Autopilot work unit is not active")
             self._connection.execute(
-                "UPDATE autopilot_jobs SET updated_at = ? WHERE id = ?",
-                (time.time(), lease.job_id),
+                """
+                UPDATE autopilot_jobs SET updated_at = ?
+                WHERE id = ? AND lease_token = ? AND lease_generation = ?
+                """,
+                (time.time(), lease.job_id, lease.token, lease.generation),
             )
 
     def _leased_update(
@@ -611,24 +861,29 @@ class AutopilotStore:
             self._require_lease(lease)
             cursor = self._connection.execute(
                 f"UPDATE autopilot_jobs SET {assignments} "
-                "WHERE id = ? AND lease_token = ?",
-                (*values, lease.job_id, lease.token),
+                "WHERE id = ? AND lease_token = ? AND lease_generation = ?",
+                (*values, lease.job_id, lease.token, lease.generation),
             )
             if cursor.rowcount == 0:
-                raise RuntimeError("Autopilot job lease was lost")
+                raise AutopilotLeaseError("Autopilot job lease was lost")
 
     def _require_lease(self, lease: AutopilotLease) -> None:
         row = self._connection.execute(
-            "SELECT lease_token, lease_until FROM autopilot_jobs WHERE id = ?",
+            """
+            SELECT lease_token, lease_until, lease_generation, status
+            FROM autopilot_jobs WHERE id = ?
+            """,
             (lease.job_id,),
         ).fetchone()
         if (
             row is None
             or not lease.token
             or str(row["lease_token"] or "") != lease.token
+            or int(row["lease_generation"] or 0) != lease.generation
+            or str(row["status"]) != "running"
             or float(row["lease_until"] or 0) <= time.time()
         ):
-            raise RuntimeError("Autopilot job lease was lost")
+            raise AutopilotLeaseError("Autopilot job lease was lost")
 
     def _initialize_schema(self) -> None:
         with self._lock, self._connection:
@@ -660,6 +915,8 @@ class AutopilotStore:
                     control_requested TEXT,
                     lease_token TEXT,
                     lease_until REAL,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
+                    last_heartbeat_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     finished_at REAL
@@ -677,10 +934,13 @@ class AutopilotStore:
                     status TEXT NOT NULL,
                     batch_size INTEGER NOT NULL,
                     worker_thread_id TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
                     error_code TEXT,
                     summary TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     started_at REAL,
+                    last_heartbeat_at REAL,
+                    deadline_at REAL,
                     finished_at REAL,
                     UNIQUE(job_id, sequence)
                 );
@@ -699,9 +959,28 @@ class AutopilotStore:
                 "include_patterns": "TEXT NOT NULL DEFAULT '[]'",
                 "exclude_patterns": "TEXT NOT NULL DEFAULT '[]'",
                 "control_requested": "TEXT",
+                "lease_generation": "INTEGER NOT NULL DEFAULT 0",
+                "last_heartbeat_at": "REAL",
             }
             for name, declaration in migrations.items():
                 if name not in columns:
                     self._connection.execute(
                         f"ALTER TABLE autopilot_jobs ADD COLUMN {name} {declaration}"
+                    )
+            unit_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(autopilot_work_units)"
+                ).fetchall()
+            }
+            unit_migrations = {
+                "lease_generation": "INTEGER NOT NULL DEFAULT 0",
+                "last_heartbeat_at": "REAL",
+                "deadline_at": "REAL",
+            }
+            for name, declaration in unit_migrations.items():
+                if name not in unit_columns:
+                    self._connection.execute(
+                        "ALTER TABLE autopilot_work_units "
+                        f"ADD COLUMN {name} {declaration}"
                     )

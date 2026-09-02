@@ -271,6 +271,11 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_AUDIT_MAX_READS_PER_FILE": "5",
             "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "600",
             "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "30000",
+            "AGENT_AUTOPILOT_LEASE_SECONDS": "1200",
+            "AGENT_AUTOPILOT_HEARTBEAT_SECONDS": "20",
+            "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS": "1500",
+            "AGENT_AUTOPILOT_UNIT_BATCH_SIZE": "3",
+            "AGENT_AUTOPILOT_RECURSION_LIMIT": "50",
             "AGENT_FAILURE_LOG_MODE": "metadata",
             "AGENT_FAILURE_LOG_RETENTION_DAYS": "45",
             "AGENT_FAILURE_LOG_MAX_ROWS": "12000",
@@ -294,6 +299,11 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.audit_max_reads_per_file == 5
     assert config.project_check_timeout_seconds == 600
     assert config.project_check_output_max_chars == 30_000
+    assert config.autopilot_lease_seconds == 1_200
+    assert config.autopilot_heartbeat_seconds == 20
+    assert config.autopilot_unit_timeout_seconds == 1_500
+    assert config.autopilot_unit_batch_size == 3
+    assert config.autopilot_recursion_limit == 50
     assert config.failure_log_mode == "metadata"
     assert config.failure_log_retention_days == 45
     assert config.failure_log_max_rows == 12_000

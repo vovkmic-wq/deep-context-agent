@@ -203,6 +203,7 @@ def test_archived_threads_and_long_messages_are_reconstructed_without_overlap(
         store.archive_message("web-thread", "user", content)
         threads = store.list_threads()
         messages = store.thread_messages("web-thread")
+        usage = store.thread_context_usage("web-thread")
 
     assert threads[0]["thread_id"] == "web-thread"
     assert threads[0]["message_count"] == 1
@@ -213,3 +214,8 @@ def test_archived_threads_and_long_messages_are_reconstructed_without_overlap(
             "indexed_at": messages[0]["indexed_at"],
         }
     ]
+    assert usage == {
+        "message_count": 1,
+        "character_count": len(content),
+        "estimated_tokens": (len(content) + 3) // 4,
+    }

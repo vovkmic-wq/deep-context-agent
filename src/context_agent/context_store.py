@@ -630,6 +630,40 @@ class ContextStore:
                 )
         return messages
 
+    def thread_context_usage(self, thread_id: str) -> dict[str, int]:
+        """Return aggregate archived context size without exposing extra bodies."""
+
+        safe_thread = re.sub(r"[^a-zA-Z0-9_.-]", "_", thread_id)[:100]
+        pattern = f"conversation://{safe_thread}/%"
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS message_count,
+                       COALESCE(SUM(document_length), 0) AS character_count
+                FROM (
+                    SELECT documents.id,
+                           COALESCE(SUM(LENGTH(chunks.content)), 0)
+                           - CASE
+                               WHEN COUNT(chunks.id) > 1
+                               THEN (COUNT(chunks.id) - 1) * ?
+                               ELSE 0
+                             END AS document_length
+                    FROM documents
+                    LEFT JOIN chunks ON chunks.document_id = documents.id
+                    WHERE documents.kind = 'conversation'
+                      AND documents.source LIKE ?
+                    GROUP BY documents.id
+                ) AS archived_messages
+                """,
+                (self.chunk_overlap, pattern),
+            ).fetchone()
+        character_count = int(row["character_count"] or 0) if row else 0
+        return {
+            "message_count": int(row["message_count"] or 0) if row else 0,
+            "character_count": character_count,
+            "estimated_tokens": (character_count + 3) // 4,
+        }
+
     def index_path(self, requested: str | Path, allowed_root: Path) -> IndexReport:
         """Index a text file or tree while enforcing an allowed source root."""
         try:

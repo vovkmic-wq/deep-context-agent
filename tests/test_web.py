@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,7 +61,26 @@ def test_web_health_static_bundle_and_security_headers(tmp_path: Path) -> None:
     assert page.status_code == 200
     assert "Deep Context Agent" in page.text
     assert 'id="chat-execution"' in page.text
-    assert "Autopilot — выполнить до результата" in page.text
+    assert 'id="context-meter"' in page.text
+    assert page.text.count('class="mode-card') == 5
+    for mode in ("agent", "ask", "plan", "debug", "multitask"):
+        assert f'data-mode="{mode}"' in page.text
+        assert f'<option value="{mode}">' in page.text
+    for legacy_mode in (
+        "general",
+        "audit",
+        "coder",
+        "tester",
+        "reviewer",
+        "debugger",
+        "refactor",
+        "security",
+        "docs",
+        "architect",
+        "research",
+    ):
+        assert f'data-mode="{legacy_mode}"' not in page.text
+        assert f'<option value="{legacy_mode}">' not in page.text
     assert 'data-panel="audits"' not in page.text
     assert 'id="audit-form"' not in page.text
 
@@ -396,6 +416,27 @@ def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
                 None,
                 "started",
             )
+            callback(
+                AutopilotProgress(
+                    job_id="job-from-chat",
+                    status="running",
+                    phase="audit",
+                    mode="allow-write",
+                    audit_run_id="audit-from-chat",
+                    batch_size=2,
+                    attempts=1,
+                    replans=0,
+                    completed_units=0,
+                    failed_units=0,
+                    verification_status="not_run",
+                    last_error_code=None,
+                    requested_status=None,
+                    lease_generation=2,
+                    last_heartbeat_at=1_700_000_000.0,
+                ),
+                None,
+                "heartbeat",
+            )
             return "Autopilot job complete."
 
     monkeypatch.setattr(
@@ -407,12 +448,13 @@ def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
         "/api/chat",
         json={
             "query": (
-                "Необходимо разбираться с недостающими модулями проекта "  # noqa: RUF001
-                "в соответствии с промтом и ТЗ."  # noqa: RUF001
+                "Напиши промт для проверки соответствия кода ТЗ, выполни его "  # noqa: RUF001
+                "по пунктам и исправь найденные несоответствия."
             ),
             "thread_id": "web-autopilot",
             "allow_write": True,
             "execution_mode": "auto",
+            "mode": "agent",
         },
         headers={"x-csrf-token": csrf},
     )
@@ -422,6 +464,7 @@ def test_complex_web_chat_uses_autopilot_and_trusted_write_flag(
     assert "event: execution" in events.text
     assert '"mode": "autopilot"' in events.text
     assert "event: job_progress" in events.text
+    assert "event: job_heartbeat" in events.text
     assert "job-from-chat" in events.text
     assert "Autopilot job complete" in events.text
     assert [item[1] for item in archived] == ["user", "assistant"]
@@ -795,8 +838,170 @@ def test_settings_and_work_modes_include_russian_explanations(tmp_path: Path) ->
     assert settings["items"]
     assert all(item["comment"] for item in settings["items"])
     assert all(" / " in item["label"] for item in settings["items"])
-    assert {"audit", "coder", "tester", "security"}.issubset(runtime["work_modes"])
+    assert runtime["work_modes"] == ["agent", "ask", "plan", "debug", "multitask"]
     assert invalid.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "legacy_mode",
+    [
+        "general",
+        "audit",
+        "coder",
+        "tester",
+        "reviewer",
+        "debugger",
+        "refactor",
+        "security",
+        "docs",
+        "architect",
+        "research",
+    ],
+)
+def test_legacy_chat_modes_are_rejected(
+    tmp_path: Path,
+    legacy_mode: str,
+) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    response = client.post(
+        "/api/chat",
+        json={"query": "Legacy mode", "mode": legacy_mode},
+        headers={"x-csrf-token": csrf},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("mode", "requested_write", "effective_write"),
+    [
+        ("ask", True, False),
+        ("plan", True, False),
+        ("debug", True, True),
+    ],
+)
+def test_chat_modes_enforce_execution_and_write_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    requested_write: bool,
+    effective_write: bool,
+) -> None:
+    policies: list[bool] = []
+
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def set_filesystem_mutations_allowed(self, allowed: bool) -> None:
+            policies.append(allowed)
+
+        def ask(self, query: str, **_kwargs: object) -> str:
+            assert f"Режим работы: {mode}." in query
+            return "Mode policy applied."
+
+        def run_autopilot_job(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("This mode must use one bounded turn")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": "Проверь режим.",
+            "thread_id": f"mode-{mode}",
+            "mode": mode,
+            "allow_write": requested_write,
+            "execution_mode": "autopilot",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert started.status_code == 202
+    assert policies == [effective_write, True]
+    assert '"mode": "single-turn"' in events.text
+    assert f'"allow_write": {str(effective_write).lower()}' in events.text
+    assert f'"work_mode": "{mode}"' in events.text
+
+
+def test_multitask_chat_runs_independent_workers_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_threads: list[str] = []
+    archived: list[tuple[str, str, str]] = []
+    started_workers = threading.Barrier(3)
+
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+        context_store = SimpleNamespace(
+            archive_message=lambda thread_id, role, content: archived.append(
+                (thread_id, role, content)
+            )
+        )
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def set_filesystem_mutations_allowed(self, _allowed: bool) -> None:
+            return None
+
+        def ask(self, _query: str, **kwargs: object) -> str:
+            worker_threads.append(str(kwargs["thread_id"]))
+            started_workers.wait(timeout=5)
+            return "Independent worker complete."
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    task_ids: list[str] = []
+    for query in ("Первая независимая задача.", "Вторая независимая задача."):
+        response = client.post(
+            "/api/chat",
+            json={
+                "query": query,
+                "thread_id": "multitask-parent",
+                "mode": "multitask",
+                "execution_mode": "single-turn",
+            },
+            headers={"x-csrf-token": csrf},
+        )
+        assert response.status_code == 202
+        task_ids.append(str(response.json()["task_id"]))
+
+    started_workers.wait(timeout=5)
+    streams = [client.get(f"/api/events/{task_id}").text for task_id in task_ids]
+
+    assert len(set(worker_threads)) == 2
+    assert all(
+        thread.startswith("multitask-parent:multitask:") for thread in worker_threads
+    )
+    assert all("Independent worker complete" in stream for stream in streams)
+    assert {item[0] for item in archived} == {"multitask-parent"}
+    assert sorted(item[1] for item in archived) == [
+        "assistant",
+        "assistant",
+        "user",
+        "user",
+    ]
 
 
 def test_remote_web_mode_requires_authentication_token(tmp_path: Path) -> None:

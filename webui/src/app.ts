@@ -13,9 +13,11 @@ const pageTitles: Record<string, string> = {
 };
 
 let csrfToken = "";
-let activeChatTask = "";
+const activeChatTasks = new Set<string>();
 let activeChatJob = "";
 let currentThread = "web";
+let archivedContextTokens = 0;
+let contextTokenLimit = 80_000;
 let currentFilePath = "";
 let currentFileSha = "";
 let currentDirectory = "/workspace";
@@ -61,6 +63,30 @@ function setOperationStatus(
   node.classList.toggle("error", state === "error");
 }
 
+function updateCancelButton(): void {
+  element<HTMLButtonElement>("cancel-chat").disabled = activeChatTasks.size === 0;
+}
+
+function updateContextMeter(extraCharacters = 0): void {
+  const estimated = archivedContextTokens + Math.ceil(extraCharacters / 4);
+  const percent = Math.min(100, (estimated / Math.max(1, contextTokenLimit)) * 100);
+  const meter = element<HTMLElement>("context-meter");
+  meter.style.setProperty("--context-angle", `${percent * 3.6}deg`);
+  meter.setAttribute("aria-valuenow", percent.toFixed(1));
+  meter.classList.toggle("warning", percent >= 75 && percent < 90);
+  meter.classList.toggle("critical", percent >= 90);
+  element("context-meter-label").textContent = `${Math.round(percent)}%`;
+  meter.title = `${Math.round(estimated).toLocaleString()} / ${contextTokenLimit.toLocaleString()} токенов (оценка). При приближении к пределу Deep Agents автоматически суммаризует старую переписку; полная SQLite-история сохраняется.`;
+}
+
+function applyContextUsage(data: Payload | undefined): void {
+  if (data) {
+    archivedContextTokens = Number(data.estimated_tokens || 0);
+    contextTokenLimit = Number(data.limit_tokens || 80_000);
+  }
+  updateContextMeter(value("chat-query").length);
+}
+
 async function api<T extends Payload>(
   path: string,
   options: RequestInit = {},
@@ -96,6 +122,8 @@ function streamTask(
     "job_progress",
     "job_replanned",
     "job_verification",
+    "job_heartbeat",
+    "job_deadline",
     "result",
     "completed",
     "cancelled",
@@ -199,9 +227,14 @@ async function loadThread(threadId: string): Promise<void> {
   element("current-thread-label").textContent = threadId;
   const output = element("chat-output");
   output.replaceChildren();
-  const result = await api<{ items: Payload[]; request_id: string }>(
+  const result = await api<{
+    items: Payload[];
+    context_usage: Payload;
+    request_id: string;
+  }>(
     `/api/threads/${encodeURIComponent(threadId)}/messages?limit=200`,
   );
+  applyContextUsage(result.context_usage);
   for (const item of result.items) {
     const role = text(item.role);
     appendMessage(
@@ -245,11 +278,25 @@ async function refreshThreads(): Promise<void> {
 
 async function sendChatMessage(): Promise<void> {
   const query = value("chat-query").trim();
-  if (!query || activeChatTask) return;
+  const workMode = value("chat-mode");
+  if (!query) return;
+  if (activeChatTasks.size && workMode !== "multitask") {
+    showToast(
+      "Дождитесь активной задачи либо выберите Multitask для параллельного запуска.",
+    );
+    return;
+  }
   appendMessage("user", query);
-  const pending = appendMessage("agent", "Агент анализирует задачу…", true);
+  const pending = appendMessage(
+    "agent",
+    workMode === "multitask"
+      ? "Независимый worker запускается…"
+      : "Агент анализирует задачу…",
+    true,
+  );
   element<HTMLTextAreaElement>("chat-query").value = "";
-  element<HTMLButtonElement>("cancel-chat").disabled = false;
+  updateContextMeter();
+  let taskId = "";
   try {
     const result = await api<Payload>("/api/chat", {
       method: "POST",
@@ -257,13 +304,15 @@ async function sendChatMessage(): Promise<void> {
         query,
         thread_id: currentThread,
         auto_context: checked("auto-context"),
-        mode: value("chat-mode"),
+        mode: workMode,
         allow_write: checked("chat-write"),
         execution_mode: value("chat-execution"),
       }),
     });
-    activeChatTask = text(result.task_id);
-    streamTask(activeChatTask, (name, data) => {
+    taskId = text(result.task_id);
+    activeChatTasks.add(taskId);
+    updateCancelButton();
+    streamTask(taskId, (name, data) => {
       if (name === "execution" && data.mode === "autopilot") {
         pending.textContent = "Autopilot формирует план и рабочий манифест…";
         const status = element("chat-job-status");
@@ -273,7 +322,15 @@ async function sendChatMessage(): Promise<void> {
           `Autopilot запущен · ${text(data.reason)}`,
         );
       }
-      if (["job_progress", "job_replanned", "job_verification"].includes(name)) {
+      if (
+        [
+          "job_progress",
+          "job_replanned",
+          "job_verification",
+          "job_heartbeat",
+          "job_deadline",
+        ].includes(name)
+      ) {
         activeChatJob = text(data.job_id) || activeChatJob;
         const progress = formatJobProgress(data, name);
         pending.textContent = progress;
@@ -295,16 +352,23 @@ async function sendChatMessage(): Promise<void> {
         pending.parentElement?.classList.remove("pending");
       }
       if (["completed", "cancelled", "failed"].includes(name)) {
-        activeChatTask = "";
-        element<HTMLButtonElement>("cancel-chat").disabled = true;
+        activeChatTasks.delete(taskId);
+        updateCancelButton();
         void Promise.all([refreshThreads(), refreshChatJobs()]);
+        void api<{
+          items: Payload[];
+          context_usage: Payload;
+          request_id: string;
+        }>(`/api/threads/${encodeURIComponent(currentThread)}/messages?limit=1`)
+          .then((usage) => applyContextUsage(usage.context_usage))
+          .catch(() => undefined);
       }
     });
   } catch (error) {
     pending.textContent = error instanceof Error ? error.message : "Ошибка чата";
     pending.parentElement?.classList.remove("pending");
-    activeChatTask = "";
-    element<HTMLButtonElement>("cancel-chat").disabled = true;
+    if (taskId) activeChatTasks.delete(taskId);
+    updateCancelButton();
   }
 }
 
@@ -316,11 +380,19 @@ function formatJobProgress(data: Payload, eventName: string): string {
       ? "Autopilot перепланирует"
       : eventName === "job_verification"
         ? "Autopilot проверяет"
-        : "Autopilot выполняет";
+        : eventName === "job_heartbeat"
+          ? "Autopilot: модель работает"
+          : eventName === "job_deadline"
+            ? "Autopilot: soft deadline, завершается текущая единица"
+            : "Autopilot выполняет";
   const reviewed = text(audit.reviewed) || "0";
   const total = text(audit.total) || "?";
   const pending = text(audit.pending) || "?";
-  return `${prefix}: фаза ${text(data.phase)}, файлы ${reviewed}/${total}, ожидают ${pending}, units ${text(data.completed_units)}/${text(data.attempts)}, replans ${text(data.replans)}.`;
+  const heartbeatSeconds = Number(data.last_heartbeat_at || 0);
+  const heartbeat = heartbeatSeconds
+    ? new Date(heartbeatSeconds * 1000).toLocaleTimeString()
+    : "—";
+  return `${prefix}: фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, связь ${heartbeat}, файлы ${reviewed}/${total}, ожидают ${pending}, units ${text(data.completed_units)}/${text(data.attempts)}, interrupted ${text(data.interrupted_units)}, replans ${text(data.replans)}.`;
 }
 
 function showJobSummary(data: Payload): void {
@@ -335,7 +407,7 @@ function showJobSummary(data: Payload): void {
   status.hidden = false;
   setOperationStatus(
     "chat-job-status",
-    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · units ${text(progress.completed_units)}/${text(progress.attempts)} · replans ${text(progress.replans)}.`,
+    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · generation ${text(progress.lease_generation)} · units ${text(progress.completed_units)}/${text(progress.attempts)} · interrupted ${text(progress.interrupted_units)} · replans ${text(progress.replans)}.`,
     job.status === "complete" ? "success" : "normal",
   );
 }
@@ -766,14 +838,45 @@ async function bootstrap(): Promise<void> {
   if (pageTitles[requestedPanel]) navigate(requestedPanel);
 }
 
+const modeHelp: Record<string, string> = {
+  agent:
+    "Agent выполняет задачу до результата всеми настроенными инструментами в пределах workspace и доверенных разрешений.",
+  ask: "Ask работает только на чтение: изучает код и отвечает, не изменяя файлы.",
+  plan: "Plan задаёт необходимые вопросы и готовит план. Для реализации одобренного плана переключитесь в Agent.",
+  debug:
+    "Debug проверяет гипотезу, добавляет только разрешённую обратимую диагностику и просит воспроизвести проблему.",
+  multitask:
+    "Multitask запускает до четырёх независимых workers. Для конкурентных правок используйте разные worktree.",
+};
+
+function applyChatMode(mode: string, resetDefaults = true): void {
+  const write = element<HTMLInputElement>("chat-write");
+  const execution = element<HTMLSelectElement>("chat-execution");
+  const forcedReadOnly = ["ask", "plan"].includes(mode);
+  const forcedSingleTurn = ["ask", "plan", "debug"].includes(mode);
+  write.disabled = forcedReadOnly;
+  if (resetDefaults) {
+    write.checked = ["agent", "debug"].includes(mode);
+    execution.value = forcedSingleTurn ? "single-turn" : "auto";
+  }
+  if (mode === "multitask" && !resetDefaults) write.checked = false;
+  if (forcedReadOnly) write.checked = false;
+  execution.disabled = forcedSingleTurn;
+  if (forcedSingleTurn) execution.value = "single-turn";
+  element("mode-help").textContent = modeHelp[mode] || modeHelp.agent;
+  window.localStorage.setItem("dca_chat_mode", mode);
+  window.localStorage.setItem("dca_chat_execution", execution.value);
+}
+
 document.querySelectorAll<HTMLButtonElement>("nav button").forEach((button) => {
   button.addEventListener("click", () => navigate(text(button.dataset.panel)));
 });
 
 document.querySelectorAll<HTMLButtonElement>(".mode-card").forEach((button) => {
   button.addEventListener("click", () => {
-    element<HTMLSelectElement>("chat-mode").value = text(button.dataset.mode);
-    element<HTMLSelectElement>("chat-execution").value = "autopilot";
+    const mode = text(button.dataset.mode);
+    element<HTMLSelectElement>("chat-mode").value = mode;
+    applyChatMode(mode);
     navigate("chat");
     element<HTMLTextAreaElement>("chat-query").focus();
   });
@@ -793,6 +896,7 @@ const chatQuery = element<HTMLTextAreaElement>("chat-query");
 chatQuery.addEventListener("input", () => {
   chatQuery.style.height = "auto";
   chatQuery.style.height = `${Math.min(chatQuery.scrollHeight, 220)}px`;
+  updateContextMeter(chatQuery.value.length);
 });
 chatQuery.addEventListener("keydown", (event) => {
   if (
@@ -823,12 +927,26 @@ chatExecution.addEventListener("change", () => {
   window.localStorage.setItem("dca_chat_execution", chatExecution.value);
 });
 
+const chatMode = element<HTMLSelectElement>("chat-mode");
+const storedMode = window.localStorage.getItem("dca_chat_mode") || "agent";
+chatMode.value = ["agent", "ask", "plan", "debug", "multitask"].includes(
+  storedMode,
+)
+  ? storedMode
+  : "agent";
+applyChatMode(chatMode.value, false);
+chatMode.addEventListener("change", () => applyChatMode(chatMode.value));
+
 element("cancel-chat").addEventListener("click", async () => {
-  if (!activeChatTask) return;
+  if (!activeChatTasks.size) return;
   try {
-    await api(`/api/chat/${encodeURIComponent(activeChatTask)}/cancel`, {
-      method: "POST",
-    });
+    await Promise.all(
+      [...activeChatTasks].map((taskId) =>
+        api(`/api/chat/${encodeURIComponent(taskId)}/cancel`, {
+          method: "POST",
+        }),
+      ),
+    );
   } catch (error) {
     showToast(error instanceof Error ? error.message : "Ошибка отмены");
   }

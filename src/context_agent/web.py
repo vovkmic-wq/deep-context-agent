@@ -59,6 +59,7 @@ from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
 from context_agent.runtime import (
     AgentRuntime,
+    is_engineering_execution_request,
     is_long_running_project_request,
     message_text,
 )
@@ -132,28 +133,33 @@ _SETTINGS = {
     },
 }
 _WORK_MODES = {
-    "general": "Работай как универсальный инженер программного обеспечения.",
-    "audit": "Проведи доказательный аудит кода и сначала сформулируй находки.",
-    "coder": "Реализуй запрошенное изменение безопасно и минимально.",
-    "tester": "Спроектируй и выполни тесты, не заявляя PASS без фактического лога.",
-    "reviewer": "Выполни code review с приоритетом корректности и рисков.",
-    "debugger": "Диагностируй первопричину ошибки и проверь исправление.",
-    "refactor": "Улучши структуру без изменения наблюдаемого поведения.",
-    "security": "Проверь границы доверия, секреты, пути и опасные операции.",
-    "docs": "Обнови техническую документацию по фактическому поведению кода.",
-    "architect": "Спроектируй изменение с учётом совместимости и эксплуатации.",
+    "agent": (
+        "Доведи задачу до проверяемого результата всеми доступными runtime "
+        "tools в пределах выданных разрешений."
+    ),
+    "ask": (
+        "Работай только на чтение: изучи код и контекст, ответь на вопрос, "
+        "ничего не изменяй."
+    ),
+    "plan": (
+        "Работай только на чтение: задай только необходимые уточняющие вопросы "
+        "и подготовь план. Не начинай реализацию до нового Agent-turn."
+    ),
+    "debug": (
+        "Веди гипотезо-ориентированную отладку: гипотеза, наблюдаемый признак, "
+        "минимальная разрешённая диагностика, воспроизведение и root cause."
+    ),
+    "multitask": (
+        "Выполни эту задачу как независимый фоновый worker. Не полагайся на "
+        "незакоммиченные результаты других workers."
+    ),
 }
 WorkMode = Literal[
-    "general",
-    "audit",
-    "coder",
-    "tester",
-    "reviewer",
-    "debugger",
-    "refactor",
-    "security",
-    "docs",
-    "architect",
+    "agent",
+    "ask",
+    "plan",
+    "debug",
+    "multitask",
 ]
 ChatExecutionMode = Literal["auto", "autopilot", "single-turn"]
 
@@ -162,7 +168,7 @@ class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2 * 1024 * 1024)
     thread_id: str = Field(default="web", min_length=1, max_length=100)
     auto_context: bool = True
-    mode: WorkMode = "general"
+    mode: WorkMode = "agent"
     allow_write: bool = False
     execution_mode: ChatExecutionMode = "auto"
 
@@ -275,7 +281,12 @@ _AGENT_FAILURE_MESSAGES = {
         "Провайдер недоступен или разорвал соединение. Проверьте live-статус и сеть."
     ),
     "agent_step_limit": (
-        "Агент достиг безопасного лимита шагов. Разделите задачу на меньшие этапы."
+        "Одиночный ход достиг лимита шагов. В режиме «Авто» задача продолжится "
+        "через Autopilot; explicit single-turn можно повторить вручную."
+    ),
+    "autopilot_lease_lost": (
+        "Контроллер Autopilot потерял право владения job. Устаревший worker "
+        "остановлен; возобновите сохранённую задачу."
     ),
     "provider_chain_failed": (
         "LLM-запрос не завершён ни одним провайдером. Проверьте их live-статус "
@@ -288,6 +299,7 @@ _RETRYABLE_AGENT_FAILURES = frozenset(
         "rate_limited",
         "provider_timeout",
         "provider_unavailable",
+        "autopilot_lease_lost",
     }
 )
 
@@ -1034,14 +1046,48 @@ def create_app(
     ):
         with ContextStore(config.context_database) as store:
             items = store.thread_messages(thread_id, limit=limit, offset=offset)
-        return _request_payload(request, items=items, limit=limit, offset=offset)
+            usage = store.thread_context_usage(thread_id)
+        estimated_tokens = int(usage["estimated_tokens"])
+        context_limit = config.active_context_max_tokens
+        context_usage = {
+            **usage,
+            "limit_tokens": context_limit,
+            "percent": round(min(1.0, estimated_tokens / context_limit) * 100, 1),
+            "automatic_summary": True,
+            "estimate_only": True,
+        }
+        return _request_payload(
+            request,
+            items=items,
+            limit=limit,
+            offset=offset,
+            context_usage=context_usage,
+        )
 
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
+        if body.mode == "multitask" and tasks.active_count() >= 4:
+            raise HTTPException(
+                429,
+                "Достигнут предел четырёх одновременных фоновых задач.",
+            )
         task_id = uuid4().hex
-        detected_autopilot = is_long_running_project_request(body.query)
-        use_autopilot = body.execution_mode == "autopilot" or (
-            body.execution_mode == "auto" and detected_autopilot
+        forced_single_turn = body.mode in {"ask", "plan", "debug"}
+        effective_execution_mode: ChatExecutionMode = (
+            "single-turn" if forced_single_turn else body.execution_mode
+        )
+        effective_allow_write = body.allow_write and body.mode not in {"ask", "plan"}
+        execution_thread_id = (
+            f"{body.thread_id}:multitask:{task_id}"
+            if body.mode == "multitask"
+            else body.thread_id
+        )
+        detected_autopilot = body.mode in {"agent", "multitask"} and (
+            is_long_running_project_request(body.query)
+            or is_engineering_execution_request(body.query)
+        )
+        use_autopilot = effective_execution_mode == "autopilot" or (
+            effective_execution_mode == "auto" and detected_autopilot
         )
 
         def operation(
@@ -1069,6 +1115,8 @@ def create_app(
                     event_name = {
                         "replanned": "job_replanned",
                         "verification": "job_verification",
+                        "heartbeat": "job_heartbeat",
+                        "unit_deadline": "job_deadline",
                     }.get(event, "job_progress")
                     emit(event_name, payload)
                     if cancelled.is_set() and not progress.terminal:
@@ -1084,13 +1132,15 @@ def create_app(
                         {
                             "mode": "autopilot",
                             "reason": reason,
-                            "allow_write": body.allow_write,
+                            "allow_write": effective_allow_write,
+                            "work_mode": body.mode,
+                            "worker_thread_id": execution_thread_id,
                         },
                     )
                     job_answer = runtime.run_autopilot_job(
                         query,
-                        thread_id=body.thread_id,
-                        allow_write=body.allow_write,
+                        thread_id=execution_thread_id,
+                        allow_write=effective_allow_write,
                         progress_callback=chat_job_progress,
                         diagnostic_source="web",
                         diagnostic_task_id=task_id,
@@ -1111,7 +1161,7 @@ def create_app(
                 if use_autopilot:
                     reason = (
                         "explicit"
-                        if body.execution_mode == "autopilot"
+                        if effective_execution_mode == "autopilot"
                         else "auto-detected"
                     )
                     answer = run_chat_autopilot(reason)
@@ -1121,25 +1171,51 @@ def create_app(
                         {
                             "mode": "single-turn",
                             "reason": (
-                                "explicit"
-                                if body.execution_mode == "single-turn"
+                                f"{body.mode}-policy"
+                                if forced_single_turn
+                                else "explicit"
+                                if effective_execution_mode == "single-turn"
                                 else "auto-short-task"
                             ),
-                            "allow_write": body.allow_write,
+                            "allow_write": effective_allow_write,
+                            "work_mode": body.mode,
+                            "worker_thread_id": execution_thread_id,
                         },
                     )
                     try:
-                        answer = runtime.ask(
-                            query,
-                            thread_id=body.thread_id,
-                            auto_context=body.auto_context,
-                            diagnostic_source="web",
-                            diagnostic_task_id=task_id,
-                            diagnostic_request_id=task_id,
+                        mutation_policy = getattr(
+                            runtime,
+                            "set_filesystem_mutations_allowed",
+                            None,
                         )
+                        if callable(mutation_policy):
+                            mutation_policy(effective_allow_write)
+                        try:
+                            answer = runtime.ask(
+                                query,
+                                thread_id=execution_thread_id,
+                                auto_context=body.auto_context,
+                                diagnostic_source="web",
+                                diagnostic_task_id=task_id,
+                                diagnostic_request_id=task_id,
+                            )
+                        finally:
+                            if callable(mutation_policy):
+                                mutation_policy(True)
+                        if execution_thread_id != body.thread_id:
+                            runtime.context_store.archive_message(
+                                body.thread_id,
+                                "user",
+                                query,
+                            )
+                            runtime.context_store.archive_message(
+                                body.thread_id,
+                                "assistant",
+                                answer,
+                            )
                     except AgentError as exc:
                         fallback_code = classify_failure(exc)
-                        if body.execution_mode != "auto" or fallback_code not in {
+                        if effective_execution_mode != "auto" or fallback_code not in {
                             "agent_step_limit",
                             "context_window_exceeded",
                         }:
@@ -1156,6 +1232,8 @@ def create_app(
                         "runtime": metadata,
                         "execution_mode": resolved_execution,
                         "job_id": active_job_id or None,
+                        "work_mode": body.mode,
+                        "worker_thread_id": execution_thread_id,
                     },
                 )
                 return {
@@ -1163,15 +1241,28 @@ def create_app(
                     "runtime": metadata,
                     "execution_mode": resolved_execution,
                     "job_id": active_job_id or None,
+                    "work_mode": body.mode,
+                    "worker_thread_id": execution_thread_id,
                 }
 
         tasks.submit(
-            "chat_autopilot" if use_autopilot else "chat",
+            (
+                f"chat_multitask_{'autopilot' if use_autopilot else 'turn'}"
+                if body.mode == "multitask"
+                else "chat_autopilot"
+                if use_autopilot
+                else "chat"
+            ),
             operation,
             task_id=task_id,
             request_id=task_id,
         )
-        return _request_payload(request, task_id=task_id)
+        return _request_payload(
+            request,
+            task_id=task_id,
+            work_mode=body.mode,
+            worker_thread_id=execution_thread_id,
+        )
 
     @app.post("/api/chat/{task_id}/cancel")
     def cancel_chat(request: Request, task_id: str):
@@ -1426,6 +1517,8 @@ def create_app(
                 event_name = {
                     "replanned": "job_replanned",
                     "verification": "job_verification",
+                    "heartbeat": "job_heartbeat",
+                    "unit_deadline": "job_deadline",
                 }.get(event, "job_progress")
                 emit(event_name, payload)
                 if cancelled.is_set() and not progress.terminal:

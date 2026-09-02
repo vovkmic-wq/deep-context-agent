@@ -335,6 +335,10 @@ class AppConfig:
     autopilot_retry_attempts: int = 3
     autopilot_repair_cycles: int = 3
     autopilot_lease_seconds: int = 900
+    autopilot_heartbeat_seconds: int = 30
+    autopilot_unit_timeout_seconds: int = 900
+    autopilot_unit_batch_size: int = 2
+    autopilot_recursion_limit: int = 40
     project_check_timeout_seconds: int = 300
     project_check_output_max_chars: int = 20_000
     failure_log_mode: str = "redacted"
@@ -423,6 +427,22 @@ class AppConfig:
         if not 30 <= self.autopilot_lease_seconds <= 3_600:
             raise ConfigurationError(
                 "AGENT_AUTOPILOT_LEASE_SECONDS must be between 30 and 3600"
+            )
+        if not 1 <= self.autopilot_heartbeat_seconds <= 300:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_HEARTBEAT_SECONDS must be between 1 and 300"
+            )
+        if not 30 <= self.autopilot_unit_timeout_seconds <= 7_200:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS must be between 30 and 7200"
+            )
+        if not 1 <= self.autopilot_unit_batch_size <= 8:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_UNIT_BATCH_SIZE must be between 1 and 8"
+            )
+        if not 25 <= self.autopilot_recursion_limit <= 100:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_RECURSION_LIMIT must be between 25 and 100"
             )
         if not 10 <= self.project_check_timeout_seconds <= 3_600:
             raise ConfigurationError(
@@ -594,7 +614,27 @@ class AppConfig:
             autopilot_lease_seconds=_int_setting(
                 values,
                 "AGENT_AUTOPILOT_LEASE_SECONDS",
-                300,
+                900,
+            ),
+            autopilot_heartbeat_seconds=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_HEARTBEAT_SECONDS",
+                30,
+            ),
+            autopilot_unit_timeout_seconds=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS",
+                900,
+            ),
+            autopilot_unit_batch_size=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_UNIT_BATCH_SIZE",
+                2,
+            ),
+            autopilot_recursion_limit=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_RECURSION_LIMIT",
+                40,
             ),
             project_check_timeout_seconds=_int_setting(
                 values,

@@ -34,7 +34,13 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from context_agent import __version__
-from context_agent.autopilot import AutopilotProgress, AutopilotStore
+from context_agent.autopilot import (
+    AutopilotHeartbeat,
+    AutopilotLease,
+    AutopilotLeaseError,
+    AutopilotProgress,
+    AutopilotStore,
+)
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore, SearchHit
 from context_agent.diagnostics import (
@@ -819,6 +825,18 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         self._edit_recovery_reads: set[tuple[str, int]] = set()
         self._edit_retry_ready: set[tuple[str, int]] = set()
         self._edit_tool_blocked = False
+        self._mutation_guard: Callable[[], None] | None = None
+        self._mutations_allowed = True
+
+    def set_mutation_guard(self, guard: Callable[[], None] | None) -> None:
+        """Install a controller ownership check for later filesystem writes."""
+
+        self._mutation_guard = guard
+
+    def set_mutations_allowed(self, allowed: bool) -> None:
+        """Apply a trusted per-request mutation policy before model tool calls."""
+
+        self._mutations_allowed = allowed
 
     def reset(self) -> None:
         """Start fresh per-turn call, path-version, and read ledgers."""
@@ -889,6 +907,16 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         """Execute permitted calls and reject redundant calls deterministically."""
 
         name = str(request.tool_call.get("name", "unknown"))
+        if name in MUTATING_FILESYSTEM_TOOLS and not self._mutations_allowed:
+            raw_args = request.tool_call.get("args", {})
+            args = raw_args if isinstance(raw_args, Mapping) else {}
+            return denied_tool_message(
+                request,
+                "Filesystem mutation denied by the trusted chat mode policy.",
+                _filesystem_target(args),
+            )
+        if name in MUTATING_FILESYSTEM_TOOLS and self._mutation_guard is not None:
+            self._mutation_guard()
         raw_args = request.tool_call.get("args", {})
         args = raw_args if isinstance(raw_args, Mapping) else {}
         requested_path = _filesystem_target(args)
@@ -2376,6 +2404,16 @@ def is_long_running_project_request(query: str) -> bool:
     )
 
 
+def is_engineering_execution_request(query: str) -> bool:
+    """Detect action-oriented engineering work even without a broad-project noun."""
+
+    action = _AUTOPILOT_ACTION_PATTERN.search(query)
+    complexity = _AUTOPILOT_COMPLEXITY_PATTERN.search(query)
+    if action is None or complexity is None:
+        return False
+    return action.end() <= complexity.start() or complexity.end() <= action.start()
+
+
 def normalize_virtual_path(path: str) -> str:
     """Normalize a virtual workspace path for exact comparisons."""
 
@@ -2928,6 +2966,11 @@ class AgentRuntime:
         self.last_request_id: str | None = None
         self._closed = False
 
+    def set_filesystem_mutations_allowed(self, allowed: bool) -> None:
+        """Set trusted mutation authority for the next ordinary Web turn."""
+
+        self._tool_call_policy_middleware.set_mutations_allowed(allowed)
+
     def _record_thread_head(self, thread_id: str, checkpoint_id: str) -> None:
         self._checkpoint_connection.execute(
             """
@@ -3119,6 +3162,8 @@ class AgentRuntime:
         diagnostic_source: str = "cli",
         diagnostic_task_id: str | None = None,
         worker_thread_id: str | None = None,
+        recursion_limit: int | None = None,
+        ownership_guard: Callable[[], None] | None = None,
     ) -> str:
         """Run or resume a bounded, evidence-backed project audit."""
 
@@ -3194,7 +3239,10 @@ class AgentRuntime:
                     auto_context=False,
                     diagnostic_source=diagnostic_source,
                     diagnostic_task_id=diagnostic_task_id,
+                    recursion_limit=recursion_limit,
                 )
+                if ownership_guard is not None:
+                    ownership_guard()
             except Exception:
                 self.project_audit_store.release_batch(batch)
                 raise
@@ -3300,7 +3348,10 @@ class AgentRuntime:
             objective=clean_objective,
             workspace=self.app_config.workspace,
             allow_write=allow_write,
-            batch_size=self.app_config.audit_batch_size,
+            batch_size=min(
+                self.app_config.audit_batch_size,
+                self.app_config.autopilot_unit_batch_size,
+            ),
             include_patterns=selected_include,
             exclude_patterns=selected_exclude,
             lease_seconds=self.app_config.autopilot_lease_seconds,
@@ -3369,22 +3420,47 @@ class AgentRuntime:
                 lease,
                 phase="audit",
                 batch_size=job_progress.batch_size,
+                deadline_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             before_reviewed = audit_progress.reviewed + audit_progress.partial
+            heartbeat = self._autopilot_heartbeat(
+                lease,
+                unit_id=unit_id,
+                audit_progress=audit_progress,
+                callback=progress_callback,
+            )
             try:
-                answer = self.run_project_audit(
-                    clean_objective,
-                    thread_id=clean_thread_id,
-                    max_batches=1,
-                    allow_write=allow_write,
-                    include_patterns=selected_include,
-                    exclude_patterns=selected_exclude,
-                    batch_size=job_progress.batch_size,
-                    diagnostic_source=diagnostic_source,
-                    diagnostic_task_id=diagnostic_task_id,
-                    worker_thread_id=unit_thread_id,
-                )
+                with heartbeat:
+                    self._tool_call_policy_middleware.set_mutation_guard(
+                        lambda: self.autopilot_store.assert_lease(lease)
+                    )
+                    try:
+                        answer = self.run_project_audit(
+                            clean_objective,
+                            thread_id=clean_thread_id,
+                            max_batches=1,
+                            allow_write=allow_write,
+                            include_patterns=selected_include,
+                            exclude_patterns=selected_exclude,
+                            batch_size=job_progress.batch_size,
+                            diagnostic_source=diagnostic_source,
+                            diagnostic_task_id=diagnostic_task_id,
+                            worker_thread_id=unit_thread_id,
+                            recursion_limit=(self.app_config.autopilot_recursion_limit),
+                            ownership_guard=(
+                                lambda: self.autopilot_store.assert_lease(lease)
+                            ),
+                        )
+                    finally:
+                        self._tool_call_policy_middleware.set_mutation_guard(None)
+                    heartbeat.ensure_owned()
             except AgentError as exc:
+                try:
+                    heartbeat.ensure_owned()
+                except AutopilotLeaseError as lease_exc:
+                    raise AgentError(
+                        "Autopilot lease ownership was lost; stale worker stopped"
+                    ) from lease_exc
                 error_code = classify_failure(exc)
                 self.autopilot_store.fail_unit(
                     lease,
@@ -3473,6 +3549,10 @@ class AgentRuntime:
                     ),
                     callback=progress_callback,
                 )
+            except AutopilotLeaseError as exc:
+                raise AgentError(
+                    "Autopilot lease ownership was lost; stale worker stopped"
+                ) from exc
             except Exception:
                 self.autopilot_store.fail_unit(
                     lease,
@@ -3500,6 +3580,16 @@ class AgentRuntime:
                 f"Worker {unit_thread_id} processed {processed} file(s). "
                 f"{answer[:1_000]}",
             )
+            if heartbeat.deadline_exceeded:
+                job_progress = self.autopilot_store.replan(
+                    lease,
+                    batch_size=max(1, job_progress.batch_size // 2),
+                    error_code="unit_deadline_exceeded",
+                    safe_message=(
+                        "Work unit crossed its soft deadline; current manifest "
+                        "evidence was revalidated and the next unit was reduced."
+                    ),
+                )
             if processed == 0:
                 consecutive_failures += 1
                 next_batch_size = max(1, job_progress.batch_size // 2)
@@ -3623,8 +3713,22 @@ class AgentRuntime:
                 lease,
                 phase="verify",
                 batch_size=current.batch_size,
+                deadline_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
-            results = self.project_check_runner.run()
+            verification_heartbeat = self._autopilot_heartbeat(
+                lease,
+                unit_id=unit_id,
+                audit_progress=audit_progress,
+                callback=callback,
+            )
+            try:
+                with verification_heartbeat:
+                    results = self.project_check_runner.run()
+                    verification_heartbeat.ensure_owned()
+            except AutopilotLeaseError as exc:
+                raise AgentError(
+                    "Autopilot lease ownership was lost; stale verifier stopped"
+                ) from exc
             serialized: list[dict[str, object]] = [
                 {
                     "check": result.check,
@@ -3677,21 +3781,43 @@ class AgentRuntime:
                 lease,
                 phase="repair",
                 batch_size=job_progress.batch_size,
+                deadline_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             repair_request = self._build_autopilot_repair_request(
                 objective,
                 serialized,
                 repair_cycle + 1,
             )
+            repair_heartbeat = self._autopilot_heartbeat(
+                lease,
+                unit_id=repair_id,
+                audit_progress=audit_progress,
+                callback=callback,
+            )
             try:
-                answer = self.ask(
-                    repair_request,
-                    thread_id=repair_thread,
-                    auto_context=False,
-                    diagnostic_source=diagnostic_source,
-                    diagnostic_task_id=diagnostic_task_id,
-                )
+                with repair_heartbeat:
+                    self._tool_call_policy_middleware.set_mutation_guard(
+                        lambda: self.autopilot_store.assert_lease(lease)
+                    )
+                    try:
+                        answer = self.ask(
+                            repair_request,
+                            thread_id=repair_thread,
+                            auto_context=False,
+                            diagnostic_source=diagnostic_source,
+                            diagnostic_task_id=diagnostic_task_id,
+                            recursion_limit=(self.app_config.autopilot_recursion_limit),
+                        )
+                    finally:
+                        self._tool_call_policy_middleware.set_mutation_guard(None)
+                    repair_heartbeat.ensure_owned()
             except AgentError as exc:
+                try:
+                    repair_heartbeat.ensure_owned()
+                except AutopilotLeaseError as lease_exc:
+                    raise AgentError(
+                        "Autopilot lease ownership was lost; stale repair stopped"
+                    ) from lease_exc
                 code = classify_failure(exc)
                 self.autopilot_store.fail_unit(
                     lease,
@@ -3717,6 +3843,10 @@ class AgentRuntime:
                         callback=callback,
                     )
                 continue
+            except AutopilotLeaseError as exc:
+                raise AgentError(
+                    "Autopilot lease ownership was lost; stale repair stopped"
+                ) from exc
             self.autopilot_store.complete_unit(
                 lease,
                 repair_id,
@@ -3771,6 +3901,41 @@ class AgentRuntime:
         )
         return self._format_autopilot_response(progress, audit_progress, safe_message)
 
+    def _autopilot_heartbeat(
+        self,
+        lease: AutopilotLease,
+        *,
+        unit_id: str,
+        audit_progress: AuditProgress,
+        callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
+    ) -> AutopilotHeartbeat:
+        """Build a lease heartbeat that also emits bounded Web progress."""
+
+        deadline_notified = False
+
+        def on_heartbeat(deadline_exceeded: bool) -> None:
+            nonlocal deadline_notified
+            event = "heartbeat"
+            if deadline_exceeded and not deadline_notified:
+                event = "unit_deadline"
+                deadline_notified = True
+            self._emit_autopilot_progress(
+                callback,
+                self.autopilot_store.progress(lease.job_id),
+                audit_progress,
+                event,
+            )
+
+        return AutopilotHeartbeat(
+            self.autopilot_store,
+            lease,
+            lease_seconds=self.app_config.autopilot_lease_seconds,
+            interval_seconds=self.app_config.autopilot_heartbeat_seconds,
+            unit_id=unit_id,
+            deadline_seconds=self.app_config.autopilot_unit_timeout_seconds,
+            on_heartbeat=on_heartbeat,
+        )
+
     @staticmethod
     def _emit_autopilot_progress(
         callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
@@ -3819,6 +3984,7 @@ class AgentRuntime:
         diagnostic_task_id: str | None = None,
         diagnostic_request_id: str | None = None,
         parent_request_id: str | None = None,
+        recursion_limit: int | None = None,
     ) -> str:
         """Retrieve context, invoke the agent, and archive the completed turn."""
         clean_query = query.strip()
@@ -3827,6 +3993,13 @@ class AgentRuntime:
         clean_thread_id = thread_id.strip()
         if not clean_thread_id:
             raise ValueError("thread_id cannot be empty")
+        selected_recursion_limit = (
+            self.app_config.recursion_limit
+            if recursion_limit is None
+            else recursion_limit
+        )
+        if not 25 <= selected_recursion_limit <= 500:
+            raise ValueError("recursion_limit must be between 25 and 500")
         self.last_tool_audit = ()
         self._tool_audit_middleware.reset()
         self._tool_call_policy_middleware.reset()
@@ -3922,7 +4095,7 @@ class AgentRuntime:
                 {"messages": [{"role": "user", "content": request}]},
                 config={
                     "configurable": configurable,
-                    "recursion_limit": self.app_config.recursion_limit,
+                    "recursion_limit": selected_recursion_limit,
                 },
             )
         except Exception as exc:
