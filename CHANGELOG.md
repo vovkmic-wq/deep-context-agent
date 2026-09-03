@@ -5,7 +5,33 @@
 
 ## [Unreleased]
 
-Изменений пока нет.
+## [0.22.0] — 2026-09-03
+
+### Добавлено
+
+- Добавлен нормативный production-промпт 0.22.0 для динамического выбора
+  chat-модели, закреплённого заголовка, локальной hybrid-памяти
+  FTS5/FastEmbed/Qdrant, единого exclusion policy и cursor-based обходов.
+- Основное и Web-ТЗ дополнены требованиями partial/resume, авторитетных
+  `indexed/unchanged/skipped`, terminal provider/model/duration/file counts и
+  упрощённой пользовательской диагностики.
+- Добавлены локальный FastEmbed/ONNX CPU, Qdrant и hybrid RRF с безопасным
+  fallback на SQLite FTS5/BM25; embedding signature разделяет несовместимые
+  collections, а Qdrant не дублирует тела chunks.
+- Добавлены единый artifact policy, ограниченные glob/grep/index/audit pages,
+  защищённые курсоры, partial/resume и безопасное продолжение grep внутри файла.
+- В sticky chat header добавлены per-thread provider/model и presets
+  Auto/Quality/Balanced/Economy/Local; сервер фильтрует non-chat модели и
+  фиксирует immutable task snapshot.
+- Terminal journal расширен duration/provider/model/fallback/file counts,
+  partial/cursor evidence; Web shutdown освобождает rotating JSONL на Windows.
+
+### Проверено
+
+- Ruff, format, mypy, compileall, TypeScript/Web bundle и 281 Python-тест;
+  один системный Windows symlink test пропущен.
+- Live FastEmbed/Qdrant semantic/exact/fallback, двухмодельный Web turn,
+  browser UI, Ozon bounded scan и synthetic corpus 1 000 000 lines/200 docs.
 
 ## [0.21.0] — 2026-09-02
 

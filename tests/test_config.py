@@ -261,6 +261,14 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_AUTO_CONTEXT_QUERY_MAX_CHARS": "1500",
             "AGENT_ACTIVE_CONTEXT_MAX_TOKENS": "64000",
             "AGENT_CONTEXT_MAX_FILE_MB": "64",
+            "AGENT_RETRIEVAL_MODE": "lexical-only",
+            "AGENT_EMBEDDING_ENABLED": "false",
+            "AGENT_EMBEDDING_PROVIDER": "fastembed",
+            "AGENT_EMBEDDING_DEVICE": "cpu",
+            "AGENT_EMBEDDING_MODEL": "multilingual-test-model",
+            "AGENT_EMBEDDING_BATCH_SIZE": "24",
+            "AGENT_VECTOR_STORE": "qdrant",
+            "AGENT_EXTERNAL_EMBEDDING_FALLBACK": "false",
             "AGENT_MODEL_CALL_RETRIES": "4",
             "AGENT_MODEL_RETRY_INITIAL_DELAY": "0.5",
             "AGENT_MODEL_RETRY_MAX_DELAY": "5",
@@ -289,6 +297,14 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.auto_context_query_max_chars == 1500
     assert config.active_context_max_tokens == 64_000
     assert config.max_file_bytes == 64 * 1024 * 1024
+    assert config.retrieval_mode == "lexical-only"
+    assert config.embedding_enabled is False
+    assert config.embedding_provider == "fastembed"
+    assert config.embedding_device == "cpu"
+    assert config.embedding_model == "multilingual-test-model"
+    assert config.embedding_batch_size == 24
+    assert config.vector_store == "qdrant"
+    assert config.external_embedding_fallback is False
     assert config.model_call_retries == 4
     assert config.model_retry_initial_delay == 0.5
     assert config.model_retry_max_delay == 5
@@ -349,6 +365,14 @@ def test_data_directory_cannot_be_exposed_inside_workspace(tmp_path: Path) -> No
         ({"AGENT_FAILURE_LOG_RETENTION_DAYS": "0"}, "RETENTION_DAYS"),
         ({"AGENT_FAILURE_LOG_MAX_ROWS": "99"}, "MAX_ROWS"),
         ({"AGENT_FAILURE_LOG_QUERY_MAX_BYTES": "512"}, "QUERY_MAX_BYTES"),
+        ({"AGENT_RETRIEVAL_MODE": "vector-only"}, "RETRIEVAL_MODE"),
+        ({"AGENT_EMBEDDING_PROVIDER": "remote"}, "EMBEDDING_PROVIDER"),
+        ({"AGENT_EMBEDDING_DEVICE": "cuda"}, "EMBEDDING_DEVICE"),
+        ({"AGENT_VECTOR_STORE": "remote"}, "VECTOR_STORE"),
+        (
+            {"AGENT_EXTERNAL_EMBEDDING_FALLBACK": "true"},
+            "EXTERNAL_EMBEDDING_FALLBACK",
+        ),
     ],
 )
 def test_app_config_rejects_unsafe_or_unbounded_operational_limits(

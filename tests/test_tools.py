@@ -403,3 +403,41 @@ def test_list_context_sources_has_a_small_bounded_page(tmp_path: Path) -> None:
     assert len(default_payload["sources"]) == 20
     assert len(oversized_payload["sources"]) == 50
     assert default_payload["sources"][0] == oversized_payload["sources"][0]
+
+
+def test_grep_result_limit_resumes_inside_a_file_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text(
+        "\n".join(f"MATCH {index}" for index in range(1, 6)),
+        encoding="utf-8",
+    )
+    (workspace / "b.txt").write_text("MATCH 6\nMATCH 7\n", encoding="utf-8")
+    with ContextStore(tmp_path / "context.sqlite3") as store:
+        grep = _tool_map(build_agent_tools(store, workspace))["grep"]
+        cursor = ""
+        found: list[tuple[str, int, str]] = []
+        for _ in range(8):
+            payload = json.loads(
+                grep.invoke(
+                    {
+                        "pattern": "MATCH",
+                        "cursor": cursor,
+                        "page_size": 2,
+                        "max_results": 2,
+                    }
+                )
+            )
+            found.extend(
+                (item["path"], item["line"], item["text"])
+                for item in payload["results"]
+            )
+            cursor = payload["next_cursor"] or ""
+            if not payload["partial"]:
+                break
+
+    assert [item[2] for item in found] == [f"MATCH {index}" for index in range(1, 8)]
+    assert len(found) == len(set(found))
+    assert cursor == ""

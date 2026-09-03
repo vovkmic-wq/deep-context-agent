@@ -3,88 +3,26 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import sqlite3
 import threading
 import time
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from context_agent.artifact_policy import (
+    DEFAULT_ARTIFACT_POLICY,
+    iter_workspace_files,
+    scan_workspace_page,
+)
 from context_agent.errors import ContextStoreError, PathSecurityError
 from context_agent.paths import resolve_inside
+from context_agent.vector_index import VectorChunk, VectorIndex, VectorSearchHit
 
 _TOKEN_PATTERN = re.compile(r"[^\W_]{2,}", flags=re.UNICODE)
-_SKIPPED_DIRECTORIES = {
-    ".agent_data",
-    ".diagnostic-exports",
-    ".cache",
-    ".deps",
-    ".git",
-    ".hg",
-    ".hypothesis",
-    ".mypy_cache",
-    ".nox",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "build",
-    "dist",
-    "htmlcov",
-    "node_modules",
-    "playwright-report",
-    "reports",
-    "site-packages",
-    "test-results",
-}
-_SKIPPED_DIRECTORY_PREFIXES = (
-    ".pytest-",
-    ".pytest_",
-    "browser-profile",
-    "chrome-profile",
-    "edge-profile",
-)
-_SKIPPED_DIRECTORY_SUFFIXES = (".egg-info",)
-_SKIPPED_FILENAMES = {
-    ".coverage",
-    ".env",
-    ".env.local",
-    "context-agent-server.jsonl",
-    "diagnostics.sqlite3",
-    "diagnostics.sqlite3-shm",
-    "diagnostics.sqlite3-wal",
-}
-_SKIPPED_FILENAME_PREFIXES = (
-    ".coverage.",
-    "context-agent-server.jsonl.",
-    "diagnostic-export",
-)
-_TEXT_EXTENSIONS = {
-    "",
-    ".cfg",
-    ".csv",
-    ".html",
-    ".ini",
-    ".json",
-    ".jsonl",
-    ".log",
-    ".md",
-    ".py",
-    ".rst",
-    ".sql",
-    ".toml",
-    ".tsv",
-    ".txt",
-    ".xml",
-    ".yaml",
-    ".yml",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +56,10 @@ class IndexReport:
     files_skipped: int = 0
     chunks_written: int = 0
     errors: tuple[str, ...] = ()
+    partial: bool = False
+    next_cursor: str | None = None
+    files_scanned: int = 0
+    exclusion_reasons: dict[str, int] = field(default_factory=dict)
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -163,11 +105,13 @@ class ContextStore:
         chunk_size: int = 4_000,
         chunk_overlap: int = 400,
         max_file_bytes: int = 2 * 1024 * 1024 * 1024,
+        vector_index: VectorIndex | None = None,
     ) -> None:
         self.database_path = database_path.resolve()
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.max_file_bytes = max_file_bytes
+        self.vector_index = vector_index
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
             self.database_path,
@@ -200,6 +144,13 @@ class ContextStore:
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
             UNIQUE(document_id, chunk_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_model_preferences (
+            thread_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -241,6 +192,8 @@ class ContextStore:
         with self._lock:
             if not self._closed:
                 self._connection.close()
+                if self.vector_index is not None:
+                    self.vector_index.close()
                 self._closed = True
 
     def __enter__(self) -> ContextStore:
@@ -276,6 +229,7 @@ class ContextStore:
                 (source,),
             ).fetchone()
             if current and current["content_hash"] == digest:
+                self._ensure_vector_source(source)
                 return False, 0
             try:
                 with self._connection:
@@ -316,6 +270,7 @@ class ContextStore:
                     )
             except sqlite3.Error as exc:
                 raise ContextStoreError(f"Cannot index source '{source}'") from exc
+        self._sync_vector_source(source)
         return True, len(chunks)
 
     def archive_message(self, thread_id: str, role: str, content: str) -> None:
@@ -346,6 +301,7 @@ class ContextStore:
                 and current["modified_ns"] == modified_ns
                 and current["byte_size"] == byte_size
             ):
+                self._ensure_vector_source(source)
                 return False, 0
 
         digest = _file_sha256(path)
@@ -365,6 +321,7 @@ class ContextStore:
                             source,
                         ),
                     )
+                self._ensure_vector_source(source)
                 return False, 0
 
             chunk_count = 0
@@ -411,7 +368,42 @@ class ContextStore:
                         self._write_chunk_batch(batch)
             except (OSError, UnicodeError, sqlite3.Error) as exc:
                 raise ContextStoreError(f"Cannot index source '{source}'") from exc
+        self._sync_vector_source(source)
         return True, chunk_count
+
+    def _ensure_vector_source(self, source: str) -> None:
+        """Backfill a source after an embedding-model or collection change."""
+
+        if self.vector_index is not None and not self.vector_index.has_source(source):
+            self._sync_vector_source(source)
+
+    def _sync_vector_source(self, source: str) -> None:
+        """Best-effort sync to the derived vector index."""
+
+        if self.vector_index is None:
+            return
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT documents.source, documents.kind, chunks.chunk_index,
+                       chunks.content
+                FROM chunks
+                JOIN documents ON documents.id = chunks.document_id
+                WHERE documents.source = ?
+                ORDER BY chunks.chunk_index
+                """,
+                (source,),
+            ).fetchall()
+        chunks = [
+            VectorChunk(
+                source=str(row["source"]),
+                kind=str(row["kind"]),
+                chunk_index=int(row["chunk_index"]),
+                content=str(row["content"]),
+            )
+            for row in rows
+        ]
+        self.vector_index.replace_source(source, chunks)
 
     def _write_chunk_batch(self, batch: list[tuple[int, int, str]]) -> None:
         self._connection.executemany(
@@ -429,9 +421,66 @@ class ContextStore:
         limit: int = 8,
         source: str | None = None,
     ) -> list[SearchHit]:
-        """Search indexed context using FTS5 and BM25 ranking."""
+        """Search using FTS5/BM25 plus local semantic retrieval when available."""
         if limit <= 0:
             raise ValueError("limit must be positive")
+        lexical_hits = self._search_lexical(
+            query,
+            limit=max(limit, min(limit * 4, 100)),
+            source=source,
+        )
+        if self.vector_index is None:
+            return lexical_hits[:limit]
+        vector_hits = self.vector_index.search(
+            query,
+            limit=max(limit, min(limit * 4, 100)),
+            source=source,
+        )
+        if not vector_hits:
+            return lexical_hits[:limit]
+        fused = _reciprocal_rank_fusion(lexical_hits, vector_hits, limit=limit)
+        return self._hydrate_vector_only_hits(fused)
+
+    def _hydrate_vector_only_hits(self, hits: list[SearchHit]) -> list[SearchHit]:
+        """Load vector-only chunk bodies from authoritative SQLite rows."""
+
+        hydrated: list[SearchHit] = []
+        with self._lock:
+            for hit in hits:
+                if hit.content:
+                    hydrated.append(hit)
+                    continue
+                row = self._connection.execute(
+                    """
+                    SELECT chunks.content, documents.kind
+                    FROM chunks
+                    JOIN documents ON documents.id = chunks.document_id
+                    WHERE documents.source = ? AND chunks.chunk_index = ?
+                    """,
+                    (hit.source, hit.chunk_index),
+                ).fetchone()
+                if row is None:
+                    continue
+                hydrated.append(
+                    SearchHit(
+                        source=hit.source,
+                        kind=str(row["kind"]),
+                        content=str(row["content"]),
+                        chunk_index=hit.chunk_index,
+                        score=hit.score,
+                    )
+                )
+        return hydrated
+
+    def _search_lexical(
+        self,
+        query: str,
+        *,
+        limit: int,
+        source: str | None,
+    ) -> list[SearchHit]:
+        """Return authoritative lexical candidates from SQLite FTS5."""
+
         match_expression = _fts_expression(query)
         if not match_expression:
             return []
@@ -471,6 +520,25 @@ class ContextStore:
             )
             for row in rows
         ]
+
+    def retrieval_status(self) -> dict[str, object]:
+        """Return the active memory backends without forcing vector model load."""
+
+        vector = (
+            self.vector_index.status()
+            if self.vector_index is not None
+            else {
+                "enabled": False,
+                "loaded": False,
+                "fallback": "sqlite-fts5-bm25",
+            }
+        )
+        vector_available = bool(vector.get("enabled")) and not vector.get("last_error")
+        return {
+            "mode": "hybrid" if vector_available else "lexical-only",
+            "lexical": "sqlite-fts5-bm25",
+            "vector": vector,
+        }
 
     def context_window(
         self,
@@ -582,6 +650,56 @@ class ContextStore:
             current["message_count"] = int(str(current["message_count"])) + 1
         return list(threads.values())[:limit]
 
+    def set_thread_model_preference(
+        self,
+        thread_id: str,
+        provider: str,
+        model: str,
+    ) -> None:
+        """Persist the provider/model preference used by future thread turns."""
+
+        safe_thread = re.sub(r"[^a-zA-Z0-9_.-]", "_", thread_id)[:100]
+        if not safe_thread or not provider.strip() or not model.strip():
+            raise ValueError("thread_id, provider, and model are required")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO thread_model_preferences(
+                    thread_id, provider, model, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    safe_thread,
+                    provider.strip().casefold(),
+                    model.strip(),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def thread_model_preference(self, thread_id: str) -> dict[str, str] | None:
+        """Return one thread preference without exposing provider credentials."""
+
+        safe_thread = re.sub(r"[^a-zA-Z0-9_.-]", "_", thread_id)[:100]
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT provider, model, updated_at
+                FROM thread_model_preferences WHERE thread_id = ?
+                """,
+                (safe_thread,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "provider": str(row["provider"]),
+            "model": str(row["model"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
     def thread_messages(
         self,
         thread_id: str,
@@ -679,6 +797,53 @@ class ContextStore:
             raise ContextStoreError(f"Context path is not a file or directory: {path}")
         return self._index_files(_iter_text_files(path, allowed_root), allowed_root)
 
+    def index_path_page(
+        self,
+        requested: str | Path,
+        allowed_root: Path,
+        *,
+        cursor: str = "",
+        page_size: int = 200,
+    ) -> IndexReport:
+        """Index one deterministic page and return a resumable cursor."""
+
+        try:
+            path = resolve_inside(allowed_root, requested, must_exist=True)
+        except PathSecurityError:
+            raise
+        except OSError as exc:
+            raise ContextStoreError(f"Cannot access context path: {requested}") from exc
+        if path.is_file():
+            report = self._index_files((path,), allowed_root.resolve())
+            return IndexReport(
+                files_indexed=report.files_indexed,
+                files_unchanged=report.files_unchanged,
+                files_skipped=report.files_skipped,
+                chunks_written=report.chunks_written,
+                errors=report.errors,
+                files_scanned=1,
+            )
+        if not path.is_dir():
+            raise ContextStoreError(f"Context path is not a file or directory: {path}")
+        page = scan_workspace_page(
+            path,
+            cursor=cursor,
+            page_size=page_size,
+            text_only=True,
+        )
+        report = self._index_files(page.paths, allowed_root.resolve())
+        return IndexReport(
+            files_indexed=report.files_indexed,
+            files_unchanged=report.files_unchanged,
+            files_skipped=report.files_skipped + page.excluded,
+            chunks_written=report.chunks_written,
+            errors=report.errors,
+            partial=not page.complete,
+            next_cursor=page.next_cursor,
+            files_scanned=page.scanned,
+            exclusion_reasons=page.reasons,
+        )
+
     def _index_files(
         self,
         files: Iterable[Path],
@@ -728,18 +893,55 @@ def _fts_expression(query: str) -> str:
     return " OR ".join(f'"{token}"' for token in unique_tokens)
 
 
+def _reciprocal_rank_fusion(
+    lexical_hits: list[SearchHit],
+    vector_hits: list[VectorSearchHit],
+    *,
+    limit: int,
+    rank_constant: int = 60,
+) -> list[SearchHit]:
+    """Merge lexical and semantic rankings without comparing raw score scales."""
+
+    fused: dict[tuple[str, int], tuple[SearchHit, float]] = {}
+    for rank, hit in enumerate(lexical_hits, start=1):
+        key = (hit.source, hit.chunk_index)
+        fused[key] = (hit, 1.0 / (rank_constant + rank))
+    for rank, vector_hit in enumerate(vector_hits, start=1):
+        key = (vector_hit.source, vector_hit.chunk_index)
+        contribution = 1.0 / (rank_constant + rank)
+        existing = fused.get(key)
+        candidate = SearchHit(
+            source=vector_hit.source,
+            kind=vector_hit.kind,
+            content=vector_hit.content,
+            chunk_index=vector_hit.chunk_index,
+            score=0.0,
+        )
+        if existing is None:
+            fused[key] = (candidate, contribution)
+        else:
+            fused[key] = (existing[0], existing[1] + contribution)
+    ordered = sorted(
+        fused.values(),
+        key=lambda item: (-item[1], item[0].source, item[0].chunk_index),
+    )[:limit]
+    return [
+        SearchHit(
+            source=hit.source,
+            kind=hit.kind,
+            content=hit.content,
+            chunk_index=hit.chunk_index,
+            score=score,
+        )
+        for hit, score in ordered
+    ]
+
+
 def _iter_text_files(path: Path, allowed_root: Path) -> Iterator[Path]:
-    for root, directory_names, file_names in os.walk(path, followlinks=False):
-        root_path = Path(root)
-        directory_names[:] = [
-            name
-            for name in directory_names
-            if not _should_skip_directory(root_path / name, allowed_root)
-        ]
-        for file_name in file_names:
-            candidate = root_path / file_name
-            if candidate.is_file() and not _should_skip(candidate, allowed_root):
-                yield candidate
+    del allowed_root
+    for candidate, reason in iter_workspace_files(path, text_only=True):
+        if reason is None and candidate.is_file():
+            yield candidate
 
 
 def _should_skip_directory(path: Path, allowed_root: Path) -> bool:
@@ -749,37 +951,21 @@ def _should_skip_directory(path: Path, allowed_root: Path) -> bool:
         relative = path.relative_to(allowed_root)
     except ValueError:
         return True
-    for part in relative.parts:
-        normalized = part.casefold()
-        if (
-            normalized in _SKIPPED_DIRECTORIES
-            or normalized.startswith(_SKIPPED_DIRECTORY_PREFIXES)
-            or normalized.endswith(_SKIPPED_DIRECTORY_SUFFIXES)
-        ):
-            return True
-    return False
+    return any(
+        DEFAULT_ARTIFACT_POLICY.directory_reason(part) is not None
+        for part in relative.parts
+    )
 
 
 def _should_skip(path: Path, allowed_root: Path) -> bool:
-    try:
-        relative = path.relative_to(allowed_root)
-    except ValueError:
-        return True
-    if any(
-        part.casefold() in _SKIPPED_DIRECTORIES
-        or part.casefold().startswith(_SKIPPED_DIRECTORY_PREFIXES)
-        or part.casefold().endswith(_SKIPPED_DIRECTORY_SUFFIXES)
-        for part in relative.parts[:-1]
-    ):
-        return True
-    normalized_name = path.name.casefold()
-    if (
-        normalized_name in _SKIPPED_FILENAMES
-        or normalized_name.startswith(".env.")
-        or normalized_name.startswith(_SKIPPED_FILENAME_PREFIXES)
-    ):
-        return True
-    return path.suffix.casefold() not in _TEXT_EXTENSIONS
+    return (
+        DEFAULT_ARTIFACT_POLICY.path_reason(
+            path,
+            allowed_root,
+            text_only=True,
+        )
+        is not None
+    )
 
 
 def _file_sha256(path: Path) -> str:

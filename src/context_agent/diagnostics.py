@@ -669,11 +669,45 @@ class DiagnosticStore:
         raw_data = event.get("data", {})
         data = raw_data if isinstance(raw_data, Mapping) else {}
         safe_data: dict[str, object] = {}
-        for name in ("task_id", "request_id", "error_type"):
+        for name in ("task_id", "request_id", "error_type", "provider", "model"):
             if data.get(name) is not None:
                 safe_data[name] = _safe_name(data[name])
+        for name in (
+            "duration_ms",
+            "failover_count",
+            "files_indexed",
+            "files_unchanged",
+            "files_skipped",
+            "files_scanned",
+            "found_files",
+            "matched",
+            "excluded",
+            "chunks_written",
+            "error_count",
+        ):
+            value = data.get(name)
+            if isinstance(value, int) and value >= 0:
+                safe_data[name] = value
         if "retryable" in data:
             safe_data["retryable"] = bool(data["retryable"])
+        for name in ("partial", "cursor_available"):
+            if name in data:
+                safe_data[name] = bool(data[name])
+        if data.get("partial_reason") is not None:
+            safe_data["partial_reason"] = _safe_name(data["partial_reason"])
+        fallback_chain = data.get("fallback_chain")
+        if isinstance(fallback_chain, list):
+            safe_chain: list[dict[str, str]] = []
+            for item in fallback_chain[:20]:
+                if not isinstance(item, Mapping):
+                    continue
+                safe_chain.append(
+                    {
+                        "provider": _safe_name(item.get("provider", "")),
+                        "model": _safe_name(item.get("model", "")),
+                    }
+                )
+            safe_data["fallback_chain"] = safe_chain
         if data.get("message") is not None:
             safe_data["message"] = redact_sensitive_text(
                 str(data["message"]), known_secrets=self.known_secrets

@@ -18,10 +18,11 @@ from context_agent.autopilot import AutopilotProgress, AutopilotStore
 from context_agent.config import SUPPORTED_PROVIDERS, AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
 from context_agent.diagnostics import DiagnosticStore, configured_secret_values
-from context_agent.errors import AgentError
+from context_agent.errors import AgentError, ConfigurationError
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
 from context_agent.runtime import AgentRuntime, message_text
+from context_agent.vector_index import FastEmbedQdrantIndex
 
 MAX_PROMPT_FILE_BYTES = 2 * 1024 * 1024
 
@@ -195,6 +196,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Index a file or directory under AGENT_CONTEXT_ROOT.",
     )
     index_parser.add_argument("path", nargs="?", default=".")
+    index_parser.add_argument(
+        "--page-size",
+        type=int,
+        default=200,
+        help="Files per bounded traversal page (1-1000; default: 200).",
+    )
+    index_parser.add_argument(
+        "--cursor",
+        default="",
+        help="Resume from an opaque cursor returned by --one-page.",
+    )
+    index_parser.add_argument(
+        "--one-page",
+        action="store_true",
+        help="Process one page and print a resumable cursor instead of looping.",
+    )
 
     search_parser = subparsers.add_parser(
         "search",
@@ -269,28 +286,77 @@ def _app_config(base_dir: Path) -> AppConfig:
     return config
 
 
-def _run_index(args: argparse.Namespace, base_dir: Path) -> int:
-    config = _app_config(base_dir)
-    with ContextStore(
+def _context_store(config: AppConfig) -> ContextStore:
+    """Open the hybrid context store with a lazy local vector backend."""
+
+    return ContextStore(
         config.context_database,
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
         max_file_bytes=config.max_file_bytes,
-    ) as store:
-        report = store.index_path(args.path, config.context_root)
-    print(
-        f"indexed={report.files_indexed} unchanged={report.files_unchanged} "
-        f"skipped={report.files_skipped} chunks={report.chunks_written}"
+        vector_index=FastEmbedQdrantIndex(
+            config.vector_database,
+            model_name=config.embedding_model,
+            cache_dir=config.embedding_cache,
+            batch_size=config.embedding_batch_size or None,
+            enabled=(config.embedding_enabled and config.retrieval_mode == "hybrid"),
+        ),
     )
-    for error in report.errors:
+
+
+def _run_index(args: argparse.Namespace, base_dir: Path) -> int:
+    config = _app_config(base_dir)
+    if not 1 <= args.page_size <= 1_000:
+        raise ConfigurationError("--page-size must be between 1 and 1000")
+    totals = {
+        "indexed": 0,
+        "unchanged": 0,
+        "skipped": 0,
+        "chunks": 0,
+        "scanned": 0,
+    }
+    errors: list[str] = []
+    cursor = args.cursor
+    with _context_store(config) as store:
+        while True:
+            report = store.index_path_page(
+                args.path,
+                config.context_root,
+                cursor=cursor,
+                page_size=args.page_size,
+            )
+            totals["indexed"] += report.files_indexed
+            totals["unchanged"] += report.files_unchanged
+            totals["skipped"] += report.files_skipped
+            totals["chunks"] += report.chunks_written
+            totals["scanned"] += report.files_scanned
+            errors.extend(report.errors)
+            print(
+                "INDEX_PROGRESS "
+                f"indexed={totals['indexed']} unchanged={totals['unchanged']} "
+                f"skipped={totals['skipped']} chunks={totals['chunks']} "
+                f"scanned={totals['scanned']} partial={str(report.partial).lower()}",
+                flush=True,
+            )
+            cursor = report.next_cursor or ""
+            if args.one_page or not report.partial:
+                break
+    print(
+        f"indexed={totals['indexed']} unchanged={totals['unchanged']} "
+        f"skipped={totals['skipped']} chunks={totals['chunks']} "
+        f"scanned={totals['scanned']} partial={str(report.partial).lower()}"
+    )
+    if report.next_cursor:
+        print(f"next_cursor={report.next_cursor}")
+    for error in errors:
         print(f"warning: {error}", file=sys.stderr)
-    return 1 if report.errors else 0
+    return 1 if errors else 0
 
 
 def _run_search(args: argparse.Namespace, base_dir: Path) -> int:
     config = _app_config(base_dir)
     limit = args.limit or config.context_top_k
-    with ContextStore(config.context_database) as store:
+    with _context_store(config) as store:
         hits = store.search(args.query, limit=limit)
     if not hits:
         print("No matching context found.")
@@ -317,6 +383,25 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
         print(f"fallback_{index}_api_key=configured")
     print(f"workspace={app_config.workspace}")
     print(f"context_database={app_config.context_database}")
+    print(f"vector_database={app_config.vector_database}")
+    print(f"retrieval_mode={app_config.retrieval_mode}")
+    print(f"embedding_enabled={str(app_config.embedding_enabled).lower()}")
+    print(f"embedding_provider={app_config.embedding_provider}")
+    print(f"embedding_device={app_config.embedding_device}")
+    print(f"embedding_model={app_config.embedding_model}")
+    print(
+        "embedding_batch_size="
+        + (
+            str(app_config.embedding_batch_size)
+            if app_config.embedding_batch_size
+            else "auto"
+        )
+    )
+    print(f"vector_store={app_config.vector_store}")
+    print(
+        "external_embedding_fallback="
+        f"{str(app_config.external_embedding_fallback).lower()}"
+    )
     print(f"project_audit_database={app_config.project_audit_database}")
     print(f"autopilot_database={app_config.autopilot_database}")
     print(f"diagnostics_database={app_config.diagnostics_database}")

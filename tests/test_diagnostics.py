@@ -276,7 +276,22 @@ def test_web_terminal_event_survives_store_restart(tmp_path: Path) -> None:
         "task-1",
         {
             "event": "failed",
-            "data": {"error_type": "provider_timeout", "message": "safe"},
+            "data": {
+                "error_type": "provider_timeout",
+                "message": "safe",
+                "provider": "zhipu",
+                "model": "glm-test",
+                "duration_ms": 321,
+                "files_scanned": 42,
+                "excluded": 7,
+                "partial": True,
+                "cursor_available": True,
+                "partial_reason": "timeout",
+                "fallback_chain": [
+                    {"provider": "zhipu", "model": "glm-test"},
+                    {"provider": "openai", "model": "gpt-test"},
+                ],
+            },
         },
     )
     first.close()
@@ -287,6 +302,16 @@ def test_web_terminal_event_survives_store_restart(tmp_path: Path) -> None:
     assert task is not None
     assert task["status"] == "failed"
     assert task["terminal_event"]["data"]["message"] == "safe"  # type: ignore[index]
+    terminal = task["terminal_event"]["data"]  # type: ignore[index]
+    assert terminal["duration_ms"] == 321
+    assert terminal["files_scanned"] == 42
+    assert terminal["excluded"] == 7
+    assert terminal["partial"] is True
+    assert terminal["cursor_available"] is True
+    assert terminal["fallback_chain"][1] == {  # type: ignore[index]
+        "provider": "openai",
+        "model": "gpt-test",
+    }
 
 
 def test_crash_recovery_marks_in_progress_request_and_task(tmp_path: Path) -> None:

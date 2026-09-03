@@ -1,7 +1,30 @@
 # Управляющий промпт реализации
 
-Последний production-этап описан промптом 0.21.0. Версия кода изменяется только
+Последний production-этап описан промптом 0.22.0. Версия кода изменяется только
 после полного offline/live/package acceptance.
+
+## Dynamic models, hybrid retrieval and bounded scans 0.22.0 (2026-09-03)
+
+Работай по `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md`,
+основному и Web-ТЗ. Соблюдай порядок: динамический выбор совместимой модели в
+закреплённом заголовке чата; локальная гибридная память FTS5/BM25 +
+FastEmbed/ONNX CPU + Qdrant; единый exclusion policy и cursor pagination для
+всех широких обходов; понятная диагностика и полный безопасный terminal journal.
+
+Embedding provider отделён от chat provider. Документы не отправляются во
+внешний embedding API, скрытый cloud fallback запрещён. При отказе FastEmbed
+или Qdrant сохраняй явно обозначенный lexical-only поиск. Смена embedding
+signature создаёт отдельный resumable индекс и переключает его атомарно только
+после завершения.
+
+Все `glob`, `grep`, indexing, audit и discovery используют один центральный
+artifact policy, bounded pages и opaque cursor. Точный известный файл читается
+через paginated `read_file`, а не широким tree grep. Timeout обязан вернуть
+partial status, подтверждённые counts и cursor для продолжения. UI показывает
+`indexed/unchanged/skipped`; diagnostics хранит terminal status,
+provider/model, duration и file counts без секретов. Повтори исходный Ozon
+timeout, миллионный offline corpus и live CPU/vector/model-switch сценарии до
+изменения версии и публикации.
 
 ## Five chat modes 0.21.0 (2026-09-02)
 

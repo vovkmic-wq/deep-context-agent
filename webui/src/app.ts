@@ -24,6 +24,9 @@ let currentDirectory = "/workspace";
 const directoryHistory: string[] = [];
 let providerCatalog: Payload[] = [];
 let activeProviders: string[] = [];
+let modelCatalogRequest = 0;
+let indexCursor = "";
+let indexedPath = "";
 
 function element<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -124,6 +127,7 @@ function streamTask(
     "job_verification",
     "job_heartbeat",
     "job_deadline",
+    "scan_progress",
     "result",
     "completed",
     "cancelled",
@@ -252,7 +256,11 @@ async function loadThread(threadId: string): Promise<void> {
     empty.append(heading, note);
     output.append(empty);
   }
-  await Promise.all([refreshThreads(), refreshChatJobs()]);
+  await Promise.all([
+    refreshThreads(),
+    refreshChatJobs(),
+    loadThreadModelPreference(threadId),
+  ]);
 }
 
 async function refreshThreads(): Promise<void> {
@@ -307,6 +315,8 @@ async function sendChatMessage(): Promise<void> {
         mode: workMode,
         allow_write: checked("chat-write"),
         execution_mode: value("chat-execution"),
+        provider: value("chat-provider"),
+        model: value("chat-model"),
       }),
     });
     taskId = text(result.task_id);
@@ -772,6 +782,153 @@ async function refreshProviders(): Promise<void> {
       `${text(primary.provider)}/${text(primary.model)}`;
   }
   renderProviders();
+  await populateChatProviders();
+}
+
+async function populateChatProviders(preferred = ""): Promise<void> {
+  const select = element<HTMLSelectElement>("chat-provider");
+  const previous = preferred || select.value;
+  select.replaceChildren();
+  const configured = providerCatalog.filter((item) => Boolean(item.configured));
+  for (const provider of configured) {
+    const option = document.createElement("option");
+    option.value = text(provider.provider);
+    option.textContent = text(provider.provider);
+    select.append(option);
+  }
+  const fallback = activeProviders[0] || text(configured[0]?.provider);
+  select.value = configured.some((item) => text(item.provider) === previous)
+    ? previous
+    : fallback;
+  select.disabled = !configured.length;
+  await loadChatModels(select.value);
+}
+
+async function loadChatModels(
+  provider: string,
+  preferred = "",
+): Promise<void> {
+  const requestNumber = ++modelCatalogRequest;
+  const select = element<HTMLSelectElement>("chat-model");
+  select.disabled = true;
+  element("chat-model-status").textContent =
+    `Загружаю модели ${provider || "провайдера"}…`;
+  if (!provider) {
+    select.replaceChildren();
+    element("chat-model-status").textContent = "Нет настроенного провайдера.";
+    return;
+  }
+  try {
+    const result = await api<{
+      models: Json[];
+      partial: boolean;
+      message?: string;
+      request_id: string;
+    }>(`/api/providers/${encodeURIComponent(provider)}/models`);
+    if (requestNumber !== modelCatalogRequest) return;
+    const previous = preferred || select.value;
+    select.replaceChildren();
+    for (const model of result.models) {
+      const option = document.createElement("option");
+      option.value = text(model);
+      option.textContent = text(model);
+      select.append(option);
+    }
+    if (result.models.some((model) => text(model) === previous)) {
+      select.value = previous;
+    }
+    select.disabled = !result.models.length;
+    element("chat-model-status").textContent = result.partial
+      ? `Частичный список: ${text(result.message)} Текущую модель можно использовать.`
+      : `Доступно моделей: ${result.models.length}. Выбор сохранится для этой задачи.`;
+  } catch (error) {
+    if (requestNumber !== modelCatalogRequest) return;
+    const providerItem = providerCatalog.find(
+      (item) => text(item.provider) === provider,
+    );
+    const fallbackModel = preferred || text(providerItem?.model);
+    select.replaceChildren();
+    if (fallbackModel) {
+      const option = document.createElement("option");
+      option.value = fallbackModel;
+      option.textContent = fallbackModel;
+      select.append(option);
+    }
+    select.disabled = !fallbackModel;
+    element("chat-model-status").textContent =
+      `Каталог моделей недоступен: ${error instanceof Error ? error.message : "ошибка"}. Используется настроенная модель.`;
+  }
+}
+
+async function saveThreadModelPreference(): Promise<void> {
+  const provider = value("chat-provider");
+  const model = value("chat-model");
+  if (!provider || !model) return;
+  await api<Payload>(
+    `/api/threads/${encodeURIComponent(currentThread)}/model-preference`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ provider, model }),
+    },
+  );
+  element("runtime-badge").textContent = `${provider}/${model}`;
+  element("chat-model-status").textContent =
+    `Выбрано ${provider}/${model}. Следующий запрос получит неизменяемый снимок этой модели.`;
+}
+
+async function applyModelPreset(preset: string): Promise<void> {
+  const configured = providerCatalog.filter((item) => Boolean(item.configured));
+  if (!configured.length) return;
+  const active = activeProviders[0] || text(configured[0]?.provider);
+  const preferredProviders: Record<string, string[]> = {
+    auto: [active],
+    quality: ["openai", "zhipu", active],
+    balanced: [active, "zhipu", "openai"],
+    economy: [active, "openai", "zhipu"],
+    local: ["lmstudio"],
+  };
+  const configuredNames = new Set(configured.map((item) => text(item.provider)));
+  const provider = (preferredProviders[preset] || [active]).find((name) =>
+    configuredNames.has(name),
+  );
+  if (!provider) {
+    element("chat-model-status").textContent =
+      "Для выбранного профиля нет настроенного провайдера.";
+    return;
+  }
+  element<HTMLSelectElement>("chat-provider").value = provider;
+  await loadChatModels(provider);
+  const modelSelect = element<HTMLSelectElement>("chat-model");
+  const patterns: Record<string, string[]> = {
+    quality: ["gpt-5.6-sol", "glm-5.3", "pro", "max", "reason"],
+    balanced: ["terra", "plus", "turbo", "glm-5.3"],
+    economy: ["nano", "mini", "flash", "air", "lite"],
+  };
+  const candidates = Array.from(modelSelect.options).map((option) => option.value);
+  const matchedPattern = (patterns[preset] || []).find((pattern) =>
+    candidates.some((candidate) => candidate.toLowerCase().includes(pattern)),
+  );
+  if (matchedPattern) {
+    const matching = candidates.find((candidate) =>
+      candidate.toLowerCase().includes(matchedPattern),
+    );
+    if (matching) modelSelect.value = matching;
+  }
+  await saveThreadModelPreference();
+}
+
+async function loadThreadModelPreference(threadId: string): Promise<void> {
+  const result = await api<{ preference: Payload; request_id: string }>(
+    `/api/threads/${encodeURIComponent(threadId)}/model-preference`,
+  );
+  if (threadId !== currentThread) return;
+  const provider = text(result.preference.provider);
+  const model = text(result.preference.model);
+  await populateChatProviders(provider);
+  await loadChatModels(provider, model);
+  element<HTMLSelectElement>("chat-provider").value = provider;
+  element<HTMLSelectElement>("chat-model").value = model;
+  element("runtime-badge").textContent = `${provider}/${model}`;
 }
 
 async function loadSettings(): Promise<void> {
@@ -810,6 +967,10 @@ async function bootstrap(): Promise<void> {
   element("runtime-badge").textContent =
     `${text(runtime.provider)}/${text(runtime.model)}`;
   element("workspace-badge").textContent = text(runtime.workspace);
+  const retrieval =
+    runtime.retrieval && typeof runtime.retrieval === "object"
+      ? (runtime.retrieval as Payload)
+      : {};
   const metrics = element("overview-grid");
   metrics.replaceChildren();
   for (const [name, metricValue] of [
@@ -817,6 +978,8 @@ async function bootstrap(): Promise<void> {
     ["Аудит по умолчанию", runtime.audit_mode_default],
     ["Активные задачи", runtime.active_tasks],
     ["Провайдеров в цепочке", (runtime.provider_priority as Json[]).length],
+    ["Память / Memory", retrieval.mode],
+    ["Embedding", retrieval.embedding_model],
   ] as Array<[string, Json]>) {
     const node = document.createElement("div");
     node.className = "metric";
@@ -827,12 +990,13 @@ async function bootstrap(): Promise<void> {
   }
   const health = await api<Payload>("/api/health");
   element("health").textContent = JSON.stringify(health, null, 2);
+  await refreshProviders();
   await Promise.all([
     refreshChatJobs(),
     refreshThreads(),
-    refreshProviders(),
     loadSettings(),
     loadDirectory("/workspace", false),
+    loadThreadModelPreference(currentThread),
   ]);
   const requestedPanel = window.location.hash.slice(1);
   if (pageTitles[requestedPanel]) navigate(requestedPanel);
@@ -937,6 +1101,33 @@ chatMode.value = ["agent", "ask", "plan", "debug", "multitask"].includes(
 applyChatMode(chatMode.value, false);
 chatMode.addEventListener("change", () => applyChatMode(chatMode.value));
 
+element<HTMLSelectElement>("chat-provider").addEventListener(
+  "change",
+  async () => {
+    try {
+      await loadChatModels(value("chat-provider"));
+      await saveThreadModelPreference();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Ошибка выбора провайдера");
+    }
+  },
+);
+
+element<HTMLSelectElement>("chat-model").addEventListener("change", () => {
+  void saveThreadModelPreference().catch((error: Error) =>
+    showToast(error.message),
+  );
+});
+
+element<HTMLSelectElement>("chat-model-preset").addEventListener(
+  "change",
+  () => {
+    void applyModelPreset(value("chat-model-preset")).catch((error: Error) =>
+      showToast(error.message),
+    );
+  },
+);
+
 element("cancel-chat").addEventListener("click", async () => {
   if (!activeChatTasks.size) return;
   try {
@@ -983,20 +1174,35 @@ element<HTMLFormElement>("context-form").addEventListener(
 
 element("index-workspace").addEventListener("click", async () => {
   const button = element<HTMLButtonElement>("index-workspace");
+  const requestedPath = normalizeWorkspacePath(value("index-path"));
+  if (requestedPath !== indexedPath) indexCursor = "";
+  indexedPath = requestedPath;
   button.disabled = true;
-  setOperationStatus("index-status", "Индексация запущена…");
+  setOperationStatus(
+    "index-status",
+    indexCursor ? "Продолжаю индексацию с сохранённого курсора…" : "Индексация запущена…",
+  );
   try {
     const result = await api<Payload>("/api/context/index", {
       method: "POST",
-      body: JSON.stringify({ path: value("index-path") }),
+      body: JSON.stringify({ path: requestedPath, cursor: indexCursor, page_size: 200 }),
     });
     streamTask(text(result.task_id), (name, data) => {
-      if (name === "result") {
-        const report = data.result as Payload;
+      if (name === "scan_progress") {
         setOperationStatus(
           "index-status",
-          `Готово: новых ${text(report.files_indexed)}, без изменений ${text(report.files_unchanged)}, пропущено ${text(report.files_skipped)}, фрагментов ${text(report.chunks_written)}.`,
-          "success",
+          `Сканирование: просмотрено ${text(data.files_scanned) || "0"}, новых ${text(data.files_indexed) || "0"}, без изменений ${text(data.files_unchanged) || "0"}, пропущено ${text(data.files_skipped) || "0"}${data.partial ? " · частичный результат" : ""}.`,
+        );
+      }
+      if (name === "result") {
+        const report = data.result as Payload;
+        indexCursor = text(report.next_cursor);
+        const partial = Boolean(report.partial);
+        button.textContent = partial ? "Продолжить индексацию" : "Индексировать";
+        setOperationStatus(
+          "index-status",
+          `${partial ? "Частичный результат" : "Готово"}: просмотрено ${text(report.files_scanned)}, новых ${text(report.files_indexed)}, без изменений ${text(report.files_unchanged)}, пропущено ${text(report.files_skipped)}, фрагментов ${text(report.chunks_written)}.${partial ? " Нажмите «Продолжить индексацию»." : ""}`,
+          partial ? "normal" : "success",
         );
       }
       if (name === "failed") {

@@ -30,9 +30,11 @@
    вне неё не предоставляется. Встроенный filesystem middleware создаётся с
    явным списком инструментов без общего `delete`; удаление выполняется только
    отдельным `remove_path`.
-4. Большой контекст и диалоги хранятся в SQLite. Полнотекстовый индекс FTS5,
-   разбиение на фрагменты и ранжирование BM25 не требуют внешней embedding API.
-   Файлы индексируются потоково и пакетами, без чтения всего файла в RAM.
+4. Большой контекст и диалоги хранятся в SQLite. Полнотекстовый индекс FTS5 и
+   BM25 остаются обязательным лексическим слоем. Семантический слой использует
+   локальный FastEmbed/ONNX на CPU и Qdrant; внешний embedding API и скрытый
+   cloud fallback запрещены. Файлы индексируются потоково и пакетами, без
+   чтения всего файла в RAM.
 5. Перед каждым запросом приложение автоматически извлекает релевантные
    фрагменты. Агент также получает `search_context`, список источников и чтение
    окна соседних чанков, поэтому начало документа остаётся доступным после
@@ -425,6 +427,55 @@
    принудительно checkpoint/truncate. Секрет провалившегося запроса не должен
    оставаться даже в свободных страницах или WAL при побайтовой проверке.
 
+## 2.7. Dynamic models, hybrid retrieval and bounded scans 0.22.0
+
+1. Chat provider/model выбираются для следующего turn через server-validated
+   per-thread preference. Доступные модели берутся из bounded provider catalog
+   и compatibility manifest; embedding/image/audio/moderation/deprecated и
+   неподтверждённые tool-incompatible модели не выдаются за chat-compatible.
+2. Provider/model/fallback фиксируются immutable task snapshot. Переключение
+   при активном turn действует только на следующий turn или безопасную границу
+   Autopilot work unit и сохраняется в terminal evidence.
+3. Закреплённый заголовок Web-чата содержит thread, mode, execution, provider,
+   model, connection/context status и не прокручивается вместе с историей.
+4. `EmbeddingProvider` и `VectorStore` отделены от chat provider. Production-
+   default — FastEmbed/ONNX CPU и локальный Qdrant под `AGENT_DATA_DIR`.
+   Модель многоязычная, пригодна для русского и кода, имеет pinned ID/revision,
+   лицензию, размерность, distance и query/document prefixes.
+5. Hybrid retrieval объединяет bounded FTS5/BM25 и vector candidates
+   детерминированным rank fusion, дедуплицирует по source/chunk и сохраняет
+   source diversity. Отказ vector слоя даёт наблюдаемый `lexical-only`, но не
+   прерывает обычный поиск и чат.
+6. Векторная индексация использует существующие source/chunk IDs и SHA-256.
+   Новые/изменённые chunks вычисляются инкрементально, исчезнувшие удаляются,
+   неизменённые не пересчитываются. Смена embedding signature создаёт отдельную
+   resumable collection; alias переключается только после полного завершения.
+7. FastEmbed загружается лениво. Adaptive CPU batch имеет жёсткий максимум и
+   при MemoryError/OOM уменьшается вдвое, не повторяя committed entries.
+8. Один central artifact policy обслуживает glob, grep, context index, audit,
+   symbol index и Web discovery. Минимально исключаются `.git`, virtualenv,
+   `node_modules`, dist/build/cache/coverage/browser/temp/backup/log paths и все
+   database/WAL/SHM/export artifacts агента; сравнение path segments
+   регистронезависимо.
+9. Include/exclude пользователя только сужают либо разрешённо уточняют общий
+   policy и не возвращают secrets, agent databases, traversal/symlink escape.
+   Точный разрешённый `read_file` не считается широким discovery.
+10. Все широкие операции возвращают bounded page, opaque cursor, authoritative
+    counts, `complete/partial/reason`. Timeout/cancel сохраняют cursor и уже
+    committed результат; resume не повторяет полный обход и не дублирует items.
+11. При известном точном пути и намерении прочитать файл runtime направляет
+    модель к paginated `read_file`; tree-wide grep допустим только для pattern
+    search или неизвестного расположения и всегда ограничен policy/page budget.
+12. Progress содержит discovered/scanned/matched/indexed/unchanged/skipped/
+    excluded/chunks/errors/elapsed и доступность cursor. Повторная индексация
+    явно показывает даже нулевые `indexed / unchanged / skipped`.
+13. Terminal journal каждой scan/index/audit/provider/chat task сохраняет
+    status, correlation IDs, provider/model/fallback snapshot, duration, file
+    counts, partial reason, cursor presence и safe error code. HTTP 200/202 и
+    открытый SSE не заменяют terminal `completed`.
+14. Полный нормативный порядок, API, миграции и acceptance заданы в
+    `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md`.
+
 ## 3. Провайдеры и переменные
 
 | Провайдер | Ключ | Модель / endpoint |
@@ -439,6 +490,24 @@
 Значения endpoint и моделей должны переопределяться без изменения кода.
 Модель обязана поддерживать tool calling; это особенно важно для локальной
 модели LM Studio.
+
+Локальная гибридная память 0.22.0 использует отдельную конфигурацию и не
+наследует chat provider:
+
+| Переменная | Default / назначение |
+| --- | --- |
+| `AGENT_RETRIEVAL_MODE` | `hybrid`; допустим также аварийный `lexical-only` |
+| `AGENT_EMBEDDING_PROVIDER` | `fastembed` |
+| `AGENT_EMBEDDING_DEVICE` | `cpu` |
+| `AGENT_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`; Apache-2.0, 384d, cosine, prefixes не требуются |
+| `AGENT_EMBEDDING_ENABLED` | `true`; `false` отключает vector-слой без отключения FTS5 |
+| `AGENT_EMBEDDING_BATCH_SIZE` | `0` = automatic CPU/RAM-aware bounded batch; `1..256` = явный максимум |
+| `AGENT_VECTOR_STORE` | `qdrant` |
+| `AGENT_EXTERNAL_EMBEDDING_FALLBACK` | `false`; `true` не допускается без отдельного opt-in контракта |
+
+Qdrant data path вычисляется только внутри `AGENT_DATA_DIR` и не раскрывается
+Web-клиенту. Изменение embedding signature требует управляемой переиндексации,
+а не смешивания несовместимых векторов в действующей collection.
 
 Для резервной `openai/gpt-5.6-sol` в текущем Chat Completions tool-calling
 контуре устанавливается `OPENAI_REASONING_EFFORT=none`. Ненулевой effort с
@@ -788,6 +857,32 @@ Soft deadline служит наблюдаемой границей и повод
 Deep Agents built-in summarization остаётся включена. Круг контекста отображает
 оценку архивных conversational tokens относительно
 `AGENT_ACTIVE_CONTEXT_MAX_TOKENS`; он не является точным provider token meter.
+
+## 7.17. Dynamic models, hybrid retrieval and bounded scans (0.22.0)
+
+1. Sticky chat header позволяет выбрать `auto` либо server-validated provider и
+   совместимую модель для следующего turn; выполняющийся task сохраняет прежний
+   snapshot, а terminal result показывает фактический fallback.
+2. FastEmbed/ONNX CPU и Qdrant выполняют локальный semantic retrieval русского
+   текста и кода. Внешний embedding endpoint не вызывается ни при успехе, ни
+   при отказе; FTS5 остаётся рабочим в явно обозначенном lexical-only режиме.
+3. Инкрементальная SHA-bound индексация не пересчитывает unchanged chunks.
+   Смена embedding signature выполняет resumable side-by-side rebuild и
+   атомарное переключение только полностью готовой collection.
+4. Glob, grep, index, audit, symbol и Web discovery используют один exclusion
+   policy. Большое дерево выдаётся bounded страницами без дубликатов; timeout
+   даёт partial counts и cursor, а resume продолжает с подтверждённой позиции.
+5. Известный точный файл при read intent обрабатывается paginated `read_file`,
+   а не tree-wide grep. Pattern search сохраняет bounded grep semantics.
+6. UI различает partial/degraded/failed/cancelled/complete и показывает
+   authoritative `indexed/unchanged/skipped`, прогресс и кнопку продолжения.
+7. Durable terminal event содержит correlation IDs, provider/model, duration и
+   file counts при любом исходе, не раскрывая secret или document bodies.
+8. Offline corpus не менее 1 000 000 строк, Ozon timeout/resume, vector failure,
+   model switch, browser/mobile и live CPU tests подтверждены свежими логами.
+9. Детальные критерии заданы в
+   `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md` и обязательны
+   перед изменением release version или публикацией.
 
 ## 8. Этапы
 

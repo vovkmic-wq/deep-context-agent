@@ -61,3 +61,14 @@ def configure_structured_logger(
         handler.setFormatter(_JsonFormatter(known_secrets))
         logger.addHandler(handler)
     return logger
+
+
+def close_structured_logger(logger: logging.Logger) -> None:
+    """Flush, detach, and close application-owned file handlers."""
+
+    for handler in tuple(logger.handlers):
+        try:
+            handler.flush()
+        finally:
+            handler.close()
+            logger.removeHandler(handler)

@@ -17,89 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
-_SKIPPED_DIRECTORIES: Final[frozenset[str]] = frozenset(
-    {
-        ".agent_data",
-        ".deps",
-        ".git",
-        ".hg",
-        ".mypy_cache",
-        ".nox",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".svn",
-        ".tox",
-        ".venv",
-        "__pycache__",
-        "agent-data",
-        "build",
-        "coverage",
-        "coverage-html",
-        "dist",
-        "htmlcov",
-        "node_modules",
-        "playwright-report",
-        "reports",
-        "site-packages",
-        "test-results",
-        "venv",
-    }
-)
-
-_SKIPPED_FILE_NAMES: Final[frozenset[str]] = frozenset(
-    {
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.test",
-    }
-)
-
-_SKIPPED_DIRECTORY_PREFIXES: Final[tuple[str, ...]] = (
-    ".pytest-",
-    ".pytest_",
-    "browser-profile",
-    "edge-profile",
-)
-
-_SKIPPED_DIRECTORY_SUFFIXES: Final[tuple[str, ...]] = (".egg-info",)
-
-_BINARY_SUFFIXES: Final[frozenset[str]] = frozenset(
-    {
-        ".7z",
-        ".avi",
-        ".bin",
-        ".bmp",
-        ".class",
-        ".db",
-        ".dll",
-        ".doc",
-        ".docx",
-        ".exe",
-        ".gif",
-        ".gz",
-        ".ico",
-        ".jar",
-        ".jpeg",
-        ".jpg",
-        ".mov",
-        ".mp3",
-        ".mp4",
-        ".pdf",
-        ".png",
-        ".pyc",
-        ".pyd",
-        ".sqlite",
-        ".sqlite3",
-        ".tar",
-        ".tiff",
-        ".wav",
-        ".webp",
-        ".whl",
-        ".xls",
-        ".xlsx",
-        ".zip",
-    }
+from context_agent.artifact_policy import (
+    BINARY_SUFFIXES,
+    DEFAULT_ARTIFACT_POLICY,
+    scan_workspace_page,
 )
 
 _SUMMARY_READ_LIMIT: Final[int] = 256 * 1024
@@ -137,6 +58,9 @@ class AuditFileSelection:
     paths: tuple[Path, ...]
     excluded: int = 0
     reasons: Mapping[str, int] = field(default_factory=dict)
+    partial: bool = False
+    next_cursor: str | None = None
+    scanned: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +88,13 @@ class AuditProgress:
     file_reads: int
     mode: str = "read-only"
     excluded: int = 0
+    inventory_partial: bool = False
 
     @property
     def complete(self) -> bool:
-        return self.pending == 0 and self.in_progress == 0
+        return (
+            self.pending == 0 and self.in_progress == 0 and not self.inventory_partial
+        )
 
     def as_dict(self) -> dict[str, object]:
         """Return a stable JSON-serializable status payload."""
@@ -178,6 +105,7 @@ class AuditProgress:
             "mode": self.mode,
             "total": self.total,
             "excluded": self.excluded,
+            "inventory_partial": self.inventory_partial,
             "pending": self.pending,
             "in_progress": self.in_progress,
             "reviewed": self.reviewed,
@@ -345,62 +273,91 @@ class ProjectAuditStore:
                 "WHERE run_id = ? AND status = 'in_progress'",
                 (run_id,),
             )
-        selection = select_project_files(resolved_workspace, rules)
-        self._synchronize_files(run_id, resolved_workspace, selection)
+            inventory = self._connection.execute(
+                """
+                SELECT status, inventory_complete, inventory_generation
+                FROM audit_runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if inventory is not None and bool(inventory["inventory_complete"]):
+                self._connection.execute(
+                    """
+                    UPDATE audit_runs
+                    SET status = 'running', inventory_cursor = '',
+                        inventory_complete = 0, inventory_generation = ?,
+                        excluded_count = 0, exclusion_summary = '{}',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (int(inventory["inventory_generation"]) + 1, now, run_id),
+                )
+        self._continue_inventory(run_id)
         self._synchronize_requirements(run_id, resolved_workspace, objective)
         return self.progress(run_id)
 
     def next_batch(self, run_id: str) -> AuditBatch | None:
         """Allocate the next bounded batch and persist its in-progress state."""
 
-        with self._lock, self._connection:
-            run = self._connection.execute(
-                "SELECT batch_size, status FROM audit_runs WHERE id = ?",
-                (run_id,),
-            ).fetchone()
-            if run is None:
-                raise ValueError(f"Unknown audit run: {run_id}")
-            if str(run["status"]) in {"paused", "cancelled"}:
-                return None
-
-            self._connection.execute(
-                "UPDATE audit_files SET status = 'pending' "
-                "WHERE run_id = ? AND status = 'in_progress'",
-                (run_id,),
-            )
-            rows = self._connection.execute(
-                """
-                SELECT path
-                FROM audit_files
-                WHERE run_id = ? AND status = 'pending'
-                ORDER BY path COLLATE NOCASE
-                LIMIT ?
-                """,
-                (run_id, int(run["batch_size"])),
-            ).fetchall()
-            if not rows:
-                self._set_completion_status(run_id)
-                return None
-
-            batch_number = (
-                int(
-                    self._connection.execute(
-                        "SELECT COUNT(*) FROM audit_batches WHERE run_id = ?",
-                        (run_id,),
-                    ).fetchone()[0]
+        for _ in range(2):
+            with self._lock, self._connection:
+                run = self._connection.execute(
+                    """
+                    SELECT batch_size, status, inventory_complete
+                    FROM audit_runs WHERE id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if run is None:
+                    raise ValueError(f"Unknown audit run: {run_id}")
+                if str(run["status"]) in {"paused", "cancelled"}:
+                    return None
+                self._connection.execute(
+                    "UPDATE audit_files SET status = 'pending' "
+                    "WHERE run_id = ? AND status = 'in_progress'",
+                    (run_id,),
                 )
-                + 1
-            )
-            paths = tuple(str(row["path"]) for row in rows)
-            self._connection.executemany(
-                """
-                UPDATE audit_files
-                SET status = 'in_progress', batch_number = ?, updated_at = ?
-                WHERE run_id = ? AND path = ?
-                """,
-                ((batch_number, time.time(), run_id, path) for path in paths),
-            )
-            return AuditBatch(run_id=run_id, number=batch_number, paths=paths)
+                rows = self._connection.execute(
+                    """
+                    SELECT path
+                    FROM audit_files
+                    WHERE run_id = ? AND status = 'pending'
+                    ORDER BY path COLLATE NOCASE
+                    LIMIT ?
+                    """,
+                    (run_id, int(run["batch_size"])),
+                ).fetchall()
+                if rows:
+                    batch_number = (
+                        int(
+                            self._connection.execute(
+                                "SELECT COUNT(*) FROM audit_batches WHERE run_id = ?",
+                                (run_id,),
+                            ).fetchone()[0]
+                        )
+                        + 1
+                    )
+                    paths = tuple(str(row["path"]) for row in rows)
+                    self._connection.executemany(
+                        """
+                        UPDATE audit_files
+                        SET status = 'in_progress', batch_number = ?, updated_at = ?
+                        WHERE run_id = ? AND path = ?
+                        """,
+                        ((batch_number, time.time(), run_id, path) for path in paths),
+                    )
+                    return AuditBatch(
+                        run_id=run_id,
+                        number=batch_number,
+                        paths=paths,
+                    )
+                inventory_complete = bool(run["inventory_complete"])
+            if inventory_complete:
+                with self._lock, self._connection:
+                    self._set_completion_status(run_id)
+                return None
+            self._continue_inventory(run_id)
+        return None
 
     def complete_batch(
         self,
@@ -489,7 +446,10 @@ class ProjectAuditStore:
     def progress(self, run_id: str) -> AuditProgress:
         with self._lock:
             run = self._connection.execute(
-                "SELECT status, mode, excluded_count FROM audit_runs WHERE id = ?",
+                """
+                SELECT status, mode, excluded_count, inventory_complete
+                FROM audit_runs WHERE id = ?
+                """,
                 (run_id,),
             ).fetchone()
             if run is None:
@@ -532,6 +492,7 @@ class ProjectAuditStore:
             file_reads=file_reads,
             mode=str(run["mode"]),
             excluded=int(run["excluded_count"]),
+            inventory_partial=not bool(run["inventory_complete"]),
         )
 
     def run_details(self, run_id: str) -> dict[str, object]:
@@ -880,6 +841,9 @@ class ProjectAuditStore:
                     selected_count INTEGER NOT NULL DEFAULT 0,
                     excluded_count INTEGER NOT NULL DEFAULT 0,
                     exclusion_summary TEXT NOT NULL DEFAULT '{}',
+                    inventory_cursor TEXT NOT NULL DEFAULT '',
+                    inventory_complete INTEGER NOT NULL DEFAULT 0,
+                    inventory_generation INTEGER NOT NULL DEFAULT 1,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -894,6 +858,7 @@ class ProjectAuditStore:
                     read_count INTEGER NOT NULL DEFAULT 0,
                     summary TEXT NOT NULL,
                     updated_at REAL NOT NULL,
+                    inventory_generation INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (run_id, path)
                 );
 
@@ -994,12 +959,26 @@ class ProjectAuditStore:
                 "selected_count": "INTEGER NOT NULL DEFAULT 0",
                 "excluded_count": "INTEGER NOT NULL DEFAULT 0",
                 "exclusion_summary": "TEXT NOT NULL DEFAULT '{}'",
+                "inventory_cursor": "TEXT NOT NULL DEFAULT ''",
+                "inventory_complete": "INTEGER NOT NULL DEFAULT 0",
+                "inventory_generation": "INTEGER NOT NULL DEFAULT 1",
             }
             for column, declaration in run_migrations.items():
                 if column not in run_columns:
                     self._connection.execute(
                         f"ALTER TABLE audit_runs ADD COLUMN {column} {declaration}"
                     )
+            audit_file_columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(audit_files)"
+                ).fetchall()
+            }
+            if "inventory_generation" not in audit_file_columns:
+                self._connection.execute(
+                    "ALTER TABLE audit_files ADD COLUMN "
+                    "inventory_generation INTEGER NOT NULL DEFAULT 1"
+                )
             ledger_columns = {
                 str(row[1])
                 for row in self._connection.execute(
@@ -1012,14 +991,80 @@ class ProjectAuditStore:
                     "ADD COLUMN modified_ns INTEGER NOT NULL DEFAULT 0"
                 )
 
+    def _continue_inventory(self, run_id: str, page_size: int = 1_000) -> None:
+        """Scan and persist one bounded inventory page for a resumable audit."""
+
+        with self._lock:
+            run = self._connection.execute(
+                """
+                SELECT workspace, include_patterns, exclude_patterns,
+                       inventory_cursor, inventory_complete,
+                       inventory_generation, excluded_count, exclusion_summary
+                FROM audit_runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if run is None:
+            raise ValueError(f"Unknown audit run: {run_id}")
+        if bool(run["inventory_complete"]):
+            return
+        rules = AuditSelectionRules(
+            include=tuple(json.loads(str(run["include_patterns"]))),
+            exclude=tuple(json.loads(str(run["exclude_patterns"]))),
+        )
+        selection = select_project_files_page(
+            Path(str(run["workspace"])),
+            rules,
+            cursor=str(run["inventory_cursor"]),
+            page_size=page_size,
+        )
+        generation = int(run["inventory_generation"])
+        self._synchronize_files(
+            run_id,
+            Path(str(run["workspace"])),
+            selection,
+            generation=generation,
+            finalize=not selection.partial,
+        )
+        previous_reasons = json.loads(str(run["exclusion_summary"]))
+        merged_reasons = Counter(
+            {str(name): int(count) for name, count in previous_reasons.items()}
+        )
+        merged_reasons.update(selection.reasons)
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE audit_runs
+                SET inventory_cursor = ?, inventory_complete = ?,
+                    excluded_count = excluded_count + ?,
+                    exclusion_summary = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    selection.next_cursor or "",
+                    int(not selection.partial),
+                    selection.excluded,
+                    json.dumps(
+                        dict(sorted(merged_reasons.items())),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    time.time(),
+                    run_id,
+                ),
+            )
+            self._set_completion_status(run_id)
+
     def _synchronize_files(
         self,
         run_id: str,
         workspace: Path,
         selection: AuditFileSelection,
+        *,
+        generation: int = 1,
+        finalize: bool = True,
     ) -> None:
         workspace_key = str(workspace)
-        seen: set[str] = set()
         now = time.time()
 
         for path in selection.paths:
@@ -1056,8 +1101,6 @@ class ProjectAuditStore:
                     summary, symbols = _analyze_file(path, byte_size)
                 except OSError:
                     continue
-            seen.add(relative)
-
             with self._lock, self._connection:
                 self._connection.execute(
                     """
@@ -1095,20 +1138,45 @@ class ProjectAuditStore:
                         """
                         INSERT INTO audit_files(
                             run_id, path, content_hash, byte_size, status,
-                            summary, updated_at
-                        ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                            summary, updated_at, inventory_generation
+                        ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
                         """,
-                        (run_id, relative, content_hash, byte_size, summary, now),
+                        (
+                            run_id,
+                            relative,
+                            content_hash,
+                            byte_size,
+                            summary,
+                            now,
+                            generation,
+                        ),
                     )
                 elif existing["content_hash"] != content_hash:
                     self._connection.execute(
                         """
                         UPDATE audit_files
                         SET content_hash = ?, byte_size = ?, status = 'pending',
-                            batch_number = NULL, summary = ?, updated_at = ?
+                            batch_number = NULL, summary = ?, updated_at = ?,
+                            inventory_generation = ?
                         WHERE run_id = ? AND path = ?
                         """,
-                        (content_hash, byte_size, summary, now, run_id, relative),
+                        (
+                            content_hash,
+                            byte_size,
+                            summary,
+                            now,
+                            generation,
+                            run_id,
+                            relative,
+                        ),
+                    )
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE audit_files SET inventory_generation = ?, updated_at = ?
+                        WHERE run_id = ? AND path = ?
+                        """,
+                        (generation, now, run_id, relative),
                     )
 
                 if symbols is not None:
@@ -1130,14 +1198,29 @@ class ProjectAuditStore:
                     )
 
         with self._lock, self._connection:
+            if not finalize:
+                selected_count = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM audit_files "
+                        "WHERE run_id = ? AND inventory_generation = ?",
+                        (run_id, generation),
+                    ).fetchone()[0]
+                )
+                self._connection.execute(
+                    "UPDATE audit_runs SET selected_count = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (selected_count, now, run_id),
+                )
+                return
             known_paths = {
                 str(row["path"])
                 for row in self._connection.execute(
-                    "SELECT path FROM audit_files WHERE run_id = ?",
-                    (run_id,),
+                    "SELECT path FROM audit_files "
+                    "WHERE run_id = ? AND inventory_generation != ?",
+                    (run_id, generation),
                 ).fetchall()
             }
-            missing = known_paths - seen
+            missing = known_paths
             ledger_paths = {
                 str(row["path"])
                 for row in self._connection.execute(
@@ -1145,7 +1228,15 @@ class ProjectAuditStore:
                     (workspace_key,),
                 ).fetchall()
             }
-            stale_ledger_paths = ledger_paths - seen
+            current_paths = {
+                str(row["path"])
+                for row in self._connection.execute(
+                    "SELECT path FROM audit_files "
+                    "WHERE run_id = ? AND inventory_generation = ?",
+                    (run_id, generation),
+                ).fetchall()
+            }
+            stale_ledger_paths = ledger_paths - current_paths
             self._connection.executemany(
                 "DELETE FROM audit_files WHERE run_id = ? AND path = ?",
                 ((run_id, path) for path in missing),
@@ -1161,14 +1252,11 @@ class ProjectAuditStore:
             self._connection.execute(
                 """
                 UPDATE audit_runs
-                SET status = 'running', selected_count = ?, excluded_count = ?,
-                    exclusion_summary = ?, updated_at = ?
+                SET status = 'running', selected_count = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
-                    len(selection.paths),
-                    selection.excluded,
-                    json.dumps(selection.reasons, ensure_ascii=False, sort_keys=True),
+                    len(current_paths),
                     now,
                     run_id,
                 ),
@@ -1224,7 +1312,7 @@ class ProjectAuditStore:
 
     def _set_completion_status(self, run_id: str) -> None:
         current = self._connection.execute(
-            "SELECT status FROM audit_runs WHERE id = ?",
+            "SELECT status, inventory_complete FROM audit_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
         if current is not None and str(current["status"]) in {"paused", "cancelled"}:
@@ -1246,7 +1334,7 @@ class ProjectAuditStore:
                 (run_id,),
             ).fetchone()[0]
         )
-        if unfinished:
+        if unfinished or (current is not None and not current["inventory_complete"]):
             status = "running"
         elif partial:
             status = "complete_with_partial"
@@ -1310,7 +1398,7 @@ def select_project_files(
             if _matches_any(relative, selected_rules.exclude):
                 reasons["configured_exclude"] += 1
                 continue
-            if path.suffix.casefold() in _BINARY_SUFFIXES:
+            if path.suffix.casefold() in BINARY_SUFFIXES:
                 reasons["binary_suffix"] += 1
                 continue
             try:
@@ -1330,6 +1418,55 @@ def select_project_files(
     )
 
 
+def select_project_files_page(
+    workspace: Path,
+    rules: AuditSelectionRules | None = None,
+    *,
+    cursor: str = "",
+    page_size: int = 500,
+) -> AuditFileSelection:
+    """Select one bounded, resumable audit inventory page."""
+
+    selected_rules = rules or AuditSelectionRules()
+    page = scan_workspace_page(
+        workspace,
+        cursor=cursor,
+        page_size=page_size,
+        text_only=False,
+    )
+    paths: list[Path] = []
+    reasons: Counter[str] = Counter(page.reasons)
+    for path in page.paths:
+        relative = path.relative_to(workspace).as_posix()
+        if selected_rules.include and not _matches_any(
+            relative,
+            selected_rules.include,
+        ):
+            reasons["not_included"] += 1
+            continue
+        if _matches_any(relative, selected_rules.exclude):
+            reasons["configured_exclude"] += 1
+            continue
+        try:
+            with path.open("rb") as stream:
+                probe = stream.read(4_096)
+            if b"\0" in probe:
+                reasons["binary_content"] += 1
+                continue
+        except OSError:
+            reasons["unreadable"] += 1
+            continue
+        paths.append(path)
+    return AuditFileSelection(
+        paths=tuple(paths),
+        excluded=sum(reasons.values()),
+        reasons=dict(sorted(reasons.items())),
+        partial=not page.complete,
+        next_cursor=page.next_cursor,
+        scanned=page.scanned,
+    )
+
+
 def _iter_project_files(workspace: Path) -> Iterator[Path]:
     """Yield default-selected files for backwards-compatible callers."""
 
@@ -1337,12 +1474,7 @@ def _iter_project_files(workspace: Path) -> Iterator[Path]:
 
 
 def _is_skipped_directory(name: str) -> bool:
-    normalized = name.casefold()
-    return (
-        normalized in _SKIPPED_DIRECTORIES
-        or normalized.startswith(_SKIPPED_DIRECTORY_PREFIXES)
-        or normalized.endswith(_SKIPPED_DIRECTORY_SUFFIXES)
-    )
+    return DEFAULT_ARTIFACT_POLICY.directory_reason(name) is not None
 
 
 def _matches_any(path: str, patterns: tuple[str, ...]) -> bool:
@@ -1360,12 +1492,7 @@ def _matches_any(path: str, patterns: tuple[str, ...]) -> bool:
 
 
 def _is_skipped_file(name: str) -> bool:
-    normalized = name.casefold()
-    return (
-        normalized in _SKIPPED_FILE_NAMES
-        or normalized == ".coverage"
-        or normalized.startswith(".coverage.")
-    )
+    return DEFAULT_ARTIFACT_POLICY.file_reason(Path(name)) is not None
 
 
 def _sha256_file(path: Path) -> str:

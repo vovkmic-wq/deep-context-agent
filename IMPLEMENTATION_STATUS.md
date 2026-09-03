@@ -3,6 +3,42 @@
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 
+## Dynamic models, hybrid retrieval and bounded scans 0.22.0 — 2026-09-03
+
+- Нормативный промпт создан:
+  `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md`.
+- Требования внесены в `IMPLEMENTATION_PROMPT.md`, `TECHNICAL_SPEC.md` и
+  `WEB_INTERFACE_TECHNICAL_SPECIFICATION.md`.
+- Реализованы sticky per-thread provider/model selection и пять presets;
+  server-validated bounded catalog, immutable task snapshot и фактический
+  provider/model/fallback в terminal evidence.
+- Реализованы локальные FastEmbed/ONNX CPU + Qdrant, hybrid RRF с FTS5/BM25,
+  SHA-256 incremental sync, lazy load, RAM-aware batch и lexical-only fallback.
+- Один artifact policy используется context index, audit, glob и grep;
+  широкие операции возвращают bounded pages, scope-bound cursor,
+  partial/resume и явные indexed/unchanged/skipped counts.
+- Terminal Web event сохраняет duration, provider/model/fallback, file counts,
+  partial и cursor presence; Windows shutdown закрывает SQLite, workers и
+  rotating JSONL handler.
+
+Финальные evidence 0.22.0:
+
+- Ruff check/format, mypy и compileall — PASS; pytest — 281 passed,
+  1 planned Windows symlink skip; TypeScript и production bundle — PASS.
+- Editable install и `pip check` — PASS; собраны wheel и sdist 0.22.0.
+  Wheel: 173851 bytes, SHA-256
+  `c2e3bb33765e1be671e96fabb7631efefe1c230ce03d52574ffc8cead7a77f9a`.
+- Реальный FastEmbed/Qdrant CPU: русский semantic paraphrase и точный Python
+  symbol найдены; forced invalid model дал рабочий `lexical-only`.
+- Web live: `zhipu/glm-5.3` корректно перешёл на
+  `openai/gpt-5.6-sol` после rate limit; следующий turn выбрал OpenAI напрямую,
+  preference сохранён, JSONL handler освободил файл при shutdown.
+- Browser live: sticky header `top=0`, три provider, model catalog и пять
+  presets видимы, console errors отсутствуют.
+- Ozon read-only scan: 112 уникальных файлов за 3 страницы; grep resume по 25
+  results без дубликатов. Synthetic 1 000 000 lines/200 docs: 5 pages,
+  6.051 s index, 1.285 ms two searches, 1.27 MiB Python peak, anchors PASS.
+
 ## Five chat modes 0.21.0 — 2026-09-02
 
 | Этап 0.21.0 | Статус | Реализация/проверка |

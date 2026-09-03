@@ -6,6 +6,51 @@ import pytest
 
 from context_agent.context_store import ContextStore, chunk_text
 from context_agent.errors import PathSecurityError
+from context_agent.vector_index import VectorChunk, VectorSearchHit
+
+
+class _FakeVectorIndex:
+    def __init__(self, *, fail_search: bool = False) -> None:
+        self.sources: dict[str, list[VectorChunk]] = {}
+        self.fail_search = fail_search
+
+    def replace_source(self, source: str, chunks: list[VectorChunk]) -> bool:
+        self.sources[source] = chunks
+        return True
+
+    def has_source(self, source: str) -> bool:
+        return source in self.sources
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        source: str | None = None,
+    ) -> list[VectorSearchHit]:
+        del query
+        if self.fail_search:
+            return []
+        for candidate, chunks in self.sources.items():
+            if source is not None and candidate != source:
+                continue
+            return [
+                VectorSearchHit(
+                    source=chunk.source,
+                    kind=chunk.kind,
+                    chunk_index=chunk.chunk_index,
+                    content=chunk.content,
+                    score=0.9,
+                )
+                for chunk in chunks[:limit]
+            ]
+        return []
+
+    def status(self) -> dict[str, object]:
+        return {"enabled": True, "loaded": True, "backend": "fake"}
+
+    def close(self) -> None:
+        return None
 
 
 def test_chunk_text_has_overlap_and_preserves_ends() -> None:
@@ -36,6 +81,51 @@ def test_context_persists_and_searches_after_reopen(tmp_path: Path) -> None:
         )
         assert unchanged is False
         assert count == 0
+
+
+def test_hybrid_search_fuses_semantic_hits_and_survives_vector_failure(
+    tmp_path: Path,
+) -> None:
+    vector = _FakeVectorIndex()
+    with ContextStore(tmp_path / "hybrid.sqlite3", vector_index=vector) as store:
+        store.add_text("memory://semantic", "Выручка продавца на маркетплейсе")
+        semantic = store.search("совершенно другой запрос", limit=3)
+        assert semantic[0].source == "memory://semantic"
+        assert store.retrieval_status()["mode"] == "hybrid"
+
+    failing_vector = _FakeVectorIndex(fail_search=True)
+    with ContextStore(
+        tmp_path / "fallback.sqlite3",
+        vector_index=failing_vector,
+    ) as store:
+        store.add_text("memory://lexical", "LEXICAL_FALLBACK_ANCHOR")
+        lexical = store.search("LEXICAL_FALLBACK_ANCHOR", limit=3)
+        assert lexical[0].source == "memory://lexical"
+
+
+def test_index_pages_resume_and_report_incremental_counts(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    for index in range(3):
+        (source_root / f"doc-{index}.txt").write_text(
+            f"PAGE_ANCHOR_{index}",
+            encoding="utf-8",
+        )
+    with ContextStore(tmp_path / "paged.sqlite3") as store:
+        first = store.index_path_page(".", source_root, page_size=2)
+        assert first.files_indexed == 2
+        assert first.partial is True
+        assert first.next_cursor
+        second = store.index_path_page(
+            ".",
+            source_root,
+            cursor=first.next_cursor or "",
+            page_size=2,
+        )
+        assert second.files_indexed == 1
+        assert second.partial is False
+        repeated = store.index_path_page(".", source_root, page_size=2)
+        assert repeated.files_unchanged == 2
 
 
 def test_streaming_file_index_search_filter_and_window(tmp_path: Path) -> None:

@@ -65,6 +65,7 @@ from context_agent.tools import (
     SearchClientFactory,
     build_agent_tools,
 )
+from context_agent.vector_index import FastEmbedQdrantIndex
 
 MUTATING_FILESYSTEM_TOOLS = frozenset(
     {"write_file", "edit_file", "make_directory", "remove_path"}
@@ -2822,11 +2823,22 @@ class AgentRuntime:
         )
         self._provider_failover_middleware = provider_failover_middleware
         self.app_config.prepare_directories()
+        vector_index = FastEmbedQdrantIndex(
+            self.app_config.vector_database,
+            model_name=self.app_config.embedding_model,
+            cache_dir=self.app_config.embedding_cache,
+            batch_size=self.app_config.embedding_batch_size or None,
+            enabled=(
+                self.app_config.embedding_enabled
+                and self.app_config.retrieval_mode == "hybrid"
+            ),
+        )
         self.context_store = ContextStore(
             self.app_config.context_database,
             chunk_size=self.app_config.chunk_size,
             chunk_overlap=self.app_config.chunk_overlap,
             max_file_bytes=self.app_config.max_file_bytes,
+            vector_index=vector_index,
         )
         self.project_audit_store = ProjectAuditStore(
             self.app_config.project_audit_database
@@ -2887,6 +2899,7 @@ class AgentRuntime:
             "memory_scope": (
                 "persistent SQLite archive searchable across restarts and thread IDs"
             ),
+            "retrieval": self.context_store.retrieval_status(),
             "recursion_limit": self.app_config.recursion_limit,
             "audit_batch_size": self.app_config.audit_batch_size,
             "audit_max_batches_per_request": (
@@ -2909,7 +2922,7 @@ class AgentRuntime:
         )
         filesystem_middleware = FilesystemMiddleware(
             backend=backend,
-            tools=["ls", "read_file", "write_file", "edit_file", "glob", "grep"],
+            tools=["ls", "read_file", "write_file", "edit_file"],
             custom_tool_descriptions=SAFE_FILESYSTEM_TOOL_DESCRIPTIONS,
         )
         tool_audit_middleware = ToolAuditMiddleware(self.app_config.workspace)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import errno
+import hashlib
 import ipaddress
 import json
 import re
@@ -21,6 +23,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from ddgs import DDGS
 from langchain_core.tools import StructuredTool
 
+from context_agent.artifact_policy import scan_workspace_page
 from context_agent.context_store import ContextSource, ContextStore, SearchHit
 from context_agent.errors import PathSecurityError, WebSearchError
 from context_agent.paths import resolve_inside, strip_workspace_prefix
@@ -49,6 +52,61 @@ _ALLOWED_WEB_PORTS = {80, 443}
 _BLOCKED_HTML_ELEMENTS = {"script", "style", "noscript", "svg", "template"}
 _PYPI_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+
+def _grep_cursor_scope(root: Path, pattern: str, glob_pattern: str) -> str:
+    value = f"{str(root.resolve()).casefold()}\0{pattern}\0{glob_pattern}"
+    return hashlib.sha256(value.encode()).hexdigest()[:20]
+
+
+def _encode_grep_cursor(
+    *,
+    scope: str,
+    page_cursor: str,
+    file_index: int,
+    line_offset: int,
+) -> str:
+    body: dict[str, object] = {
+        "v": 1,
+        "scope": scope,
+        "page_cursor": page_cursor,
+        "file_index": file_index,
+        "line_offset": line_offset,
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    body["check"] = hashlib.sha256(f"{canonical}:dca-grep-cursor".encode()).hexdigest()[
+        :16
+    ]
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_grep_cursor(cursor: str, *, scope: str) -> tuple[str, int, int]:
+    if not cursor:
+        return "", 0, 0
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        body = json.loads(base64.urlsafe_b64decode(padded).decode())
+        check = str(body.pop("check"))
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        expected = hashlib.sha256(f"{canonical}:dca-grep-cursor".encode()).hexdigest()[
+            :16
+        ]
+        file_index = int(body["file_index"])
+        line_offset = int(body["line_offset"])
+        page_cursor = str(body["page_cursor"])
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid grep cursor") from exc
+    if (
+        body.get("v") != 1
+        or body.get("scope") != scope
+        or check != expected
+        or file_index < 0
+        or line_offset < 0
+    ):
+        raise ValueError("Invalid grep cursor")
+    return page_cursor, file_index, line_offset
+
+
 SAFE_FILESYSTEM_TOOL_DESCRIPTIONS = {
     "ls": (
         "List a /workspace/ directory only when the user explicitly asks for a "
@@ -74,12 +132,13 @@ SAFE_FILESYSTEM_TOOL_DESCRIPTIONS = {
         "when the bounded retry is exhausted."
     ),
     "glob": (
-        "Search workspace path names only when the user asks for path discovery or "
-        "the exact target is genuinely unknown."
+        "Search workspace path names in bounded pages only when the exact target "
+        "is genuinely unknown. Reuse next_cursor to continue a partial result."
     ),
     "grep": (
-        "Search workspace file contents only when the user asks for content search "
-        "or the exact target is genuinely unknown."
+        "Search workspace contents in bounded pages only when the exact target is "
+        "genuinely unknown. Use read_file instead when an exact file is known, and "
+        "reuse next_cursor to continue a partial result."
     ),
 }
 
@@ -490,6 +549,7 @@ def build_agent_tools(
                 "in_progress": progress.in_progress,
                 "reviewed": progress.reviewed,
                 "partial": progress.partial,
+                "inventory_partial": progress.inventory_partial,
                 "skipped": progress.skipped,
                 "batches": progress.batches,
                 "file_reads": progress.file_reads,
@@ -771,6 +831,154 @@ def build_agent_tools(
             indent=2,
         )
 
+    def glob(
+        pattern: str = "**/*",
+        path: str = "/workspace",
+        cursor: str = "",
+        page_size: int = 200,
+    ) -> str:
+        """Find workspace file paths in bounded, resumable pages."""
+
+        try:
+            search_root = resolve_inside(workspace, path, must_exist=True)
+            if not search_root.is_dir():
+                raise ValueError("glob path must be a directory")
+            page = scan_workspace_page(
+                search_root,
+                pattern=pattern,
+                cursor=cursor,
+                page_size=page_size,
+            )
+            items = [
+                "/workspace/" + item.relative_to(workspace.resolve()).as_posix()
+                for item in page.paths
+            ]
+            payload = {
+                "status": "success",
+                "items": items,
+                "count": len(items),
+                "scanned": page.scanned,
+                "excluded": page.excluded,
+                "exclusion_reasons": page.reasons,
+                "partial": not page.complete,
+                "next_cursor": page.next_cursor,
+            }
+        except (OSError, PathSecurityError, ValueError) as exc:
+            payload = {
+                "status": "error",
+                "items": [],
+                "count": 0,
+                "partial": False,
+                "next_cursor": None,
+                "message": str(exc),
+            }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def grep(
+        pattern: str,
+        path: str = "/workspace",
+        glob_pattern: str = "**/*",
+        cursor: str = "",
+        page_size: int = 100,
+        max_results: int = 200,
+    ) -> str:
+        """Search text files in a bounded page and return a continuation cursor."""
+
+        try:
+            if not pattern or len(pattern) > 2_000:
+                raise ValueError("pattern must contain between 1 and 2000 characters")
+            bounded_results = max(1, min(max_results, 500))
+            expression = re.compile(pattern)
+            search_root = resolve_inside(workspace, path, must_exist=True)
+            if not search_root.is_dir():
+                raise ValueError("grep path must be a directory")
+            scope = _grep_cursor_scope(search_root, pattern, glob_pattern)
+            page_cursor, file_index, line_offset = _decode_grep_cursor(
+                cursor,
+                scope=scope,
+            )
+            page = scan_workspace_page(
+                search_root,
+                pattern=glob_pattern,
+                cursor=page_cursor,
+                page_size=page_size,
+                text_only=True,
+            )
+            matches: list[dict[str, Any]] = []
+            unreadable = 0
+            result_limit_reached = False
+            next_cursor: str | None = None
+            for current_index, file_path in enumerate(
+                page.paths[file_index:],
+                file_index,
+            ):
+                try:
+                    with file_path.open(
+                        "r",
+                        encoding="utf-8-sig",
+                        errors="replace",
+                    ) as stream:
+                        for line_number, line in enumerate(stream, start=1):
+                            if (
+                                current_index == file_index
+                                and line_number <= line_offset
+                            ):
+                                continue
+                            if expression.search(line):
+                                matches.append(
+                                    {
+                                        "path": "/workspace/"
+                                        + file_path.relative_to(
+                                            workspace.resolve()
+                                        ).as_posix(),
+                                        "line": line_number,
+                                        "text": line.rstrip()[:1_000],
+                                    }
+                                )
+                                if len(matches) >= bounded_results:
+                                    result_limit_reached = True
+                                    next_cursor = _encode_grep_cursor(
+                                        scope=scope,
+                                        page_cursor=page_cursor,
+                                        file_index=current_index,
+                                        line_offset=line_number,
+                                    )
+                                    break
+                except OSError:
+                    unreadable += 1
+                if result_limit_reached:
+                    break
+                line_offset = 0
+            if not result_limit_reached and page.next_cursor:
+                next_cursor = _encode_grep_cursor(
+                    scope=scope,
+                    page_cursor=page.next_cursor,
+                    file_index=0,
+                    line_offset=0,
+                )
+            payload = {
+                "status": "success",
+                "results": matches,
+                "count": len(matches),
+                "files_in_page": len(page.paths),
+                "scanned": page.scanned,
+                "excluded": page.excluded,
+                "unreadable": unreadable,
+                "partial": next_cursor is not None,
+                "result_limit_reached": result_limit_reached,
+                "next_cursor": next_cursor,
+            }
+        except (OSError, PathSecurityError, ValueError, re.error) as exc:
+            payload = {
+                "status": "error",
+                "results": [],
+                "count": 0,
+                "partial": False,
+                "next_cursor": None,
+                "message": str(exc),
+            }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
     def make_directory(path: str, parents: bool = True) -> str:
         """Create a directory inside /workspace and return its virtual path."""
         try:
@@ -881,6 +1089,8 @@ def build_agent_tools(
         StructuredTool.from_function(web_search),
         StructuredTool.from_function(fetch_web_page),
         StructuredTool.from_function(get_pypi_package_info),
+        StructuredTool.from_function(glob),
+        StructuredTool.from_function(grep),
         StructuredTool.from_function(make_directory),
         StructuredTool.from_function(remove_path),
     ]

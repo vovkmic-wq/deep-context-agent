@@ -825,6 +825,55 @@ def test_context_index_uses_virtual_workspace_root_and_reports_result(
     assert "event: completed" in events.text
 
 
+def test_thread_model_preference_and_provider_model_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    monkeypatch.setattr(
+        "context_agent.web._probe_openai_models",
+        lambda _provider: (
+            "test-model",
+            "second-chat-model",
+            "embed-model",
+            "audio-model",
+            "realtime-model",
+            "sora-model",
+        ),
+    )
+
+    models = client.get("/api/providers/lmstudio/models?refresh=true")
+    updated = client.put(
+        "/api/threads/model-test/model-preference",
+        json={"provider": "lmstudio", "model": "second-chat-model"},
+        headers={"x-csrf-token": csrf},
+    )
+    restored = client.get("/api/threads/model-test/model-preference")
+
+    assert models.status_code == 200
+    assert models.json()["models"] == ["test-model", "second-chat-model"]
+
+    rejected = client.put(
+        "/api/threads/model-test/model-preference",
+        json={"provider": "lmstudio", "model": "invented-model"},
+        headers={"x-csrf-token": csrf},
+    )
+    assert rejected.status_code == 422
+    assert updated.status_code == 200
+    assert restored.json()["preference"]["provider"] == "lmstudio"
+    assert restored.json()["preference"]["model"] == "second-chat-model"
+
+
+def test_web_lifespan_releases_structured_log_file(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    log_path = config.data_dir / "context-agent-server.jsonl"
+    with TestClient(create_app(config, (_provider(),))) as client:
+        assert client.get("/api/runtime").status_code == 200
+        assert log_path.exists()
+    log_path.unlink()
+    assert not log_path.exists()
+
+
 def test_settings_and_work_modes_include_russian_explanations(tmp_path: Path) -> None:
     client, csrf, _config_value = _client(tmp_path)
     settings = client.get("/api/settings").json()

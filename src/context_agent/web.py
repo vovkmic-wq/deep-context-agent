@@ -63,7 +63,11 @@ from context_agent.runtime import (
     is_long_running_project_request,
     message_text,
 )
-from context_agent.structured_logging import configure_structured_logger
+from context_agent.structured_logging import (
+    close_structured_logger,
+    configure_structured_logger,
+)
+from context_agent.vector_index import FastEmbedQdrantIndex
 
 _STATIC_ROOT = Path(__file__).parent / "static"
 _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -171,6 +175,8 @@ class ChatRequest(BaseModel):
     mode: WorkMode = "agent"
     allow_write: bool = False
     execution_mode: ChatExecutionMode = "auto"
+    provider: str | None = Field(default=None, min_length=1, max_length=100)
+    model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class AuditRequest(BaseModel):
@@ -193,10 +199,17 @@ class JobRequest(BaseModel):
 
 class IndexRequest(BaseModel):
     path: str = Field(default="/workspace", max_length=2_000)
+    cursor: str = Field(default="", max_length=2_000)
+    page_size: int = Field(default=200, ge=1, le=1_000)
 
 
 class ThreadRequest(BaseModel):
     thread_id: str = Field(min_length=1, max_length=100)
+
+
+class ThreadModelPreferenceRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(min_length=1, max_length=200)
 
 
 class FileWriteRequest(BaseModel):
@@ -375,12 +388,18 @@ class TaskRegistry:
                     self._tasks.pop(task_id, None)
             self._tasks[task.task_id] = task
 
+        submitted_at = time.monotonic()
+
         def emit(event: str, data: Mapping[str, object]) -> None:
             safe_data = dict(data)
             if event in {"completed", "cancelled", "failed"}:
                 safe_data.setdefault("task_id", task.task_id)
                 safe_data.setdefault("request_id", task.request_id or task.task_id)
                 safe_data.setdefault("retryable", False)
+                safe_data.setdefault(
+                    "duration_ms",
+                    round((time.monotonic() - submitted_at) * 1_000),
+                )
             record: dict[str, object] = {"event": event, "data": safe_data}
             if event in {"completed", "cancelled", "failed"}:
                 task.terminal_event = record
@@ -388,6 +407,7 @@ class TaskRegistry:
             task.events.put(record)
 
         def runner() -> None:
+            started_at = time.monotonic()
             emit("started", {"task_id": task.task_id, "kind": kind})
             try:
                 if task.cancel.is_set():
@@ -396,7 +416,38 @@ class TaskRegistry:
                 if task.cancel.is_set():
                     raise _TaskCancelledError
                 emit("result", {"result": result})
-                emit("completed", {"task_id": task.task_id})
+                terminal: dict[str, object] = {
+                    "task_id": task.task_id,
+                    "duration_ms": round((time.monotonic() - started_at) * 1_000),
+                }
+                if isinstance(result, Mapping):
+                    runtime = result.get("runtime")
+                    if isinstance(runtime, Mapping):
+                        terminal["provider"] = str(runtime.get("provider", ""))
+                        terminal["model"] = str(runtime.get("model", ""))
+                        if isinstance(runtime.get("failover_count"), int):
+                            terminal["failover_count"] = runtime["failover_count"]
+                        chain = runtime.get("provider_priority")
+                        if isinstance(chain, list):
+                            terminal["fallback_chain"] = chain
+                    for name in (
+                        "files_indexed",
+                        "files_unchanged",
+                        "files_skipped",
+                        "files_scanned",
+                        "found_files",
+                        "matched",
+                        "excluded",
+                        "chunks_written",
+                        "error_count",
+                    ):
+                        if isinstance(result.get(name), int):
+                            terminal[name] = result[name]
+                    terminal["partial"] = bool(result.get("partial", False))
+                    terminal["cursor_available"] = bool(result.get("next_cursor"))
+                    if result.get("partial_reason"):
+                        terminal["partial_reason"] = str(result["partial_reason"])
+                emit("completed", terminal)
             except _TaskCancelledError:
                 emit("cancelled", {"task_id": task.task_id})
             except _PublicTaskError as exc:
@@ -493,7 +544,11 @@ class TaskRegistry:
             return sum(not task.done.is_set() for task in self._tasks.values())
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            for task in self._tasks.values():
+                if not task.done.is_set():
+                    task.cancel.set()
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 class ProviderRegistry:
@@ -507,6 +562,7 @@ class ProviderRegistry:
             item.name: item for item in providers if item.name.startswith("custom-")
         }
         self._lock = threading.RLock()
+        self._model_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
 
     def snapshot(self) -> tuple[ProviderConfig, ...]:
         """Return one immutable provider-chain snapshot for an operation."""
@@ -559,7 +615,68 @@ class ProviderRegistry:
             for provider in self._providers:
                 if provider.name == canonical:
                     return provider
-            return self._custom.get(canonical)
+            custom = self._custom.get(canonical)
+        if custom is not None:
+            return custom
+        try:
+            return ProviderConfig.from_env(canonical)
+        except ConfigurationError:
+            return None
+
+    def snapshot_for(
+        self,
+        provider_name: str | None,
+        model_name: str | None,
+    ) -> tuple[ProviderConfig, ...]:
+        """Return an immutable chain with a selected provider/model first."""
+
+        active = self.snapshot()
+        if provider_name is None and model_name is None:
+            return active
+        requested_provider = provider_name or active[0].name
+        selected = self.get(requested_provider)
+        if selected is None:
+            raise ConfigurationError("Provider is not configured")
+        if model_name is not None:
+            requested_model = model_name.strip()
+            if not requested_model:
+                raise ConfigurationError("Model ID cannot be empty")
+            if requested_model != selected.model:
+                available = self.models(selected.name)
+                if requested_model not in available:
+                    raise ConfigurationError(
+                        "Model is not present in the validated provider catalog"
+                    )
+            selected = replace(selected, model=requested_model)
+        return (selected, *(item for item in active if item.name != selected.name))
+
+    def models(
+        self,
+        provider_name: str,
+        *,
+        refresh: bool = False,
+    ) -> tuple[str, ...]:
+        """Return a bounded cached model catalog for one configured provider."""
+
+        canonical = "zhipu" if provider_name.casefold() == "glm" else provider_name
+        now = time.monotonic()
+        with self._lock:
+            cached = self._model_cache.get(canonical)
+        if cached is not None and cached[0] > now and not refresh:
+            return cached[1]
+        provider = self.get(canonical)
+        if provider is None:
+            raise ConfigurationError("Provider is not configured")
+        discovered = _probe_openai_models(provider)
+        models = tuple(
+            model for model in discovered if _is_chat_model_candidate(provider, model)
+        )
+        if provider.model not in models:
+            models = (provider.model, *models)
+        models = tuple(dict.fromkeys(models))[:100]
+        with self._lock:
+            self._model_cache[canonical] = (now + 60.0, models)
+        return models
 
     def update(self, provider: ProviderConfig) -> None:
         """Replace one provider config in the catalog and active chain."""
@@ -571,6 +688,7 @@ class ProviderRegistry:
                 provider if item.name == provider.name else item
                 for item in self._providers
             )
+            self._model_cache.pop(provider.name, None)
 
     def catalog(self) -> list[dict[str, object]]:
         """Return configured/active metadata without returning credentials."""
@@ -783,6 +901,44 @@ def _probe_openai_models(provider: ProviderConfig) -> tuple[str, ...]:
     return models
 
 
+def _is_chat_model_candidate(provider: ProviderConfig, model: str) -> bool:
+    """Apply a conservative server-side chat catalog compatibility filter."""
+
+    normalized = model.strip().casefold()
+    if not normalized:
+        return False
+    if any(
+        marker in normalized
+        for marker in (
+            "audio",
+            "babbage",
+            "codex",
+            "dall-e",
+            "davinci",
+            "embed",
+            "image",
+            "instruct",
+            "moderation",
+            "realtime",
+            "rerank",
+            "search",
+            "sora",
+            "transcri",
+            "tts",
+            "whisper",
+        )
+    ):
+        return False
+    prefixes: dict[str, tuple[str, ...]] = {
+        "openai": ("gpt-", "o1", "o3", "o4"),
+        "zhipu": ("glm-",),
+        "deepseek": ("deepseek-",),
+        "qwen": ("qwen",),
+    }
+    accepted = prefixes.get(provider.name)
+    return accepted is None or normalized.startswith(accepted)
+
+
 def _runtime_factory(
     config: AppConfig,
     providers: tuple[ProviderConfig, ...],
@@ -791,6 +947,24 @@ def _runtime_factory(
         config,
         providers[0],
         fallback_provider_configs=providers[1:],
+    )
+
+
+def _hybrid_context_store(config: AppConfig) -> ContextStore:
+    """Open the shared lexical store with its lazy local vector index."""
+
+    return ContextStore(
+        config.context_database,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
+        max_file_bytes=config.max_file_bytes,
+        vector_index=FastEmbedQdrantIndex(
+            config.vector_database,
+            model_name=config.embedding_model,
+            cache_dir=config.embedding_cache,
+            batch_size=config.embedding_batch_size or None,
+            enabled=(config.embedding_enabled and config.retrieval_mode == "hybrid"),
+        ),
     )
 
 
@@ -872,6 +1046,7 @@ def create_app(
             loop.set_exception_handler(previous_handler)
             tasks.close()
             diagnostics.close()
+            close_structured_logger(logger)
 
     app = FastAPI(
         title="Deep Context Agent",
@@ -1022,6 +1197,20 @@ def create_app(
             audit_mode_default="read-only",
             work_modes=list(_WORK_MODES),
             failure_log_mode=config.failure_log_mode,
+            retrieval={
+                "mode": (
+                    "hybrid"
+                    if config.embedding_enabled and config.retrieval_mode == "hybrid"
+                    else "lexical-only"
+                ),
+                "lexical": "SQLite FTS5/BM25",
+                "vector": "FastEmbed/ONNX CPU + Qdrant local",
+                "embedding_provider": config.embedding_provider,
+                "embedding_device": config.embedding_device,
+                "embedding_model": config.embedding_model,
+                "fallback": "SQLite FTS5/BM25",
+                "external_document_transfer": False,
+            },
         )
 
     @app.get("/api/threads")
@@ -1064,6 +1253,42 @@ def create_app(
             context_usage=context_usage,
         )
 
+    @app.get("/api/threads/{thread_id}/model-preference")
+    def thread_model_preference(request: Request, thread_id: str):
+        with ContextStore(config.context_database) as store:
+            preference = store.thread_model_preference(thread_id)
+        if preference is None:
+            primary = provider_registry.snapshot()[0]
+            preference = {
+                "provider": primary.name,
+                "model": primary.model,
+                "updated_at": "",
+            }
+        return _request_payload(request, preference=preference)
+
+    @app.put("/api/threads/{thread_id}/model-preference")
+    def update_thread_model_preference(
+        request: Request,
+        thread_id: str,
+        body: ThreadModelPreferenceRequest,
+    ):
+        try:
+            selected = provider_registry.snapshot_for(body.provider, body.model)[0]
+        except ConfigurationError as exc:
+            raise HTTPException(422, "Провайдер не настроен на сервере.") from exc
+        with ContextStore(config.context_database) as store:
+            store.set_thread_model_preference(
+                thread_id,
+                selected.name,
+                selected.model,
+            )
+            preference = store.thread_model_preference(thread_id)
+        return _request_payload(
+            request,
+            preference=preference,
+            effective_next_turn=True,
+        )
+
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
         if body.mode == "multitask" and tasks.active_count() >= 4:
@@ -1072,6 +1297,28 @@ def create_app(
                 "Достигнут предел четырёх одновременных фоновых задач.",
             )
         task_id = uuid4().hex
+        with ContextStore(config.context_database) as store:
+            saved_preference = store.thread_model_preference(body.thread_id)
+        preferred_provider = body.provider
+        preferred_model = body.model
+        if preferred_provider is None and saved_preference is not None:
+            preferred_provider = saved_preference["provider"]
+            if preferred_model is None:
+                preferred_model = saved_preference["model"]
+        try:
+            task_providers = provider_registry.snapshot_for(
+                preferred_provider,
+                preferred_model,
+            )
+        except ConfigurationError as exc:
+            raise HTTPException(422, "Провайдер не настроен на сервере.") from exc
+        if body.provider is not None or body.model is not None:
+            with ContextStore(config.context_database) as store:
+                store.set_thread_model_preference(
+                    body.thread_id,
+                    task_providers[0].name,
+                    task_providers[0].model,
+                )
         forced_single_turn = body.mode in {"ask", "plan", "debug"}
         effective_execution_mode: ChatExecutionMode = (
             "single-turn" if forced_single_turn else body.execution_mode
@@ -1094,8 +1341,7 @@ def create_app(
             emit: Callable[[str, Mapping[str, object]], None],
             cancelled: threading.Event,
         ) -> object:
-            current_providers = provider_registry.snapshot()
-            with _runtime_factory(config, current_providers) as runtime:
+            with _runtime_factory(config, task_providers) as runtime:
                 if cancelled.is_set():
                     raise _TaskCancelledError
                 mode_instruction = _WORK_MODES[body.mode]
@@ -1234,6 +1480,8 @@ def create_app(
                         "job_id": active_job_id or None,
                         "work_mode": body.mode,
                         "worker_thread_id": execution_thread_id,
+                        "requested_provider": task_providers[0].name,
+                        "requested_model": task_providers[0].model,
                     },
                 )
                 return {
@@ -1243,6 +1491,8 @@ def create_app(
                     "job_id": active_job_id or None,
                     "work_mode": body.mode,
                     "worker_thread_id": execution_thread_id,
+                    "requested_provider": task_providers[0].name,
+                    "requested_model": task_providers[0].model,
                 }
 
         tasks.submit(
@@ -1262,6 +1512,8 @@ def create_app(
             task_id=task_id,
             work_mode=body.mode,
             worker_thread_id=execution_thread_id,
+            requested_provider=task_providers[0].name,
+            requested_model=task_providers[0].model,
         )
 
     @app.post("/api/chat/{task_id}/cancel")
@@ -1390,24 +1642,45 @@ def create_app(
     @app.post("/api/context/index", status_code=202)
     def index_context(request: Request, body: IndexRequest):
         def operation(
-            _emit: Callable[[str, Mapping[str, object]], None],
+            emit: Callable[[str, Mapping[str, object]], None],
             cancelled: threading.Event,
         ) -> object:
             if cancelled.is_set():
                 raise _TaskCancelledError
-            with ContextStore(
-                config.context_database,
-                chunk_size=config.chunk_size,
-                chunk_overlap=config.chunk_overlap,
-                max_file_bytes=config.max_file_bytes,
-            ) as store:
+            emit(
+                "scan_progress",
+                {
+                    "phase": "scanning",
+                    "cursor": body.cursor or None,
+                    "page_size": body.page_size,
+                    "partial": bool(body.cursor),
+                },
+            )
+            with _hybrid_context_store(config) as store:
                 try:
-                    report = store.index_path(body.path, config.context_root)
+                    report = store.index_path_page(
+                        body.path,
+                        config.context_root,
+                        cursor=body.cursor,
+                        page_size=body.page_size,
+                    )
                 except (ContextStoreError, PathSecurityError) as exc:
                     raise _PublicTaskError(
                         "context_index_failed",
                         "Не удалось индексировать выбранный путь внутри /workspace.",
                     ) from exc
+            emit(
+                "scan_progress",
+                {
+                    "phase": "page_complete",
+                    "files_scanned": report.files_scanned,
+                    "files_indexed": report.files_indexed,
+                    "files_unchanged": report.files_unchanged,
+                    "files_skipped": report.files_skipped,
+                    "partial": report.partial,
+                    "next_cursor": report.next_cursor,
+                },
+            )
             return {
                 "files_indexed": report.files_indexed,
                 "files_unchanged": report.files_unchanged,
@@ -1419,6 +1692,11 @@ def create_app(
                     if report.errors
                     else []
                 ),
+                "files_scanned": report.files_scanned,
+                "excluded": sum(report.exclusion_reasons.values()),
+                "partial": report.partial,
+                "next_cursor": report.next_cursor,
+                "exclusion_reasons": report.exclusion_reasons,
             }
 
         task_id = tasks.submit("context_index", operation)
@@ -1456,8 +1734,9 @@ def create_app(
         limit: int = Query(8, ge=1, le=100),
         source: str | None = None,
     ):
-        with ContextStore(config.context_database) as store:
+        with _hybrid_context_store(config) as store:
             hits = store.search(query, limit=limit, source=source)
+            retrieval = store.retrieval_status()
         return _request_payload(
             request,
             items=[
@@ -1471,6 +1750,7 @@ def create_app(
                 for hit in hits
             ],
             result_count=len(hits),
+            retrieval=retrieval,
         )
 
     @app.get("/api/context/window")
@@ -1913,6 +2193,36 @@ def create_app(
             request,
             items=provider_registry.catalog(),
             active=[item.name for item in provider_registry.snapshot()],
+        )
+
+    @app.get("/api/providers/{provider_name}/models")
+    def provider_models(
+        request: Request,
+        provider_name: str,
+        refresh: bool = False,
+    ):
+        try:
+            models = provider_registry.models(provider_name, refresh=refresh)
+        except ConfigurationError as exc:
+            raise HTTPException(404, "Провайдер не настроен на сервере.") from exc
+        except _PublicTaskError as exc:
+            candidate = provider_registry.get(provider_name)
+            if candidate is None:
+                raise HTTPException(422, exc.safe_message) from exc
+            return _request_payload(
+                request,
+                provider=candidate.name,
+                models=[candidate.model],
+                partial=True,
+                message=exc.safe_message,
+                cached=False,
+            )
+        return _request_payload(
+            request,
+            provider=("zhipu" if provider_name.casefold() == "glm" else provider_name),
+            models=list(models),
+            partial=False,
+            cached=not refresh,
         )
 
     @app.post("/api/providers", status_code=201)

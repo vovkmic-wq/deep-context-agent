@@ -62,6 +62,10 @@
 ### 5.2. Чат
 
 - выбор/создание thread ID;
+- закреплённый внутри чата заголовок с mode, execution, provider, model,
+  connection status и context meter;
+- динамический server-validated выбор модели для следующего turn с сохранением
+  предпочтения thread и неизменяемым snapshot уже активной задачи;
 - многострочный ввод, отмена генерации и повтор безопасного запроса;
 - потоковый текст и отдельные карточки tool calls;
 - ссылки на использованные context sources и evidence;
@@ -72,7 +76,9 @@
 ### 5.3. Контекст
 
 - индексирование workspace или разрешённого подкаталога;
+- hybrid `FTS5/BM25 + FastEmbed/Qdrant` и явный аварийный `lexical-only`;
 - прогресс: найдено, проиндексировано, unchanged, skipped, chunks, ошибки;
+- partial/timeout/cancel status и продолжение с persisted opaque cursor;
 - поиск с `query`, source, kind, top-k и pagination;
 - просмотр одного hit и соседнего окна chunks;
 - список источников с размером, hash, mtime и последней индексацией;
@@ -107,6 +113,8 @@
 ### 5.6. Провайдеры
 
 - список поддержанных провайдеров и приоритет;
+- paginated live-каталог совместимых chat/tool моделей с cache/refresh и
+  фильтрацией embedding/media/deprecated entries;
 - model/base URL и состояние ключа без значения ключа;
 - drag-and-drop приоритета с серверной валидацией;
 - `doctor` без live-вызова и отдельная подтверждаемая кнопка live-check с
@@ -117,6 +125,8 @@
 ### 5.7. Настройки и диагностика
 
 - безопасные несекретные настройки retrieval, audit, retry и timeout;
+- краткий понятный health-status на «Обзоре», а raw diagnostics и safe export —
+  только в раскрываемом advanced-разделе;
 - значения по умолчанию, effective value и источник env/config;
 - просмотр bounded tool audit без тел секретных данных;
 - health БД, WAL, свободное место, версия Python и web bundle;
@@ -129,6 +139,7 @@
 - `GET /api/health`;
 - `GET /api/runtime`;
 - `GET/POST /api/threads`, `GET /api/threads/{id}/messages`;
+- `GET/PUT /api/threads/{id}/model-preference`;
 - `POST /api/chat`, `POST /api/chat/{turn_id}/cancel`;
 - `GET /api/events/{task_id}` для SSE;
 - `POST /api/context/index`, `GET /api/context/sources`,
@@ -137,7 +148,8 @@
 - `POST /api/audits/{run_id}/pause|resume|cancel`;
 - `GET /api/audits/{run_id}/findings|requirements|report`;
 - `GET /api/files`, `GET/PUT/POST/DELETE /api/files/{virtual_path}`;
-- `GET /api/providers`, `POST /api/providers/doctor`;
+- `GET /api/providers`, `GET /api/providers/{id}/models`,
+  `POST /api/providers/doctor`;
 - `GET/PUT /api/settings` только для разрешённых несекретных параметров.
 
 Каждый ответ содержит `request_id`; ошибки используют единый DTO:
@@ -463,3 +475,41 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
    и остаётся доступной context search после active-context compaction.
 8. Browser/API tests проверяют ровно пять modes, legacy 422, read-only policy,
    параллельную отправку, child IDs и meter без утечки дополнительной истории.
+
+### 13.16. Модели, hybrid memory и bounded scans / Models and retrieval 0.22.0
+
+1. Заголовок внутри чата закреплён под общей topbar и содержит thread, mode,
+   execution, provider, model, connection status и context meter. История имеет
+   независимую прокрутку; на экране 360 px controls доступны без горизонтального
+   overflow.
+2. Provider/model selectors применяются только к следующему turn. Активный task
+   сохраняет immutable snapshot. Выбор хранится на сервере для thread; browser
+   localStorage может быть только UX-cache, но не источником исполнения.
+3. Каталог моделей загружается сервером с timeout/TTL/pagination. UI группирует
+   `Авто`, `Качество`, `Баланс`, `Экономия`, `Локально` и полный совместимый
+   список; embedding/image/audio/moderation/deprecated entries исключаются из
+   chat selector. `unverified` явно маркируется и не выдаётся за tool-capable.
+4. Ответ и terminal card показывают фактические provider/model, fallback и
+   duration. Переключение приоритета или модели не изменяет активный запрос.
+5. Раздел «Контекст» показывает `hybrid`, `lexical-only`, состояние FastEmbed и
+   Qdrant, pinned embedding signature без физического пути. Никакие документы
+   не отправляются внешнему embedding API.
+6. Index/search/discovery показывают authoritative counters: discovered,
+   scanned, matched, indexed, unchanged, skipped, excluded, chunks и errors.
+   Повторный index отображает нулевые значения, а не только ненулевые.
+7. `partial`, `timed_out`, `paused`, `cancelled`, `failed`, `degraded` и
+   `complete` имеют разные текстовые/визуальные состояния. Partial card содержит
+   причину, counts и кнопку `Продолжить`, если сервер вернул cursor.
+8. Resume использует persisted opaque cursor и task/job status. Reload или SSE
+   reconnect не начинает новый полный обход и не дублирует уже показанные items.
+9. Raw Technical diagnostics на «Обзоре» заменяется понятным статусом
+   `Система готова / Ограниченный режим / Требуется внимание`. Детальный JSON и
+   безопасный export доступны в `Настройки → Дополнительно → Диагностика`.
+10. Terminal diagnostics любой задачи содержат safe provider/model snapshot,
+    duration, file counts, partial reason и correlation ID. `200`, `202` и SSE
+    connection сами по себе не отображаются как успешное завершение.
+11. Browser/API/E2E acceptance покрывает sticky/mobile header, dynamic catalog,
+    per-thread switch, in-flight immutability, fallback label, hybrid/lexical
+    status, partial/resume, repeated index counts и redacted diagnostics.
+12. Полный нормативный контракт и последовательность реализации заданы в
+    `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md`.

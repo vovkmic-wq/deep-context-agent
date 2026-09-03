@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from context_agent.errors import ConfigurationError
+from context_agent.vector_index import DEFAULT_EMBEDDING_MODEL
 
 CANONICAL_PROVIDERS = (
     "lmstudio",
@@ -46,6 +47,15 @@ def _int_setting(environ: Mapping[str, str], name: str, default: int) -> int:
         return int(raw_value)
     except ValueError as exc:
         raise ConfigurationError(f"{name} must be an integer") from exc
+
+
+def _bool_setting(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    raw_value = environ.get(name, "true" if default else "false").strip().casefold()
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
 
 
 def _int_setting_with_alias(
@@ -320,6 +330,14 @@ class AppConfig:
     chunk_size: int = 4_000
     chunk_overlap: int = 400
     max_file_bytes: int = 2 * 1024 * 1024 * 1024
+    retrieval_mode: str = "hybrid"
+    embedding_enabled: bool = False
+    embedding_provider: str = "fastembed"
+    embedding_device: str = "cpu"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_batch_size: int = 0
+    vector_store: str = "qdrant"
+    external_embedding_fallback: bool = False
     model_call_retries: int = 3
     model_retry_initial_delay: float = 1.0
     model_retry_max_delay: float = 15.0
@@ -376,6 +394,27 @@ class AppConfig:
             )
         if self.max_file_bytes <= 0:
             raise ConfigurationError("AGENT_CONTEXT_MAX_FILE_MB must be positive")
+        if self.retrieval_mode not in {"hybrid", "lexical-only"}:
+            raise ConfigurationError(
+                "AGENT_RETRIEVAL_MODE must be hybrid or lexical-only"
+            )
+        if self.embedding_provider != "fastembed":
+            raise ConfigurationError("AGENT_EMBEDDING_PROVIDER must be fastembed")
+        if self.embedding_device != "cpu":
+            raise ConfigurationError("AGENT_EMBEDDING_DEVICE must be cpu")
+        if not self.embedding_model.strip():
+            raise ConfigurationError("AGENT_EMBEDDING_MODEL cannot be empty")
+        if not 0 <= self.embedding_batch_size <= 256:
+            raise ConfigurationError(
+                "AGENT_EMBEDDING_BATCH_SIZE must be 0 (auto) or between 1 and 256"
+            )
+        if self.vector_store != "qdrant":
+            raise ConfigurationError("AGENT_VECTOR_STORE must be qdrant")
+        if self.external_embedding_fallback:
+            raise ConfigurationError(
+                "AGENT_EXTERNAL_EMBEDDING_FALLBACK must remain false; documents "
+                "are never sent to an external embedding API"
+            )
         if self.model_call_retries < 0:
             raise ConfigurationError("AGENT_MODEL_CALL_RETRIES cannot be negative")
         if self.model_retry_initial_delay < 0:
@@ -480,6 +519,18 @@ class AppConfig:
         return self.data_dir / "checkpoints.sqlite3"
 
     @property
+    def vector_database(self) -> Path:
+        """Return the persistent local Qdrant directory."""
+
+        return self.data_dir / "qdrant"
+
+    @property
+    def embedding_cache(self) -> Path:
+        """Return the application-owned FastEmbed model cache."""
+
+        return self.data_dir / "embedding-cache"
+
+    @property
     def project_audit_database(self) -> Path:
         """Return the persistent project-audit manifest database path."""
         return self.data_dir / "project_audit.sqlite3"
@@ -548,6 +599,35 @@ class AppConfig:
             ),
             max_file_bytes=(
                 _int_setting(values, "AGENT_CONTEXT_MAX_FILE_MB", 2_048) * 1024 * 1024
+            ),
+            retrieval_mode=values.get("AGENT_RETRIEVAL_MODE", "hybrid").strip(),
+            embedding_enabled=_bool_setting(
+                values,
+                "AGENT_EMBEDDING_ENABLED",
+                True,
+            ),
+            embedding_provider=values.get(
+                "AGENT_EMBEDDING_PROVIDER",
+                "fastembed",
+            ).strip(),
+            embedding_device=values.get(
+                "AGENT_EMBEDDING_DEVICE",
+                "cpu",
+            ).strip(),
+            embedding_model=values.get(
+                "AGENT_EMBEDDING_MODEL",
+                DEFAULT_EMBEDDING_MODEL,
+            ).strip(),
+            embedding_batch_size=_int_setting(
+                values,
+                "AGENT_EMBEDDING_BATCH_SIZE",
+                0,
+            ),
+            vector_store=values.get("AGENT_VECTOR_STORE", "qdrant").strip(),
+            external_embedding_fallback=_bool_setting(
+                values,
+                "AGENT_EXTERNAL_EMBEDDING_FALLBACK",
+                False,
             ),
             model_call_retries=_int_setting(
                 values,
