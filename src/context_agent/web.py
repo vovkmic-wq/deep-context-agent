@@ -57,12 +57,8 @@ from context_agent.errors import (
 from context_agent.paths import resolve_inside
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
-from context_agent.runtime import (
-    AgentRuntime,
-    is_engineering_execution_request,
-    is_long_running_project_request,
-    message_text,
-)
+from context_agent.routing import RoutingDecision, route_chat_request
+from context_agent.runtime import AgentRuntime, message_text
 from context_agent.structured_logging import (
     close_structured_logger,
     configure_structured_logger,
@@ -227,6 +223,10 @@ class ProviderDoctorRequest(BaseModel):
 
 class ProviderPriorityRequest(BaseModel):
     providers: list[str] = Field(min_length=1, max_length=20)
+
+
+class ProviderModelRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
 
 
 class ProviderCreateRequest(BaseModel):
@@ -561,6 +561,10 @@ class ProviderRegistry:
         self._custom: dict[str, ProviderConfig] = {
             item.name: item for item in providers if item.name.startswith("custom-")
         }
+        self._overrides: dict[str, ProviderConfig] = {}
+        self._known_models: dict[str, list[str]] = {
+            item.name: [item.model] for item in providers
+        }
         self._lock = threading.RLock()
         self._model_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
 
@@ -579,13 +583,18 @@ class ProviderRegistry:
         active = {item.name: item for item in self.snapshot()}
         with self._lock:
             custom = dict(self._custom)
+            overrides = dict(self._overrides)
         resolved: list[ProviderConfig] = []
         seen: set[str] = set()
         for requested_name in normalized:
             canonical = "zhipu" if requested_name == "glm" else requested_name
             if canonical in seen:
                 raise ConfigurationError(f"Provider '{canonical}' is repeated")
-            provider = active.get(canonical) or custom.get(canonical)
+            provider = (
+                active.get(canonical)
+                or overrides.get(canonical)
+                or custom.get(canonical)
+            )
             if provider is None:
                 provider = ProviderConfig.from_env(canonical)
             seen.add(canonical)
@@ -606,6 +615,7 @@ class ProviderRegistry:
             ):
                 raise ConfigurationError("Provider ID already exists")
             self._custom[provider.name] = provider
+            self._known_models[provider.name] = [provider.model]
 
     def get(self, name: str) -> ProviderConfig | None:
         """Return configured provider metadata without exposing its credential."""
@@ -615,9 +625,9 @@ class ProviderRegistry:
             for provider in self._providers:
                 if provider.name == canonical:
                     return provider
-            custom = self._custom.get(canonical)
-        if custom is not None:
-            return custom
+            configured = self._overrides.get(canonical) or self._custom.get(canonical)
+        if configured is not None:
+            return configured
         try:
             return ProviderConfig.from_env(canonical)
         except ConfigurationError:
@@ -668,12 +678,15 @@ class ProviderRegistry:
         if provider is None:
             raise ConfigurationError("Provider is not configured")
         discovered = _probe_openai_models(provider)
+        with self._lock:
+            known = self._known_models.setdefault(canonical, [])
+            if provider.model not in known:
+                known.insert(0, provider.model)
+            known_models = tuple(known)
         models = tuple(
             model for model in discovered if _is_chat_model_candidate(provider, model)
         )
-        if provider.model not in models:
-            models = (provider.model, *models)
-        models = tuple(dict.fromkeys(models))[:100]
+        models = tuple(dict.fromkeys((provider.model, *known_models, *models)))[:100]
         with self._lock:
             self._model_cache[canonical] = (now + 60.0, models)
         return models
@@ -684,6 +697,10 @@ class ProviderRegistry:
         with self._lock:
             if provider.name.startswith("custom-"):
                 self._custom[provider.name] = provider
+            self._overrides[provider.name] = provider
+            known = self._known_models.setdefault(provider.name, [])
+            if provider.model not in known:
+                known.append(provider.model)
             self._providers = tuple(
                 provider if item.name == provider.name else item
                 for item in self._providers
@@ -699,7 +716,13 @@ class ProviderRegistry:
         }
         items: list[dict[str, object]] = []
         with self._lock:
-            custom_names = tuple(sorted(self._custom))
+            custom_names = tuple(
+                sorted(
+                    name
+                    for name in set(self._custom).union(self._overrides)
+                    if name.startswith("custom-")
+                )
+            )
         names = (
             "lmstudio",
             "zhipu",
@@ -714,7 +737,7 @@ class ProviderRegistry:
             provider = active_entry[1] if active_entry else None
             if provider is None:
                 with self._lock:
-                    provider = self._custom.get(name)
+                    provider = self._overrides.get(name) or self._custom.get(name)
             configured = provider is not None
             configuration_error = ""
             if provider is None and not name.startswith("custom-"):
@@ -1275,7 +1298,8 @@ def create_app(
         try:
             selected = provider_registry.snapshot_for(body.provider, body.model)[0]
         except ConfigurationError as exc:
-            raise HTTPException(422, "Провайдер не настроен на сервере.") from exc
+            raise HTTPException(422, str(exc)) from exc
+        provider_registry.update(selected)
         with ContextStore(config.context_database) as store:
             store.set_thread_model_preference(
                 thread_id,
@@ -1311,30 +1335,50 @@ def create_app(
                 preferred_model,
             )
         except ConfigurationError as exc:
-            raise HTTPException(422, "Провайдер не настроен на сервере.") from exc
+            raise HTTPException(422, str(exc)) from exc
         if body.provider is not None or body.model is not None:
+            provider_registry.update(task_providers[0])
             with ContextStore(config.context_database) as store:
                 store.set_thread_model_preference(
                     body.thread_id,
                     task_providers[0].name,
                     task_providers[0].model,
                 )
-        forced_single_turn = body.mode in {"ask", "plan", "debug"}
-        effective_execution_mode: ChatExecutionMode = (
-            "single-turn" if forced_single_turn else body.execution_mode
+        routing = route_chat_request(
+            body.query,
+            work_mode=body.mode,
+            requested_execution=body.execution_mode,
         )
-        effective_allow_write = body.allow_write and body.mode not in {"ask", "plan"}
+        effective_allow_write = (
+            body.allow_write
+            and routing.mutation_requested
+            and body.mode not in {"ask", "plan"}
+        )
         execution_thread_id = (
             f"{body.thread_id}:multitask:{task_id}"
             if body.mode == "multitask"
             else body.thread_id
         )
-        detected_autopilot = body.mode in {"agent", "multitask"} and (
-            is_long_running_project_request(body.query)
-            or is_engineering_execution_request(body.query)
-        )
-        use_autopilot = effective_execution_mode == "autopilot" or (
-            effective_execution_mode == "auto" and detected_autopilot
+        use_autopilot = routing.execution == "persistent"
+        logger.info(
+            "Chat routing decision",
+            extra={
+                "event_code": "chat_routing_decision",
+                "safe_fields": {
+                    "task_id": task_id,
+                    "thread_id": body.thread_id,
+                    "requested_execution": body.execution_mode,
+                    "execution": routing.execution,
+                    "workflow": routing.workflow,
+                    "scope": routing.scope,
+                    "allow_project_scan": routing.allow_project_scan,
+                    "mutation_requested": routing.mutation_requested,
+                    "confidence": routing.confidence,
+                    "reason_codes": ",".join(routing.reason_codes),
+                    "instruction_chars": routing.instruction_chars,
+                    "excluded_data_chars": routing.excluded_data_chars,
+                },
+            },
         )
 
         def operation(
@@ -1347,6 +1391,16 @@ def create_app(
                 mode_instruction = _WORK_MODES[body.mode]
                 query = f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}"
                 active_job_id = ""
+                resolved_routing = routing
+                routing_policy = getattr(runtime, "set_routing_scope", None)
+                if callable(routing_policy):
+                    routing_policy(
+                        workspace_reads_allowed=(
+                            routing.scope in {"file", "project"}
+                            or routing.workflow in {"plan", "debug"}
+                        ),
+                        project_scan_allowed=routing.allow_project_scan,
+                    )
 
                 def chat_job_progress(
                     progress: AutopilotProgress,
@@ -1372,12 +1426,18 @@ def create_app(
                                 "cancelled",
                             )
 
-                def run_chat_autopilot(reason: str) -> str:
+                def run_chat_autopilot(
+                    reason: str,
+                    decision: RoutingDecision,
+                ) -> str:
                     emit(
                         "execution",
                         {
                             "mode": "autopilot",
                             "reason": reason,
+                            "routing": decision.as_dict(),
+                            "workflow": decision.workflow,
+                            "scope": decision.scope,
                             "allow_write": effective_allow_write,
                             "work_mode": body.mode,
                             "worker_thread_id": execution_thread_id,
@@ -1390,6 +1450,7 @@ def create_app(
                         progress_callback=chat_job_progress,
                         diagnostic_source="web",
                         diagnostic_task_id=task_id,
+                        workflow=decision.workflow,
                     )
                     runtime.context_store.archive_message(
                         body.thread_id,
@@ -1407,10 +1468,10 @@ def create_app(
                 if use_autopilot:
                     reason = (
                         "explicit"
-                        if effective_execution_mode == "autopilot"
-                        else "auto-detected"
+                        if body.execution_mode == "autopilot"
+                        else f"auto-detected:{routing.workflow}"
                     )
-                    answer = run_chat_autopilot(reason)
+                    answer = run_chat_autopilot(reason, routing)
                 else:
                     emit(
                         "execution",
@@ -1418,11 +1479,14 @@ def create_app(
                             "mode": "single-turn",
                             "reason": (
                                 f"{body.mode}-policy"
-                                if forced_single_turn
+                                if body.mode in {"ask", "plan", "debug"}
                                 else "explicit"
-                                if effective_execution_mode == "single-turn"
-                                else "auto-short-task"
+                                if body.execution_mode == "single-turn"
+                                else f"auto:{routing.workflow}"
                             ),
+                            "routing": routing.as_dict(),
+                            "workflow": routing.workflow,
+                            "scope": routing.scope,
                             "allow_write": effective_allow_write,
                             "work_mode": body.mode,
                             "worker_thread_id": execution_thread_id,
@@ -1461,14 +1525,23 @@ def create_app(
                             )
                     except AgentError as exc:
                         fallback_code = classify_failure(exc)
-                        if effective_execution_mode != "auto" or fallback_code not in {
+                        if body.execution_mode != "auto" or fallback_code not in {
                             "agent_step_limit",
                             "context_window_exceeded",
                         }:
                             raise
                         resolved_execution = "autopilot"
+                        resolved_routing = replace(
+                            routing,
+                            execution="persistent",
+                            reason_codes=(
+                                *routing.reason_codes,
+                                f"AUTOMATIC_FALLBACK_{fallback_code.upper()}",
+                            ),
+                        )
                         answer = run_chat_autopilot(
-                            f"automatic-fallback:{fallback_code}"
+                            f"automatic-fallback:{fallback_code}",
+                            resolved_routing,
                         )
                 metadata = runtime._provider_failover_middleware.runtime_metadata()
                 emit(
@@ -1480,6 +1553,7 @@ def create_app(
                         "job_id": active_job_id or None,
                         "work_mode": body.mode,
                         "worker_thread_id": execution_thread_id,
+                        "routing": resolved_routing.as_dict(),
                         "requested_provider": task_providers[0].name,
                         "requested_model": task_providers[0].model,
                     },
@@ -1491,6 +1565,7 @@ def create_app(
                     "job_id": active_job_id or None,
                     "work_mode": body.mode,
                     "worker_thread_id": execution_thread_id,
+                    "routing": resolved_routing.as_dict(),
                     "requested_provider": task_providers[0].name,
                     "requested_model": task_providers[0].model,
                 }
@@ -1514,6 +1589,7 @@ def create_app(
             worker_thread_id=execution_thread_id,
             requested_provider=task_providers[0].name,
             requested_model=task_providers[0].model,
+            routing=routing.as_dict(),
         )
 
     @app.post("/api/chat/{task_id}/cancel")
@@ -2223,6 +2299,27 @@ def create_app(
             models=list(models),
             partial=False,
             cached=not refresh,
+        )
+
+    @app.put("/api/providers/{provider_name}/model")
+    def update_provider_model(
+        request: Request,
+        provider_name: str,
+        body: ProviderModelRequest,
+    ):
+        try:
+            selected = provider_registry.snapshot_for(provider_name, body.model)[0]
+        except ConfigurationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        provider_registry.update(selected)
+        return _request_payload(
+            request,
+            provider=selected.name,
+            model=selected.model,
+            active=any(
+                item.name == selected.name for item in provider_registry.snapshot()
+            ),
+            effective_immediately=True,
         )
 
     @app.post("/api/providers", status_code=201)

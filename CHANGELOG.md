@@ -5,6 +5,46 @@
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-03
+
+### Добавлено
+
+- Структурированный data-aware маршрутизатор независимо определяет execution,
+  workflow, scope, project-scan authority и прямой mutation intent.
+- Non-project persistent workflows используют durable `execute` units с
+  lease/heartbeat/retry, не создавая project-audit manifest.
+- Web API, SSE, интерфейс и JSONL показывают безопасное объяснение выбранного
+  маршрута; `workflow` хранится в мигрируемой Autopilot SQLite.
+
+### Исправлено
+
+- Команды внутри вставленного PowerShell-журнала, traceback, blockquote,
+  fenced code или tagged attachment больше не запускают аудит проекта.
+- Включённый allow-write больше не считается просьбой изменить файлы.
+- Automatic step/context fallback сохраняет workflow и не расширяет scope.
+- Списки провайдеров в чате и разделе «Провайдеры» используют одну активную
+  цепочку; для каждого провайдера доступен проверенный выпадающий список
+  моделей, а изменение модели синхронизируется с текущей задачей чата.
+- Чат переведён на ограниченный высотой viewport layout: общая страница больше
+  не прокручивает заголовок, история сообщений прокручивается независимо.
+
+### Проверено
+
+- Ruff check/format, mypy, compileall, TypeScript production build/bundle,
+  `pip check` и 298 Python-тестов; один системный Windows symlink test
+  пропущен.
+- Исходный log-analysis incident стабилен в пяти повторах; проверены quoted
+  command injection, explicit overrides, targeted file, SQLite migration и
+  persistent non-project execute unit.
+- Live Web запрос завершился как `log-analysis / message / single-turn` без
+  Autopilot job и ProjectAudit run; GLM rate limit корректно переключил задачу
+  на OpenAI. Отдельный explicit persistent live-запрос создал только
+  `log-analysis / execute` job с `audit_run_id=NULL`; при недоступном provider
+  bounded retries завершились persisted `blocked` без project audit. Browser
+  acceptance подтвердил sticky header и чистую console.
+- Wheel 0.23.0 установлен в чистый target; SHA-256
+  `C184A9B5EC5C1DF498141F531DC055063FDC8C5F195ED3EAFD5B80565471930A`.
+
 ## [0.22.0] — 2026-09-03
 
 ### Добавлено

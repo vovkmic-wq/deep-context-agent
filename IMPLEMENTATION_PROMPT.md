@@ -1,7 +1,22 @@
 # Управляющий промпт реализации
 
-Последний production-этап описан промптом 0.22.0. Версия кода изменяется только
+Последний production-этап описан промптом 0.23.0. Версия кода изменяется только
 после полного offline/live/package acceptance.
+
+## Structured data-aware routing 0.23.0 (2026-09-03)
+
+Работай по `DEEP_CONTEXT_AGENT_0_23_STRUCTURED_ROUTING_PROMPT.md`, основному и
+Web-ТЗ. Не классифицируй сырой query целиком: сначала отдели direct instruction
+от fenced/quoted/tagged logs, attachments, traceback, terminal и tool output.
+Структурированное решение независимо фиксирует execution, workflow, scope,
+project-scan authority и mutation intent.
+
+Persistent execution не означает project audit. Для non-project workflow
+используй durable execute unit с теми же lease, heartbeat, retry и terminal
+гарантиями, но без ProjectAuditStore manifest. `allow_write` — только trusted
+capability и применяется совместно с прямой mutation-командой. Перед релизом
+повтори исходный PowerShell-log incident, adversarial quoted instructions,
+explicit overrides, SQLite migration, API/SSE/UI и live Web сценарий.
 
 ## Dynamic models, hybrid retrieval and bounded scans 0.22.0 (2026-09-03)
 

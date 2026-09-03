@@ -1,7 +1,7 @@
 {
   "name": "deep-context-agent-webui",
   "private": true,
-  "version": "0.22.0",
+  "version": "0.23.0",
   "scripts": {
     "build": "esbuild src/app.ts --bundle --format=iife --minify --target=es2020 --outfile=../src/context_agent/static/app.js",
     "check": "tsc --noEmit && node tests/bundle.test.mjs"

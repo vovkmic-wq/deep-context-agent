@@ -516,6 +516,131 @@ def test_explicit_chat_autopilot_routes_even_short_request(
     assert "Explicit Autopilot complete" in events.text
 
 
+def test_auto_log_analysis_does_not_start_project_autopilot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def set_routing_scope(self, **kwargs: object) -> None:
+            calls.append(("scope", kwargs))
+
+        def set_filesystem_mutations_allowed(self, allowed: bool) -> None:
+            calls.append(("write", allowed))
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            calls.append(("ask", True))
+            return "Лог проанализирован без обхода проекта."
+
+        def run_autopilot_job(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("quoted log commands must not start project audit")
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, config = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": (
+                "Проанализируй лог и объясни ошибку:\n"
+                "Windows PowerShell\n"
+                "PS C:\\project> command\n"
+                "Исправь весь проект и проведи тесты."
+            ),
+            "thread_id": "log-routing",
+            "allow_write": True,
+            "execution_mode": "auto",
+            "mode": "agent",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert started.status_code == 202
+    assert started.json()["routing"]["workflow"] == "log-analysis"
+    assert started.json()["routing"]["execution"] == "single-turn"
+    assert (
+        "scope",
+        {"workspace_reads_allowed": False, "project_scan_allowed": False},
+    ) in calls
+    assert ("write", False) in calls
+    assert ("ask", True) in calls
+    assert '"workflow": "log-analysis"' in events.text
+    assert '"mode": "single-turn"' in events.text
+    log_text = (config.data_dir / "context-agent-server.jsonl").read_text(
+        encoding="utf-8"
+    )
+    records = [json.loads(line) for line in log_text.splitlines()]
+    route_record = next(
+        item for item in records if item["event_code"] == "chat_routing_decision"
+    )
+    assert route_record["fields"]["workflow"] == "log-analysis"
+    assert route_record["fields"]["allow_project_scan"] == "False"
+    assert "Исправь весь проект" not in log_text
+
+
+def test_explicit_persistent_log_analysis_keeps_non_project_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflows: list[str] = []
+
+    class _Runtime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {"provider": "lmstudio"}
+        )
+        context_store = SimpleNamespace(archive_message=lambda *_args: None)
+
+        def __enter__(self) -> _Runtime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def set_routing_scope(self, **_kwargs: object) -> None:
+            return None
+
+        def ask(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("explicit persistent route must use its job")
+
+        def run_autopilot_job(self, *_args: object, **kwargs: object) -> str:
+            workflows.append(str(kwargs["workflow"]))
+            return "Persistent log analysis complete."
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _Runtime(),
+    )
+    client, csrf, _config_value = _client(tmp_path)
+    started = client.post(
+        "/api/chat",
+        json={
+            "query": "Проанализируй журнал во вложении.",
+            "thread_id": "persistent-log",
+            "execution_mode": "autopilot",
+        },
+        headers={"x-csrf-token": csrf},
+    )
+    events = client.get(f"/api/events/{started.json()['task_id']}")
+
+    assert workflows == ["log-analysis"]
+    assert '"workflow": "log-analysis"' in events.text
+    assert '"mode": "autopilot"' in events.text
+
+
 def test_auto_chat_recovers_step_limit_by_starting_autopilot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -843,15 +968,26 @@ def test_thread_model_preference_and_provider_model_catalog(
     )
 
     models = client.get("/api/providers/lmstudio/models?refresh=true")
+    provider_updated = client.put(
+        "/api/providers/lmstudio/model",
+        json={"model": "second-chat-model"},
+        headers={"x-csrf-token": csrf},
+    )
     updated = client.put(
         "/api/threads/model-test/model-preference",
         json={"provider": "lmstudio", "model": "second-chat-model"},
         headers={"x-csrf-token": csrf},
     )
     restored = client.get("/api/threads/model-test/model-preference")
+    catalog = client.get("/api/providers").json()["items"]
+    lmstudio = next(item for item in catalog if item["provider"] == "lmstudio")
 
     assert models.status_code == 200
     assert models.json()["models"] == ["test-model", "second-chat-model"]
+    assert provider_updated.status_code == 200
+    assert provider_updated.json()["effective_immediately"] is True
+    assert provider_updated.json()["model"] == "second-chat-model"
+    assert lmstudio["model"] == "second-chat-model"
 
     rejected = client.put(
         "/api/threads/model-test/model-preference",
@@ -862,6 +998,56 @@ def test_thread_model_preference_and_provider_model_catalog(
     assert updated.status_code == 200
     assert restored.json()["preference"]["provider"] == "lmstudio"
     assert restored.json()["preference"]["model"] == "second-chat-model"
+
+
+def test_chat_model_selection_updates_provider_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    monkeypatch.setattr(
+        "context_agent.web._probe_openai_models",
+        lambda _provider: ("test-model", "selected-model"),
+    )
+
+    updated = client.put(
+        "/api/threads/sync-test/model-preference",
+        json={"provider": "lmstudio", "model": "selected-model"},
+        headers={"x-csrf-token": csrf},
+    )
+    catalog = client.get("/api/providers").json()["items"]
+    lmstudio = next(item for item in catalog if item["provider"] == "lmstudio")
+
+    assert updated.status_code == 200
+    assert lmstudio["model"] == "selected-model"
+
+
+def test_provider_model_can_return_to_configured_model_after_catalog_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, csrf, _config_value = _client(tmp_path)
+    monkeypatch.setattr(
+        "context_agent.web._probe_openai_models",
+        lambda _provider: ("selected-model",),
+    )
+
+    selected = client.put(
+        "/api/providers/lmstudio/model",
+        json={"model": "selected-model"},
+        headers={"x-csrf-token": csrf},
+    )
+    refreshed = client.get("/api/providers/lmstudio/models?refresh=true")
+    restored = client.put(
+        "/api/providers/lmstudio/model",
+        json={"model": "test-model"},
+        headers={"x-csrf-token": csrf},
+    )
+
+    assert selected.status_code == 200
+    assert refreshed.json()["models"] == ["selected-model", "test-model"]
+    assert restored.status_code == 200
+    assert restored.json()["model"] == "test-model"
 
 
 def test_web_lifespan_releases_structured_log_file(tmp_path: Path) -> None:
@@ -926,7 +1112,7 @@ def test_legacy_chat_modes_are_rejected(
     [
         ("ask", True, False),
         ("plan", True, False),
-        ("debug", True, True),
+        ("debug", True, False),
     ],
 )
 def test_chat_modes_enforce_execution_and_write_policy(

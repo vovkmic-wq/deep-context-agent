@@ -25,6 +25,7 @@ const directoryHistory: string[] = [];
 let providerCatalog: Payload[] = [];
 let activeProviders: string[] = [];
 let modelCatalogRequest = 0;
+let providerRenderGeneration = 0;
 let indexCursor = "";
 let indexedPath = "";
 
@@ -182,8 +183,10 @@ function navigate(panelId: string): void {
   document.querySelectorAll<HTMLElement>(".panel").forEach((panel) => {
     panel.classList.toggle("active", panel.id === panelId);
   });
+  element("main").classList.toggle("chat-view", panelId === "chat");
   element("page-title").textContent = pageTitles[panelId] || panelId;
   window.history.replaceState(null, "", `#${panelId}`);
+  if (panelId === "chat") window.scrollTo({ top: 0, behavior: "auto" });
 }
 
 function card(title: string, body: string): HTMLElement {
@@ -322,15 +325,31 @@ async function sendChatMessage(): Promise<void> {
     taskId = text(result.task_id);
     activeChatTasks.add(taskId);
     updateCancelButton();
+    const initialRouting =
+      result.routing && typeof result.routing === "object"
+        ? (result.routing as Payload)
+        : {};
+    if (Object.keys(initialRouting).length) {
+      const summary = formatRoutingDecision(initialRouting);
+      pending.textContent = summary;
+      const status = element("chat-job-status");
+      status.hidden = false;
+      setOperationStatus("chat-job-status", summary);
+    }
     streamTask(taskId, (name, data) => {
-      if (name === "execution" && data.mode === "autopilot") {
-        pending.textContent = "Autopilot формирует план и рабочий манифест…";
+      if (name === "execution") {
+        const routing =
+          data.routing && typeof data.routing === "object"
+            ? (data.routing as Payload)
+            : {};
+        const summary = formatRoutingDecision(routing);
+        pending.textContent =
+          data.mode === "autopilot"
+            ? `${summary} Подготавливается сохраняемая рабочая единица…`
+            : summary;
         const status = element("chat-job-status");
         status.hidden = false;
-        setOperationStatus(
-          "chat-job-status",
-          `Autopilot запущен · ${text(data.reason)}`,
-        );
+        setOperationStatus("chat-job-status", summary);
       }
       if (
         [
@@ -382,6 +401,28 @@ async function sendChatMessage(): Promise<void> {
   }
 }
 
+const workflowLabels: Record<string, string> = {
+  answer: "Ответ / Answer",
+  "log-analysis": "Анализ журнала / Log analysis",
+  "targeted-review": "Проверка файла / Targeted review",
+  "targeted-change": "Изменение файла / Targeted change",
+  "project-audit": "Аудит проекта / Project audit",
+  "project-change": "Изменение проекта / Project change",
+  "project-test": "Тестирование проекта / Project testing",
+  plan: "Планирование / Planning",
+  debug: "Отладка / Debugging",
+};
+
+function formatRoutingDecision(routing: Payload): string {
+  const workflow = text(routing.workflow) || "answer";
+  const execution =
+    text(routing.execution) === "persistent"
+      ? "длительная задача"
+      : "один ход";
+  const scope = text(routing.scope) || "message";
+  return `Маршрут: ${workflowLabels[workflow] || workflow} · ${execution} · область ${scope}.`;
+}
+
 function formatJobProgress(data: Payload, eventName: string): string {
   const audit =
     data.audit && typeof data.audit === "object" ? (data.audit as Payload) : {};
@@ -395,14 +436,18 @@ function formatJobProgress(data: Payload, eventName: string): string {
           : eventName === "job_deadline"
             ? "Autopilot: soft deadline, завершается текущая единица"
             : "Autopilot выполняет";
-  const reviewed = text(audit.reviewed) || "0";
-  const total = text(audit.total) || "?";
-  const pending = text(audit.pending) || "?";
+  const reviewed = text(audit.reviewed);
+  const total = text(audit.total);
+  const pending = text(audit.pending);
   const heartbeatSeconds = Number(data.last_heartbeat_at || 0);
   const heartbeat = heartbeatSeconds
     ? new Date(heartbeatSeconds * 1000).toLocaleTimeString()
     : "—";
-  return `${prefix}: фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, связь ${heartbeat}, файлы ${reviewed}/${total}, ожидают ${pending}, units ${text(data.completed_units)}/${text(data.attempts)}, interrupted ${text(data.interrupted_units)}, replans ${text(data.replans)}.`;
+  const workflow = text(data.workflow) || "project-audit";
+  const fileProgress = total
+    ? `, файлы ${reviewed || "0"}/${total}, ожидают ${pending || "0"}`
+    : "";
+  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, связь ${heartbeat}${fileProgress}, units ${text(data.completed_units)}/${text(data.attempts)}, interrupted ${text(data.interrupted_units)}, replans ${text(data.replans)}.`;
 }
 
 function showJobSummary(data: Payload): void {
@@ -661,9 +706,97 @@ async function createCustomProvider(): Promise<void> {
   showToast(`Провайдер ${providerName} добавлен`);
 }
 
+function setProviderCatalogModel(provider: string, model: string): void {
+  const item = providerCatalog.find(
+    (candidate) => text(candidate.provider) === provider,
+  );
+  if (item) item.model = model;
+  document
+    .querySelectorAll<HTMLSelectElement>("[data-provider-model]")
+    .forEach((select) => {
+      if (select.dataset.providerModel === provider) select.value = model;
+    });
+}
+
+async function loadProviderModelOptions(
+  provider: string,
+  select: HTMLSelectElement,
+  configuredModel: string,
+  generation: number,
+): Promise<void> {
+  try {
+    const result = await api<{
+      models: Json[];
+      partial: boolean;
+      message?: string;
+      request_id: string;
+    }>(`/api/providers/${encodeURIComponent(provider)}/models`);
+    if (generation !== providerRenderGeneration || !select.isConnected) return;
+    const models = result.models.map((model) => text(model));
+    if (configuredModel && !models.includes(configuredModel)) {
+      models.unshift(configuredModel);
+    }
+    select.replaceChildren();
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      select.append(option);
+    }
+    select.value = configuredModel || models[0] || "";
+    select.disabled = models.length === 0;
+    select.title = result.partial
+      ? `Частичный список: ${text(result.message)}`
+      : `Доступно моделей: ${models.length}`;
+  } catch (error) {
+    if (generation !== providerRenderGeneration || !select.isConnected) return;
+    select.disabled = !configuredModel;
+    select.title =
+      `Каталог моделей недоступен: ${error instanceof Error ? error.message : "ошибка"}`;
+    providerStatus(provider, select.title, false);
+  }
+}
+
+async function saveProviderModel(
+  provider: string,
+  model: string,
+  select: HTMLSelectElement,
+): Promise<void> {
+  select.disabled = true;
+  providerStatus(provider, "Сохраняю модель…", true);
+  try {
+    await api<Payload>(`/api/providers/${encodeURIComponent(provider)}/model`, {
+      method: "PUT",
+      body: JSON.stringify({ model }),
+    });
+    setProviderCatalogModel(provider, model);
+    if (value("chat-provider") === provider) {
+      await loadChatModels(provider, model);
+      element<HTMLSelectElement>("chat-model").value = model;
+      await persistThreadModelPreference(provider, model);
+      element("runtime-badge").textContent = `${provider}/${model}`;
+    }
+    providerStatus(provider, `Модель ${model} сохранена`, true);
+    showToast(`Для ${provider} выбрана модель ${model}`);
+  } catch (error) {
+    const configured = providerCatalog.find(
+      (item) => text(item.provider) === provider,
+    );
+    select.value = text(configured?.model);
+    providerStatus(
+      provider,
+      error instanceof Error ? error.message : "Ошибка выбора модели",
+      false,
+    );
+  } finally {
+    select.disabled = false;
+  }
+}
+
 function renderProviders(): void {
   const output = element("providers-output");
   output.replaceChildren();
+  const generation = ++providerRenderGeneration;
   for (const [index, providerName] of activeProviders.entries()) {
     const item =
       providerCatalog.find((candidate) => text(candidate.provider) === providerName) ||
@@ -677,10 +810,28 @@ function renderProviders(): void {
     identity.className = "provider-details";
     const heading = document.createElement("strong");
     heading.textContent = providerName;
-    const model = document.createElement("small");
-    model.textContent = `${text(item.model)} · ${
-      item.local ? "локально, без платы API" : "удалённо"
-    }`;
+    const location = document.createElement("small");
+    location.textContent = item.local ? "локально, без платы API" : "удалённо";
+    const modelControl = document.createElement("label");
+    modelControl.className = "provider-model-control";
+    const modelCaption = document.createElement("span");
+    modelCaption.textContent = "Модель / Model";
+    const modelSelect = document.createElement("select");
+    modelSelect.dataset.providerModel = providerName;
+    modelSelect.setAttribute("aria-label", `Модель провайдера ${providerName}`);
+    const configuredModel = text(item.model);
+    if (configuredModel) {
+      const configuredOption = document.createElement("option");
+      configuredOption.value = configuredModel;
+      configuredOption.textContent = configuredModel;
+      modelSelect.append(configuredOption);
+    }
+    modelSelect.value = configuredModel;
+    modelSelect.disabled = true;
+    modelSelect.addEventListener("change", () => {
+      void saveProviderModel(providerName, modelSelect.value, modelSelect);
+    });
+    modelControl.append(modelCaption, modelSelect);
     const endpoint = document.createElement("div");
     endpoint.className = "provider-details";
     const url = document.createElement("small");
@@ -689,7 +840,7 @@ function renderProviders(): void {
     status.id = `provider-status-${providerName}`;
     status.className = "provider-status";
     status.textContent = "Не проверен";
-    identity.append(heading, model);
+    identity.append(heading, location);
     endpoint.append(url, status);
     const actions = document.createElement("div");
     actions.className = "provider-actions";
@@ -719,8 +870,14 @@ function renderProviders(): void {
       button.addEventListener("click", handler);
       actions.append(button);
     }
-    row.append(priority, identity, endpoint, actions);
+    row.append(priority, identity, modelControl, endpoint, actions);
     output.append(row);
+    void loadProviderModelOptions(
+      providerName,
+      modelSelect,
+      configuredModel,
+      generation,
+    );
   }
 
   const select = element<HTMLSelectElement>("provider-select");
@@ -767,6 +924,8 @@ function removeProvider(index: number): void {
 }
 
 async function refreshProviders(): Promise<void> {
+  const previousProvider = value("chat-provider");
+  const previousModel = value("chat-model");
   const result = await api<{
     items: Payload[];
     active: Json[];
@@ -782,14 +941,21 @@ async function refreshProviders(): Promise<void> {
       `${text(primary.provider)}/${text(primary.model)}`;
   }
   renderProviders();
-  await populateChatProviders();
+  await populateChatProviders(previousProvider, previousModel);
 }
 
-async function populateChatProviders(preferred = ""): Promise<void> {
+async function populateChatProviders(
+  preferredProvider = "",
+  preferredModel = "",
+): Promise<void> {
   const select = element<HTMLSelectElement>("chat-provider");
-  const previous = preferred || select.value;
+  const previous = preferredProvider || select.value;
   select.replaceChildren();
-  const configured = providerCatalog.filter((item) => Boolean(item.configured));
+  const configured = activeProviders
+    .map((provider) =>
+      providerCatalog.find((item) => text(item.provider) === provider),
+    )
+    .filter((item): item is Payload => Boolean(item?.configured));
   for (const provider of configured) {
     const option = document.createElement("option");
     option.value = text(provider.provider);
@@ -801,7 +967,8 @@ async function populateChatProviders(preferred = ""): Promise<void> {
     ? previous
     : fallback;
   select.disabled = !configured.length;
-  await loadChatModels(select.value);
+  const selectedModel = select.value === previous ? preferredModel : "";
+  await loadChatModels(select.value, selectedModel);
 }
 
 async function loadChatModels(
@@ -860,10 +1027,10 @@ async function loadChatModels(
   }
 }
 
-async function saveThreadModelPreference(): Promise<void> {
-  const provider = value("chat-provider");
-  const model = value("chat-model");
-  if (!provider || !model) return;
+async function persistThreadModelPreference(
+  provider: string,
+  model: string,
+): Promise<void> {
   await api<Payload>(
     `/api/threads/${encodeURIComponent(currentThread)}/model-preference`,
     {
@@ -871,6 +1038,14 @@ async function saveThreadModelPreference(): Promise<void> {
       body: JSON.stringify({ provider, model }),
     },
   );
+  setProviderCatalogModel(provider, model);
+}
+
+async function saveThreadModelPreference(): Promise<void> {
+  const provider = value("chat-provider");
+  const model = value("chat-model");
+  if (!provider || !model) return;
+  await persistThreadModelPreference(provider, model);
   element("runtime-badge").textContent = `${provider}/${model}`;
   element("chat-model-status").textContent =
     `Выбрано ${provider}/${model}. Следующий запрос получит неизменяемый снимок этой модели.`;
@@ -924,11 +1099,22 @@ async function loadThreadModelPreference(threadId: string): Promise<void> {
   if (threadId !== currentThread) return;
   const provider = text(result.preference.provider);
   const model = text(result.preference.model);
-  await populateChatProviders(provider);
-  await loadChatModels(provider, model);
-  element<HTMLSelectElement>("chat-provider").value = provider;
-  element<HTMLSelectElement>("chat-model").value = model;
-  element("runtime-badge").textContent = `${provider}/${model}`;
+  const selectedProvider = activeProviders.includes(provider)
+    ? provider
+    : activeProviders[0];
+  const selectedModel =
+    selectedProvider === provider
+      ? model
+      : text(
+          providerCatalog.find(
+            (item) => text(item.provider) === selectedProvider,
+          )?.model,
+        );
+  await populateChatProviders(selectedProvider, selectedModel);
+  if (selectedProvider && selectedModel) {
+    await persistThreadModelPreference(selectedProvider, selectedModel);
+    element("runtime-badge").textContent = `${selectedProvider}/${selectedModel}`;
+  }
 }
 
 async function loadSettings(): Promise<void> {

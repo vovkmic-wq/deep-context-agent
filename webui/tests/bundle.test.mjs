@@ -20,6 +20,8 @@ for (const required of [
   "/api/context/index",
   "/api/tasks/",
   "/api/providers/priority",
+  "/api/providers/",
+  "data-provider-model",
   '"/api/providers"',
   "dca_enter_send",
   "dca_chat_execution",
@@ -32,6 +34,8 @@ for (const required of [
   "custom-provider-form",
   "context-meter",
   "expected_sha256",
+  "Log analysis",
+  "project-audit",
 ]) {
   if (!source.includes(required)) {
     throw new Error(`Production bundle is missing feature: ${required}`);
@@ -74,5 +78,20 @@ for (const legacyMode of [
 }
 if (!htmlSource.includes('id="context-meter"')) {
   throw new Error("Context usage meter is missing");
+}
+const cssSource = await readFile(css, "utf8");
+for (const requiredStyle of [
+  ".chat-panel.active",
+  ".workspace-shell",
+  "height:100dvh",
+  "main.chat-view",
+  ".chat-main",
+  "overflow:hidden",
+  ".conversation",
+  "overflow-y:auto",
+]) {
+  if (!cssSource.replaceAll(" ", "").includes(requiredStyle.replaceAll(" ", ""))) {
+    throw new Error(`Sticky chat layout is missing: ${requiredStyle}`);
+  }
 }
 console.log(`bundle_ok bytes=${total}`);

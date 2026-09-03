@@ -42,6 +42,7 @@ class AutopilotProgress:
     lease_generation: int = 0
     last_heartbeat_at: float | None = None
     active_unit_started_at: float | None = None
+    workflow: str = "project-audit"
 
     @property
     def terminal(self) -> bool:
@@ -66,6 +67,7 @@ class AutopilotProgress:
             "lease_generation": self.lease_generation,
             "last_heartbeat_at": self.last_heartbeat_at,
             "active_unit_started_at": self.active_unit_started_at,
+            "workflow": self.workflow,
             "terminal": self.terminal,
         }
 
@@ -254,6 +256,7 @@ class AutopilotStore:
         include_patterns: tuple[str, ...] = (),
         exclude_patterns: tuple[str, ...] = (),
         lease_seconds: int = 900,
+        workflow: str = "project-audit",
     ) -> tuple[AutopilotProgress, AutopilotLease]:
         """Create/resume a stable identity and claim an exclusive lease."""
 
@@ -263,6 +266,16 @@ class AutopilotStore:
             raise ValueError("Autopilot objective cannot be empty")
         if not 1 <= batch_size <= 25:
             raise ValueError("Autopilot batch size must be between 1 and 25")
+        if workflow not in {
+            "answer",
+            "log-analysis",
+            "targeted-review",
+            "targeted-change",
+            "project-audit",
+            "project-change",
+            "project-test",
+        }:
+            raise ValueError("Unsupported Autopilot workflow")
         mode = "allow-write" if allow_write else "read-only"
         resolved_workspace = workspace.resolve()
         job_id = self.job_id_for(
@@ -272,6 +285,7 @@ class AutopilotStore:
             allow_write=allow_write,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            workflow=workflow,
         )
         token = uuid4().hex
         now = time.time()
@@ -322,13 +336,14 @@ class AutopilotStore:
                     """
                     INSERT INTO autopilot_jobs(
                         id, thread_id, objective, objective_sha256, workspace, mode,
+                        workflow,
                         include_patterns, exclude_patterns,
                         status, phase, audit_run_id, batch_size, attempts, replans,
                         verification_status, verification_results, last_error_code,
                         last_error_message, report, control_requested,
                         lease_token, lease_until, lease_generation, last_heartbeat_at,
                         created_at, updated_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 'audit', NULL, ?, 0, 0,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, NULL, ?, 0, 0,
                               'not_run', '[]', NULL, NULL, '', NULL, ?, ?, ?, ?,
                               ?, ?, NULL)
                     ON CONFLICT(id) DO UPDATE SET
@@ -357,8 +372,10 @@ class AutopilotStore:
                         hashlib.sha256(objective.strip().encode("utf-8")).hexdigest(),
                         str(resolved_workspace),
                         mode,
+                        workflow,
                         json.dumps(include_patterns, ensure_ascii=False),
                         json.dumps(exclude_patterns, ensure_ascii=False),
+                        "audit" if workflow.startswith("project-") else "execute",
                         batch_size,
                         token,
                         lease_until,
@@ -383,21 +400,23 @@ class AutopilotStore:
         allow_write: bool,
         include_patterns: tuple[str, ...] = (),
         exclude_patterns: tuple[str, ...] = (),
+        workflow: str = "project-audit",
     ) -> str:
         """Return the stable identity shared by CLI, Web, and the store."""
 
         mode = "allow-write" if allow_write else "read-only"
-        identity = "\0".join(
-            (
-                "deep-context-autopilot-v1",
-                str(workspace.resolve()).casefold(),
-                thread_id.strip(),
-                objective.strip(),
-                mode,
-                json.dumps(include_patterns, ensure_ascii=False),
-                json.dumps(exclude_patterns, ensure_ascii=False),
-            )
-        )
+        identity_parts = [
+            "deep-context-autopilot-v1",
+            str(workspace.resolve()).casefold(),
+            thread_id.strip(),
+            objective.strip(),
+            mode,
+            json.dumps(include_patterns, ensure_ascii=False),
+            json.dumps(exclude_patterns, ensure_ascii=False),
+        ]
+        if workflow != "project-audit":
+            identity_parts.append(workflow)
+        identity = "\0".join(identity_parts)
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
     def renew_lease(
@@ -703,7 +722,8 @@ class AutopilotStore:
                 """
                 SELECT id, status, phase, mode, audit_run_id, batch_size,
                        attempts, replans, verification_status, last_error_code,
-                       control_requested, lease_generation, last_heartbeat_at
+                       control_requested, lease_generation, last_heartbeat_at,
+                       workflow
                 FROM autopilot_jobs WHERE id = ?
                 """,
                 (job_id,),
@@ -758,6 +778,7 @@ class AutopilotStore:
                 if active is not None and active["started_at"] is not None
                 else None
             ),
+            workflow=str(row["workflow"] or "project-audit"),
         )
 
     def details(self, job_id: str, *, unit_limit: int = 100) -> dict[str, object]:
@@ -803,7 +824,8 @@ class AutopilotStore:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT id, thread_id, objective_sha256, mode, status, phase,
+                SELECT id, thread_id, objective_sha256, mode, workflow,
+                       status, phase,
                        batch_size, attempts, replans, verification_status,
                        last_error_code, lease_generation, last_heartbeat_at,
                        created_at, updated_at, finished_at
@@ -899,6 +921,7 @@ class AutopilotStore:
                     objective_sha256 TEXT NOT NULL,
                     workspace TEXT NOT NULL,
                     mode TEXT NOT NULL,
+                    workflow TEXT NOT NULL DEFAULT 'project-audit',
                     include_patterns TEXT NOT NULL DEFAULT '[]',
                     exclude_patterns TEXT NOT NULL DEFAULT '[]',
                     status TEXT NOT NULL,
@@ -961,6 +984,7 @@ class AutopilotStore:
                 "control_requested": "TEXT",
                 "lease_generation": "INTEGER NOT NULL DEFAULT 0",
                 "last_heartbeat_at": "REAL",
+                "workflow": "TEXT NOT NULL DEFAULT 'project-audit'",
             }
             for name, declaration in migrations.items():
                 if name not in columns:

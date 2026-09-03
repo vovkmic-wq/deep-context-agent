@@ -1330,8 +1330,39 @@ def test_turn_mutation_policy_denies_write_even_when_model_requests_it(
         )
 
     assert not (app_config.workspace / "mode-denied.txt").exists()
-    assert [entry.status for entry in runtime.last_tool_audit] == ["denied"]
     assert "write_file /workspace/mode-denied.txt: denied" in answer
+
+
+def test_message_routing_scope_denies_project_discovery_tool(
+    tmp_path: Path,
+) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "glob",
+                        "args": {"pattern": "**/*", "path": "/workspace"},
+                        "id": "routing-denied-glob",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="The supplied log was analyzed without file access."),
+        ]
+    )
+    app_config = _app_config(tmp_path)
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.set_routing_scope(
+            workspace_reads_allowed=False,
+            project_scan_allowed=False,
+        )
+        answer = runtime.ask("Analyze only the supplied log.")
+
+    assert "The supplied log was analyzed" in answer
+    assert "glob /workspace: denied" in answer
+    assert [entry.status for entry in runtime.last_tool_audit] == ["denied"]
 
 
 def test_parallel_model_tool_calls_are_reduced_to_one_per_step(

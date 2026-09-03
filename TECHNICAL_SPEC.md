@@ -433,6 +433,10 @@
    per-thread preference. Доступные модели берутся из bounded provider catalog
    и compatibility manifest; embedding/image/audio/moderation/deprecated и
    неподтверждённые tool-incompatible модели не выдаются за chat-compatible.
+   Chat показывает только активную provider chain из раздела «Провайдеры».
+   Напротив каждого активного provider отображается его validated model select;
+   выбор в любом из двух разделов обновляет единое process-default состояние и
+   preference текущего thread без изменения уже выполняющегося turn.
 2. Provider/model/fallback фиксируются immutable task snapshot. Переключение
    при активном turn действует только на следующий turn или безопасную границу
    Autopilot work unit и сохраняется в terminal evidence.
@@ -807,6 +811,25 @@ Coding Plan пользователь явно задаёт
 68. Круговой Web indicator показывает эту оценку и обновляется при вводе.
     Deep Agents summarization сохраняет compact summary в active conversation,
     полная SQLite history остаётся доступной retrieval.
+69. Web chat использует структурированный `RoutingDecision`; execution,
+    workflow, scope, project scan и mutation intent являются независимыми
+    полями, а не одним результатом keyword matching.
+70. Маршрутизация выполняется только по прямой команде. Fenced code,
+    blockquote, tagged attachment/log/output, PowerShell transcript, traceback
+    и tool output исключаются из classifier input и остаются untrusted data.
+71. `auto` консервативно выбирает single-turn, кроме подтверждённых project
+    workflows. Explicit Autopilot сохраняет workflow и не превращает
+    log-analysis/targeted task в project audit.
+72. `allow_write` является capability, но не mutation intent. Запись возможна
+    только при trusted allow-write и прямой команде изменения вне data segment.
+73. Non-project persistent workflow использует durable `execute` unit,
+    lease/heartbeat/retry/terminal state без ProjectAuditStore manifest.
+    `workflow` хранится и мигрируется в `autopilot.sqlite3`.
+74. Message/attachment routing запрещает workspace tools, targeted routing —
+    project-wide discovery, а project scan разрешается только явным полем
+    `allow_project_scan` структурированного решения.
+75. API, SSE, UI и JSONL показывают safe workflow/execution/scope/confidence и
+    reason codes без текста запроса, лога, секрета или физического пути.
 
 ## 7.13. Persistent autopilot jobs (0.19.0)
 
@@ -883,6 +906,25 @@ Deep Agents built-in summarization остаётся включена. Круг �
 9. Детальные критерии заданы в
    `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md` и обязательны
    перед изменением release version или публикацией.
+
+## 7.18. Structured data-aware routing (0.23.0)
+
+1. Нормативная последовательность и acceptance заданы в
+   `DEEP_CONTEXT_AGENT_0_23_STRUCTURED_ROUTING_PROMPT.md`.
+2. Сервер сначала отделяет direct instruction от untrusted data, затем строит
+   immutable routing decision. Исходный query не сокращается для LLM и остаётся
+   доступен как данные после применения system policy.
+3. Persistence — характеристика времени и восстановления, project audit — один
+   из workflows. Non-project persistent turn не создаёт файловый manifest и не
+   перечисляет workspace.
+4. Автоматическое повышение после `agent_step_limit` или
+   `context_window_exceeded` сохраняет исходный workflow и scope; оно не
+   расширяет доступ к файлам или право записи.
+5. Старые функции broad-project detection являются compatibility wrappers над
+   новым маршрутизатором и не анализируют quoted/log payload отдельно.
+6. Production acceptance включает исходный PowerShell incident, adversarial
+   quoted commands, exact-file route, explicit overrides, SQLite migration,
+   API/SSE/UI observability и live Web turn.
 
 ## 8. Этапы
 

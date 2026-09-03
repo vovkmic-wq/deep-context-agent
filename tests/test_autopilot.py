@@ -230,6 +230,7 @@ def test_existing_database_is_migrated_without_recreation(tmp_path: Path) -> Non
     with sqlite3.connect(database) as connection:
         connection.execute("ALTER TABLE autopilot_jobs DROP COLUMN last_heartbeat_at")
         connection.execute("ALTER TABLE autopilot_jobs DROP COLUMN lease_generation")
+        connection.execute("ALTER TABLE autopilot_jobs DROP COLUMN workflow")
         connection.execute("ALTER TABLE autopilot_work_units DROP COLUMN deadline_at")
         connection.execute(
             "ALTER TABLE autopilot_work_units DROP COLUMN last_heartbeat_at"
@@ -250,7 +251,7 @@ def test_existing_database_is_migrated_without_recreation(tmp_path: Path) -> Non
             )
         }
 
-    assert {"lease_generation", "last_heartbeat_at"} <= job_columns
+    assert {"lease_generation", "last_heartbeat_at", "workflow"} <= job_columns
     assert {"lease_generation", "last_heartbeat_at", "deadline_at"} <= unit_columns
 
 
@@ -501,3 +502,41 @@ def test_allow_write_job_requires_current_verification_pass(
     assert details["status"] == "complete"
     assert details["verification_status"] == "passed"
     assert details["verification_results"][0]["check"] == "pytest"
+
+
+def test_persistent_log_analysis_does_not_create_project_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    model = SequenceChatModel(
+        responses=[AIMessage(content="The log shows a provider timeout.")]
+    )
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        runtime.set_routing_scope(
+            workspace_reads_allowed=False,
+            project_scan_allowed=False,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "run_project_audit",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("log workflow must not start project audit")
+            ),
+        )
+        result = runtime.run_autopilot_job(
+            "Analyze this log: provider timed out.",
+            thread_id="persistent-log",
+            workflow="log-analysis",
+        )
+
+    assert result.startswith("The log shows a provider timeout.")
+    with AutopilotStore(config.autopilot_database) as store:
+        jobs = store.list_jobs(workspace=config.workspace)
+        details = store.details(str(jobs[0]["id"]))
+    assert details["workflow"] == "log-analysis"
+    assert details["audit_run_id"] is None
+    assert details["phase"] == "complete"
+    assert details["work_units"][0]["phase"] == "execute"

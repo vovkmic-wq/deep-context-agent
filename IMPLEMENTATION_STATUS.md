@@ -1,5 +1,45 @@
 # Статус реализации
 
+## Structured data-aware routing 0.23.0 — 2026-09-03
+
+- Добавлен immutable RoutingDecision с независимыми execution/workflow/scope,
+  scan authority, mutation intent, confidence и safe reason codes.
+- Direct instruction отделяется от fenced, quoted, tagged и узнаваемого
+  terminal/traceback payload до классификации; полный query сохраняется для LLM
+  как untrusted data.
+- Non-project persistent workflow выполняется durable `execute` unit без
+  ProjectAuditStore manifest. Autopilot schema мигрирована полем `workflow`.
+- Web backend применяет scope к доступным tools, а write — только при прямом
+  mutation intent и trusted allow-write. API/SSE/UI/JSONL отражают решение.
+- Нормативный контракт: `DEEP_CONTEXT_AGENT_0_23_STRUCTURED_ROUTING_PROMPT.md`,
+  TECHNICAL_SPEC 7.18 и Web-ТЗ 13.17.
+
+Финальные evidence 0.23.0:
+
+- Ruff check/format, mypy и compileall — PASS; pytest — 298 passed,
+  1 planned Windows symlink skip; TypeScript production build и bundle test —
+  PASS; `pip check` — PASS.
+- Исходный PowerShell-log route стабилен в пяти повторах: `single-turn`,
+  `log-analysis`, `scope=message`, `allow_project_scan=false`,
+  `mutation_requested=false`. Tool-policy regression подтверждает отказ
+  project-wide `glob` для message scope.
+- Live Web task `65aa43be1f31468a89ea38a1010bf9ce` получил такое же routing decision,
+  завершился обычным ответом через failover `zhipu/glm-5.3` →
+  `openai/gpt-5.6-sol`; в `autopilot.sqlite3` и `project_audit.sqlite3`
+  осталось 0 jobs/runs, safe JSONL не содержит body журнала.
+- Отдельный live explicit-persistent task
+  `f5b7d95ea50d4ff7b2253d7a1da75ece` создал durable job
+  `d4319e8d877fc28560b66906` с `workflow=log-analysis`, `phase=execute`,
+  `audit_run_id=NULL` и 0 audit runs. Недоступный в момент проверки
+  `openai/gpt-5-nano` после четырёх bounded attempts перевёл job в безопасный
+  persisted `blocked`, не расширив scope и не запустив аудит.
+- Browser acceptance подтвердил версию 0.23.0, пять chat modes, model controls,
+  `position: sticky; top: 0px`, независимый `overflow-y: auto` истории и
+  отсутствие console errors.
+- Собраны sdist и wheel 0.23.0. Wheel установлен в чистый target, импортировал
+  `context_agent.routing`; размер 180633 bytes, SHA-256
+  `C184A9B5EC5C1DF498141F531DC055063FDC8C5F195ED3EAFD5B80565471930A`.
+
 Этот файл связывает этапы `IMPLEMENTATION_PROMPT.md` с требованиями
 `TECHNICAL_SPEC.md`.
 

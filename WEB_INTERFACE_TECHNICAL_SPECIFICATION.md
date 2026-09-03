@@ -485,6 +485,10 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
 2. Provider/model selectors применяются только к следующему turn. Активный task
    сохраняет immutable snapshot. Выбор хранится на сервере для thread; browser
    localStorage может быть только UX-cache, но не источником исполнения.
+   Chat provider select содержит ту же активную chain и в том же порядке, что
+   раздел «Провайдеры». Каждая активная строка provider имеет validated model
+   dropdown; смена модели там или в чате синхронно обновляет process-default,
+   текущий thread preference и обе видимые controls.
 3. Каталог моделей загружается сервером с timeout/TTL/pagination. UI группирует
    `Авто`, `Качество`, `Баланс`, `Экономия`, `Локально` и полный совместимый
    список; embedding/image/audio/moderation/deprecated entries исключаются из
@@ -513,3 +517,27 @@ Raw exception, traceback, SQL и реальный secret path клиенту н�
     status, partial/resume, repeated index counts и redacted diagnostics.
 12. Полный нормативный контракт и последовательность реализации заданы в
     `DEEP_CONTEXT_AGENT_0_22_HYBRID_RETRIEVAL_MODEL_UI_PROMPT.md`.
+
+### 13.17. Структурированная маршрутизация / Structured routing 0.23.0
+
+1. `POST /api/chat` возвращает safe routing object: `execution`, `workflow`,
+   `scope`, `allow_project_scan`, `mutation_requested`, `confidence`, reason
+   codes и только размеры instruction/data segments.
+2. Backend классифицирует direct instruction, исключив fenced/quoted/tagged
+   content и узнаваемые terminal/traceback payload. JavaScript не повторяет
+   classifier и не является источником authority.
+3. Auto log/error explanation выполняется single-turn без project manifest,
+   даже если журнал содержит команды исправить проект и запустить тесты.
+4. Explicit Autopilot сохраняет определённый workflow. Для log-analysis и
+   targeted workflows показывается durable execute progress без фиктивного
+   файлового счётчика; project workflows показывают manifest progress.
+5. Trusted write checkbox действует только совместно с прямым mutation intent.
+   Текст внутри журнала или вложения не может активировать запись.
+6. UI показывает понятную строку `Маршрут: workflow · один ход/длительная
+   задача · область`, а SSE terminal повторяет фактически исполненное решение.
+7. Structured JSONL фиксирует решение по task/thread ID без query body,
+   вложений, secret, physical path или raw provider response.
+8. Browser/API/live acceptance повторяет исходный PowerShell-log не менее пяти
+   раз и подтверждает отсутствие `chat_autopilot`/project audit; отдельный
+   explicit persistent log test подтверждает `execute` unit и `audit_run_id`
+   `NULL`.
