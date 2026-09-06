@@ -48,6 +48,30 @@ def _start(store: DiagnosticStore, query: str, *, request_id: str | None = None)
     )
 
 
+def test_running_model_attempt_recovers_without_fabricated_usage(tmp_path):
+    with _store(tmp_path) as store:
+        request_id = _start(store, "crash during model call")
+        store.record_model_attempt(
+            request_id,
+            {
+                "attempt_id": "a1",
+                "provider": "lmstudio",
+                "model": "model/name",
+                "status": "running",
+                "ordinal": 1,
+            },
+        )
+    with _store(tmp_path) as store:
+        assert store.recover_interrupted() == (1, 0)
+        attempt = store.model_attempts(request_id)[0]
+        assert attempt["status"] == "interrupted"
+        assert attempt["input_tokens"] is None
+        assert attempt["duration_ms"] is None
+        assert attempt["finished_at_utc"] is not None
+        assert attempt["model"] == "model/name"
+        assert store.recover_interrupted() == (0, 0)
+
+
 def test_redaction_covers_headers_assignments_provider_keys_and_known_values() -> None:
     provider_key = "sk-" + "proj-" + "abcdefghijklmnop"
     text = (
@@ -211,7 +235,7 @@ def test_storage_boundary_drops_raw_tool_results_and_physical_paths(
 def test_schema_v1_is_migrated_idempotently(tmp_path: Path) -> None:
     path = tmp_path / "diagnostics.sqlite3"
     with _store(tmp_path) as store:
-        assert store.schema_version == 2
+        assert store.schema_version == 3
     with sqlite3.connect(path) as connection:
         connection.execute("ALTER TABLE request_attempts DROP COLUMN query_preview")
         connection.execute("DROP TABLE provider_attempt_records")
@@ -248,7 +272,7 @@ def test_schema_v1_is_migrated_idempotently(tmp_path: Path) -> None:
             "SELECT provider, outcome FROM provider_attempt_records"
         ).fetchall()
 
-    assert version == 2
+    assert version == 3
     assert "query_preview" in columns
     assert provider_rows == [("zhipu", "active_success")]
 
@@ -312,6 +336,54 @@ def test_web_terminal_event_survives_store_restart(tmp_path: Path) -> None:
         "provider": "openai",
         "model": "gpt-test",
     }
+
+
+def test_parent_request_resolves_children_and_task_reference(tmp_path: Path) -> None:
+    with _store(tmp_path) as store:
+        parent = store.start_request(
+            query="persistent objective",
+            thread_id="parent-thread",
+            operation_kind="autopilot",
+            source="web",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            task_id="web-task-parent",
+            request_id="request-parent",
+        )
+        child = store.start_request(
+            query="bounded execution unit",
+            thread_id="parent-thread",
+            operation_kind="autopilot-unit",
+            source="web",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            task_id="autopilot-job",
+            request_id="request-child",
+            parent_request_id=parent,
+        )
+        assert parent and child
+        store.complete_request(
+            child,
+            provider_attempts=[],
+            tool_audit=[],
+            duration_ms=3,
+        )
+        store.finish_parent(parent, status="partial", duration_ms=5)
+
+        by_parent = store.resolve_request(parent)
+        by_task = store.resolve_request("web-task-parent")
+
+    assert by_parent["status"] == "partial"
+    children = by_parent["children"]
+    assert isinstance(children, list)
+    assert len(children) == 1
+    assert children[0]["request_id"] == "request-child"
+    assert children[0]["parent_request_id"] == "request-parent"
+    assert children[0]["task_id"] == "autopilot-job"
+    assert children[0]["status"] == "completed"
+    assert by_task["request_id"] == "request-parent"
 
 
 def test_crash_recovery_marks_in_progress_request_and_task(tmp_path: Path) -> None:

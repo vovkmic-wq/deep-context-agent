@@ -533,11 +533,32 @@ class ContextStore:
                 "fallback": "sqlite-fts5-bm25",
             }
         )
-        vector_available = bool(vector.get("enabled")) and not vector.get("last_error")
+        vector_enabled = bool(vector.get("enabled"))
+        vector_failed = bool(vector.get("last_error"))
+        vector_loaded = bool(vector.get("loaded"))
+        vector_available = vector_enabled and not vector_failed
+        vector_state = (
+            "disabled"
+            if not vector_enabled
+            else "degraded"
+            if vector_failed
+            else "ready"
+            if vector_loaded
+            else "lazy"
+        )
         return {
             "mode": "hybrid" if vector_available else "lexical-only",
+            "strategy": "rrf" if vector_available else "bm25",
             "lexical": "sqlite-fts5-bm25",
+            "lexical_ready": True,
+            "active_backends": (
+                ["sqlite-fts5-bm25", "fastembed-qdrant"]
+                if vector_available
+                else ["sqlite-fts5-bm25"]
+            ),
+            "vector_state": vector_state,
             "vector": vector,
+            "external_document_transfer": False,
         }
 
     def context_window(

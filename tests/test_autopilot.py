@@ -359,6 +359,180 @@ def test_runtime_autopilot_replans_step_limit_and_completes(
     assert len({unit["worker_thread_id"] for unit in details["work_units"]}) == 3
 
 
+def test_conversational_autopilot_soft_yields_and_keeps_runtime_receipts(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        autopilot_soft_model_calls_per_unit=2,
+        autopilot_max_work_units=4,
+    )
+    config.prepare_directories()
+    target = config.workspace / "pages.txt"
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "file_path": "/workspace/pages.txt",
+                            "offset": 0,
+                            "limit": 1,
+                        },
+                        "id": "page-one",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "file_path": "/workspace/pages.txt",
+                            "offset": 1,
+                            "limit": 1,
+                        },
+                        "id": "page-two",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Продолжение после безопасной передачи."),
+        ]
+    )
+    events: list[str] = []
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        response = runtime.run_autopilot_job(
+            "Прочитай нужные страницы проекта и продолжи задачу.",
+            thread_id="soft-yield",
+            workflow="project-change",
+            progress_callback=lambda _job, _audit, event: events.append(event),
+        )
+
+    assert "Продолжение после безопасной передачи" in response
+    assert "yielded" in events
+    with AutopilotStore(config.autopilot_database) as store:
+        job = store.list_jobs(workspace=config.workspace)[0]
+        details = store.details(str(job["id"]))
+    progress = details["progress"]
+    assert progress["yielded_units"] == 1
+    assert progress["file_reads"] == 2
+    assert progress["unique_lines_read"] == 2
+    ordered_units = sorted(details["work_units"], key=lambda unit: unit["sequence"])
+    assert [unit["status"] for unit in ordered_units] == [
+        "yielded",
+        "complete",
+    ]
+    assert len(details["tool_receipts"]) == 2
+
+
+def test_targeted_autopilot_soft_yields_do_not_consume_failure_retries(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        autopilot_soft_model_calls_per_unit=2,
+        autopilot_max_work_units=3,
+        autopilot_retry_attempts=1,
+    )
+    config.prepare_directories()
+    target = config.workspace / "target.txt"
+    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {
+                        "file_path": "/workspace/target.txt",
+                        "offset": offset,
+                        "limit": 1,
+                    },
+                    "id": f"target-page-{offset}",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        for offset in range(4)
+    ]
+    responses.append(AIMessage(content="Targeted work completed."))
+
+    with AgentRuntime(
+        config, _provider(), model=SequenceChatModel(responses=responses)
+    ) as runtime:
+        response = runtime.run_autopilot_job(
+            "Прочитай точные страницы /workspace/target.txt.",
+            thread_id="targeted-soft-yield",
+            workflow="targeted-change",
+        )
+
+    assert "Targeted work completed" in response
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    progress = details["progress"]
+    assert progress["status"] == "complete"
+    assert progress["yielded_units"] == 2
+    assert progress["failed_units"] == 0
+
+
+def test_conversational_work_unit_ceiling_blocks_instead_of_asserting(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        autopilot_soft_model_calls_per_unit=2,
+        autopilot_max_work_units=2,
+    )
+    config.prepare_directories()
+    (config.workspace / "limit.txt").write_text(
+        "one\ntwo\nthree\nfour\n", encoding="utf-8"
+    )
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {
+                        "file_path": "/workspace/limit.txt",
+                        "offset": offset,
+                        "limit": 1,
+                    },
+                    "id": f"limit-page-{offset}",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        for offset in range(4)
+    ]
+
+    with AgentRuntime(
+        config, _provider(), model=SequenceChatModel(responses=responses)
+    ) as runtime:
+        response = runtime.run_autopilot_job(
+            "Прочитай страницы /workspace/limit.txt.",
+            thread_id="work-unit-ceiling",
+            workflow="targeted-change",
+        )
+
+    assert "work_unit_limit_exhausted" in response
+    with AutopilotStore(config.autopilot_database) as store:
+        progress = store.progress(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert progress.status == "blocked"
+    assert progress.yielded_units == 2
+
+
 def test_runtime_emits_heartbeat_during_model_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

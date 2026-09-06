@@ -110,6 +110,9 @@ th { color: var(--muted); font-size: .82rem; }
 .chat-header { position: sticky; top: 0; z-index: 8; display: flex; gap: 1rem; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding: 1rem 1.25rem; background: #111419f2; backdrop-filter: blur(12px); }
 .chat-header h2 { margin-bottom: 0; }
 .chat-header small { color: var(--muted); }
+.chat-identity { display: grid; align-content: start; min-width: 12rem; }
+.memory-badge { display: inline-flex; width: fit-content; margin-top: .45rem; border: 1px solid #4d5a2a; border-radius: 999px; padding: .2rem .55rem; color: var(--accent); background: var(--accent-soft); font-size: .72rem; font-weight: 750; }
+.memory-badge.degraded { border-color: #755428; color: var(--warning); background: #302514; }
 .chat-controls { display: flex; flex-wrap: wrap; gap: .65rem; align-items: end; justify-content: end; }
 .chat-header { grid-row: 1; }
 .mode-help { display: block; padding: .45rem 1.25rem; color: var(--muted); border-bottom: 1px solid var(--border); }
@@ -158,6 +161,10 @@ th { color: var(--muted); font-size: .82rem; }
 .custom-provider { margin-bottom: 1rem; }
 .custom-provider summary { cursor: pointer; color: var(--accent); font-weight: 800; }
 .custom-provider[open] summary { margin-bottom: 1rem; }
+.adaptive-routing { margin-bottom: 1rem; }
+.adaptive-routing summary { cursor: pointer; color: var(--accent); font-weight: 800; }
+.adaptive-routing[open] summary { margin-bottom: 1rem; }
+.adaptive-routing textarea { min-height: 14rem; font: 12px/1.45 "Cascadia Code", "SFMono-Regular", Consolas, monospace; }
 .provider-list { display: grid; gap: .6rem; margin-bottom: 1rem; }
 .provider-row { display: grid; grid-template-columns: 42px minmax(120px, .7fr) minmax(190px, 1.1fr) minmax(170px, 1fr) auto; gap: .75rem; align-items: center; border: 1px solid var(--border); border-radius: .7rem; padding: .75rem; background: var(--surface); }
 .provider-priority { display: grid; width: 2rem; height: 2rem; place-items: center; border-radius: 50%; color: #111506; background: var(--accent); font-weight: 900; }

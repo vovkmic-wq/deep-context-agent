@@ -18,7 +18,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -54,14 +54,25 @@ from context_agent.errors import (
     ContextStoreError,
     PathSecurityError,
 )
+from context_agent.model_catalog import (
+    ModelCatalog,
+    enrich_release_dates,
+    recent_models,
+)
+from context_agent.model_routing import ModelProfile, parse_profiles
 from context_agent.paths import resolve_inside
 from context_agent.project_audit import AuditProgress, ProjectAuditStore
 from context_agent.providers import create_chat_model
-from context_agent.routing import RoutingDecision, route_chat_request
+from context_agent.routing import RoutingDecision
 from context_agent.runtime import AgentRuntime, message_text
+from context_agent.semantic_routing import semantic_classifier
 from context_agent.structured_logging import (
     close_structured_logger,
     configure_structured_logger,
+)
+from context_agent.task_state import (
+    TaskConflict,
+    TaskStateStore,
 )
 from context_agent.vector_index import FastEmbedQdrantIndex
 
@@ -173,6 +184,13 @@ class ChatRequest(BaseModel):
     execution_mode: ChatExecutionMode = "auto"
     provider: str | None = Field(default=None, min_length=1, max_length=100)
     model: str | None = Field(default=None, min_length=1, max_length=200)
+    model_policy: Literal["auto", "manual"] | None = None
+    continuation_task_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+
+
+class TaskStateControlRequest(BaseModel):
+    status: Literal["completed", "cancelled"]
+    revision: int = Field(ge=1)
 
 
 class AuditRequest(BaseModel):
@@ -241,6 +259,22 @@ class SettingsRequest(BaseModel):
     values: dict[str, int | float] = Field(default_factory=dict)
 
 
+class AdaptiveRoutingRequest(BaseModel):
+    """Safe process-wide model routing policy persisted without credentials."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    profiles: list[ModelProfile] = Field(default_factory=list, max_length=30)
+    cost_limit_usd: float = Field(default=0, ge=0, le=1_000)
+    latency_budget_ms: int = Field(default=0, ge=0, le=600_000)
+    local_only: bool = False
+    execution_escalation_enabled: bool = True
+    manual_execution_escalation: bool = False
+    failure_threshold: int = Field(default=2, ge=1, le=10)
+    max_escalations: int = Field(default=2, ge=0, le=10)
+
+
 class DiagnosticPurgeRequest(BaseModel):
     confirm: Literal["PURGE"]
     request_id: str | None = Field(default=None, min_length=1, max_length=100)
@@ -273,6 +307,22 @@ class _Task:
 
 
 _AGENT_FAILURE_MESSAGES = {
+    "model_route_unavailable": (
+        "Нет подходящей модели для этой задачи. Проверьте профили fast/standard/"
+        "reasoning, доступность, окно контекста и ограничения стоимости/локальности."
+    ),
+    "task_cancelled": "Отменено локально; остановка inference не подтверждена.",
+    "task_deadline": "Достигнут бюджет времени задачи. Состояние сохранено.",
+    "task_authority_lost": "Разрешение выполнения задачи изменено. Worker остановлен.",
+    "model_attempt_budget": "Достигнут бюджет вызовов модели. Состояние сохранено.",
+    "soft_yield": "Этап безопасно передан следующей единице; прогресс сохранён.",
+    "runtime_ledger_unavailable": (
+        "Не удалось сохранить обязательный журнал прогресса. "
+        "Новые действия остановлены."
+    ),
+    "no_verified_progress": "Нет нового подтверждённого прогресса. Задача остановлена.",
+    "generation_truncated": "Ответ модели обрезан. Неполные действия не выполнены.",
+    "generation_repetition": "Обнаружен повтор текста. Требуется пересмотр шага.",
     "context_window_exceeded": (
         "Активное окно модели переполнено. Старые результаты инструментов будут "
         "автоматически компактированы; повторите запрос."
@@ -392,7 +442,7 @@ class TaskRegistry:
 
         def emit(event: str, data: Mapping[str, object]) -> None:
             safe_data = dict(data)
-            if event in {"completed", "cancelled", "failed"}:
+            if event in {"completed", "partial", "blocked", "cancelled", "failed"}:
                 safe_data.setdefault("task_id", task.task_id)
                 safe_data.setdefault("request_id", task.request_id or task.task_id)
                 safe_data.setdefault("retryable", False)
@@ -401,9 +451,47 @@ class TaskRegistry:
                     round((time.monotonic() - submitted_at) * 1_000),
                 )
             record: dict[str, object] = {"event": event, "data": safe_data}
-            if event in {"completed", "cancelled", "failed"}:
+            if event in {"completed", "partial", "blocked", "cancelled", "failed"}:
                 task.terminal_event = record
                 self._diagnostic_store.record_task_terminal(task.task_id, record)
+                duration_value = safe_data.get("duration_ms", 0)
+                duration_ms = (
+                    int(duration_value)
+                    if isinstance(duration_value, (int, float))
+                    else 0
+                )
+                self._diagnostic_store.finish_parent(
+                    task.request_id,
+                    status=event,
+                    duration_ms=duration_ms,
+                    error_code=(
+                        str(safe_data["error_type"])
+                        if safe_data.get("error_type")
+                        else None
+                    ),
+                )
+                self._logger.info(
+                    "Web task terminal",
+                    extra={
+                        "event_code": f"task_{event}",
+                        "safe_fields": {
+                            "task_id": task.task_id,
+                            **{
+                                key: safe_data[key]
+                                for key in (
+                                    "provider",
+                                    "model",
+                                    "duration_ms",
+                                    "found_files",
+                                    "files_scanned",
+                                    "partial",
+                                    "error_type",
+                                )
+                                if key in safe_data
+                            },
+                        },
+                    },
+                )
             task.events.put(record)
 
         def runner() -> None:
@@ -447,7 +535,17 @@ class TaskRegistry:
                     terminal["cursor_available"] = bool(result.get("next_cursor"))
                     if result.get("partial_reason"):
                         terminal["partial_reason"] = str(result["partial_reason"])
-                emit("completed", terminal)
+                outcome = (
+                    result.get("task_status") if isinstance(result, Mapping) else None
+                )
+                terminal_event = (
+                    outcome
+                    if outcome in {"partial", "blocked", "cancelled"}
+                    else "completed"
+                )
+                if terminal_event == "partial":
+                    terminal["partial"] = True
+                emit(terminal_event, terminal)
             except _TaskCancelledError:
                 emit("cancelled", {"task_id": task.task_id})
             except _PublicTaskError as exc:
@@ -475,7 +573,20 @@ class TaskRegistry:
                     },
                 )
                 emit(
-                    "failed",
+                    "cancelled"
+                    if error_code == "task_cancelled"
+                    else "blocked"
+                    if error_code
+                    in {
+                        "task_deadline",
+                        "task_authority_lost",
+                        "model_attempt_budget",
+                        "model_route_unavailable",
+                        "no_verified_progress",
+                        "generation_truncated",
+                        "generation_repetition",
+                    }
+                    else "failed",
                     {
                         "task_id": task.task_id,
                         "request_id": task.request_id or task.task_id,
@@ -496,6 +607,34 @@ class TaskRegistry:
                         },
                     },
                 )
+                # The accepted parent request must retain the real, redacted
+                # exception even if its graph transaction was rolled back. SSE
+                # deliberately exposes only the stable public message below.
+                try:
+                    self._diagnostic_store.fail_request(
+                        task.request_id,
+                        exc=exc,
+                        provider_attempts=[],
+                        tool_audit=[],
+                        duration_ms=round((time.monotonic() - submitted_at) * 1_000),
+                        rollback_attempted=False,
+                        rollback_success=False,
+                        rollback_checkpoint_rows=0,
+                        rollback_write_rows=0,
+                        filesystem_side_effects=False,
+                        error_code="background_task_failed",
+                    )
+                except Exception as journal_exc:
+                    self._logger.error(
+                        "Cannot persist background failure diagnostics",
+                        extra={
+                            "event_code": "diagnostic_write_failed",
+                            "safe_fields": {
+                                "task_id": task.task_id,
+                                "exception_type": type(journal_exc).__name__,
+                            },
+                        },
+                    )
                 emit(
                     "failed",
                     {
@@ -567,6 +706,8 @@ class ProviderRegistry:
         }
         self._lock = threading.RLock()
         self._model_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+        self._model_dates: dict[str, dict[str, dict[str, str | None]]] = {}
+        self._display_models: dict[str, tuple[str, ...]] = {}
 
     def snapshot(self) -> tuple[ProviderConfig, ...]:
         """Return one immutable provider-chain snapshot for an operation."""
@@ -657,7 +798,11 @@ class ProviderRegistry:
                     raise ConfigurationError(
                         "Model is not present in the validated provider catalog"
                     )
-            selected = replace(selected, model=requested_model)
+            effort = selected.reasoning_effort
+            if requested_model != selected.model and selected.name == "openai":
+                # Do not carry GPT-5.6's tools-specific `none` into Pro models.
+                effort = "none" if requested_model.startswith("gpt-5.6") else None
+            selected = replace(selected, model=requested_model, reasoning_effort=effort)
         return (selected, *(item for item in active if item.name != selected.name))
 
     def models(
@@ -668,7 +813,9 @@ class ProviderRegistry:
     ) -> tuple[str, ...]:
         """Return a bounded cached model catalog for one configured provider."""
 
-        canonical = "zhipu" if provider_name.casefold() == "glm" else provider_name
+        canonical = (
+            "zhipu" if provider_name.casefold() == "glm" else provider_name.casefold()
+        )
         now = time.monotonic()
         with self._lock:
             cached = self._model_cache.get(canonical)
@@ -686,10 +833,26 @@ class ProviderRegistry:
         models = tuple(
             model for model in discovered if _is_chat_model_candidate(provider, model)
         )
-        models = tuple(dict.fromkeys((provider.model, *known_models, *models)))[:100]
+        display_models = tuple(dict.fromkeys(models))
+        models = tuple(dict.fromkeys((provider.model, *known_models, *models)))[:2000]
         with self._lock:
             self._model_cache[canonical] = (now + 60.0, models)
+            self._display_models[canonical] = display_models
+            self._model_dates[canonical] = enrich_release_dates(
+                canonical,
+                models,
+                getattr(discovered, "dates", {}),
+            )
         return models
+
+    def recent_model_choices(self, name: str) -> list[dict[str, str | None]]:
+        """One five-choice list shared by chat and provider checks."""
+        canonical = "zhipu" if name.casefold() == "glm" else name.casefold()
+        models = self.models(canonical)
+        with self._lock:
+            dates = self._model_dates.get(canonical, {})
+            displayed = self._display_models.get(canonical, models)
+        return recent_models(displayed, dates)
 
     def update(self, provider: ProviderConfig) -> None:
         """Replace one provider config in the catalog and active chain."""
@@ -906,10 +1069,16 @@ def _probe_openai_models(provider: ProviderConfig) -> tuple[str, ...]:
     try:
         payload = json.loads(raw.decode("utf-8"))
         rows = payload.get("data", []) if isinstance(payload, dict) else []
-        models = tuple(
-            str(row["id"])
-            for row in rows[:100]
-            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        if not isinstance(rows, list) or len(rows) > 2000:
+            raise ValueError("Invalid or excessive model catalog")
+        models = ModelCatalog(
+            [
+                row
+                for row in rows
+                if isinstance(row, dict)
+                and isinstance(row.get("id"), str)
+                and 0 < len(row["id"].strip()) <= 200
+            ]
         )
     except (UnicodeError, ValueError, TypeError, KeyError) as exc:
         raise _PublicTaskError(
@@ -991,6 +1160,105 @@ def _hybrid_context_store(config: AppConfig) -> ContextStore:
     )
 
 
+def _routing_settings_from_config(config: AppConfig) -> AdaptiveRoutingRequest:
+    profiles = list(parse_profiles(config.model_profiles))
+    return AdaptiveRoutingRequest(
+        enabled=bool(profiles),
+        profiles=profiles,
+        cost_limit_usd=config.model_cost_limit_usd,
+        latency_budget_ms=config.model_latency_budget_ms,
+        local_only=config.model_local_only,
+        execution_escalation_enabled=config.execution_escalation_enabled,
+        manual_execution_escalation=config.manual_execution_escalation,
+        failure_threshold=config.execution_escalation_failure_threshold,
+        max_escalations=config.execution_escalation_max_events,
+    )
+
+
+def _apply_routing_settings(
+    config: AppConfig,
+    settings: AdaptiveRoutingRequest,
+) -> AppConfig:
+    profiles = (
+        json.dumps(
+            [profile.model_dump(mode="json") for profile in settings.profiles],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if settings.enabled and settings.profiles
+        else ""
+    )
+    return replace(
+        config,
+        model_profiles=profiles,
+        model_cost_limit_usd=settings.cost_limit_usd,
+        model_latency_budget_ms=settings.latency_budget_ms,
+        model_local_only=settings.local_only,
+        execution_escalation_enabled=settings.execution_escalation_enabled,
+        manual_execution_escalation=settings.manual_execution_escalation,
+        execution_escalation_failure_threshold=settings.failure_threshold,
+        execution_escalation_max_events=settings.max_escalations,
+    )
+
+
+def _load_routing_settings(
+    path: Path,
+    fallback: AdaptiveRoutingRequest,
+) -> tuple[AdaptiveRoutingRequest, str | None]:
+    if not path.is_file():
+        return fallback, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return AdaptiveRoutingRequest.model_validate(raw), None
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return (
+            fallback,
+            "Сохранённая политика повреждена; применена конфигурация среды.",
+        )
+
+
+def _persist_routing_settings(
+    path: Path,
+    settings: AdaptiveRoutingRequest,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps(
+        settings.model_dump(mode="json"),
+        ensure_ascii=False,
+        indent=2,
+    )
+    temporary.write_text(payload + "\n", encoding="utf-8", newline="\n")
+    os.replace(temporary, path)
+
+
+def _initial_retrieval_status(config: AppConfig) -> dict[str, object]:
+    enabled = config.embedding_enabled and config.retrieval_mode == "hybrid"
+    return {
+        "mode": "hybrid" if enabled else "lexical-only",
+        "strategy": "rrf" if enabled else "bm25",
+        "lexical": "sqlite-fts5-bm25",
+        "lexical_ready": True,
+        "active_backends": (
+            ["sqlite-fts5-bm25", "fastembed-qdrant"]
+            if enabled
+            else ["sqlite-fts5-bm25"]
+        ),
+        "vector_state": "lazy" if enabled else "disabled",
+        "vector": {
+            "enabled": enabled,
+            "loaded": False,
+            "backend": "qdrant-local",
+            "embedding_provider": "fastembed-onnx-cpu",
+            "model": config.embedding_model,
+            "fallback": "sqlite-fts5-bm25",
+            "last_error": None,
+        },
+        "external_document_transfer": False,
+        "observed_at": time.time(),
+    }
+
+
 def create_app(
     config: AppConfig,
     providers: tuple[ProviderConfig, ...],
@@ -1008,6 +1276,27 @@ def create_app(
         raise ValueError("Remote web mode requires a trusted HTTPS reverse proxy")
     if not _STATIC_ROOT.joinpath("index.html").is_file():
         raise RuntimeError("Web static bundle is missing")
+
+    routing_path = config.data_dir / "model-routing.json"
+    routing_settings, routing_load_warning = _load_routing_settings(
+        routing_path,
+        _routing_settings_from_config(config),
+    )
+    config = _apply_routing_settings(config, routing_settings)
+    memory_lock = threading.RLock()
+    memory_status = _initial_retrieval_status(config)
+
+    def remember_retrieval(status: Mapping[str, object]) -> None:
+        nonlocal memory_status
+        safe = dict(status)
+        safe["external_document_transfer"] = False
+        safe["observed_at"] = time.time()
+        with memory_lock:
+            memory_status = safe
+
+    def retrieval_snapshot() -> dict[str, object]:
+        with memory_lock:
+            return dict(memory_status)
 
     diagnostics = DiagnosticStore(
         config.diagnostics_database,
@@ -1082,6 +1371,7 @@ def create_app(
     app.state.config = config
     app.state.providers = provider_registry
     app.state.diagnostics = diagnostics
+    app.state.routing_settings_path = routing_path
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next: Callable[..., Any]):
@@ -1208,6 +1498,7 @@ def create_app(
     @app.get("/api/runtime")
     def runtime_info(request: Request) -> dict[str, object]:
         current_providers = provider_registry.snapshot()
+        retrieval = retrieval_snapshot()
         return _request_payload(
             request,
             version=__version__,
@@ -1220,19 +1511,15 @@ def create_app(
             audit_mode_default="read-only",
             work_modes=list(_WORK_MODES),
             failure_log_mode=config.failure_log_mode,
-            retrieval={
+            retrieval=retrieval,
+            adaptive_routing={
+                "enabled": routing_settings.enabled,
+                "configured_profiles": len(routing_settings.profiles),
                 "mode": (
-                    "hybrid"
-                    if config.embedding_enabled and config.retrieval_mode == "hybrid"
-                    else "lexical-only"
+                    "adaptive"
+                    if routing_settings.enabled and routing_settings.profiles
+                    else "configured-chain"
                 ),
-                "lexical": "SQLite FTS5/BM25",
-                "vector": "FastEmbed/ONNX CPU + Qdrant local",
-                "embedding_provider": config.embedding_provider,
-                "embedding_device": config.embedding_device,
-                "embedding_model": config.embedding_model,
-                "fallback": "SQLite FTS5/BM25",
-                "external_document_transfer": False,
             },
         )
 
@@ -1313,6 +1600,36 @@ def create_app(
             effective_next_turn=True,
         )
 
+    @app.get("/api/threads/{thread_id}/active-tasks")
+    def active_objectives(request: Request, thread_id: str):
+        with TaskStateStore(config.context_database) as state:
+            items = [task.public() for task in state.list(thread_id, config.workspace)]
+        return _request_payload(request, items=items)
+
+    @app.patch("/api/threads/{thread_id}/active-tasks/{objective_id}")
+    def close_objective(
+        request: Request,
+        thread_id: str,
+        objective_id: str,
+        body: TaskStateControlRequest,
+    ):
+        try:
+            with TaskStateStore(config.context_database) as state:
+                owner = state.close_task(
+                    objective_id,
+                    thread_id,
+                    config.workspace,
+                    body.revision,
+                    body.status,
+                )
+        except TaskConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if owner and body.status == "cancelled":
+            # An old process's owner is already fenced in SQLite.
+            with suppress(KeyError):
+                tasks.cancel(owner)
+        return _request_payload(request, status=body.status)
+
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
         if body.mode == "multitask" and tasks.active_count() >= 4:
@@ -1325,7 +1642,16 @@ def create_app(
             saved_preference = store.thread_model_preference(body.thread_id)
         preferred_provider = body.provider
         preferred_model = body.model
+        manual_model = body.model_policy == "manual" or (
+            body.model_policy is None
+            and (body.provider is not None or body.model is not None)
+        )
+        if body.model_policy == "auto":
+            preferred_provider = None
+            preferred_model = None
+            saved_preference = None
         if preferred_provider is None and saved_preference is not None:
+            manual_model = True
             preferred_provider = saved_preference["provider"]
             if preferred_model is None:
                 preferred_model = saved_preference["model"]
@@ -1336,7 +1662,7 @@ def create_app(
             )
         except ConfigurationError as exc:
             raise HTTPException(422, str(exc)) from exc
-        if body.provider is not None or body.model is not None:
+        if manual_model and (body.provider is not None or body.model is not None):
             provider_registry.update(task_providers[0])
             with ContextStore(config.context_database) as store:
                 store.set_thread_model_preference(
@@ -1344,15 +1670,35 @@ def create_app(
                     task_providers[0].name,
                     task_providers[0].model,
                 )
-        routing = route_chat_request(
-            body.query,
-            work_mode=body.mode,
-            requested_execution=body.execution_mode,
+        task_thread = (
+            f"{body.thread_id}:multitask:{task_id}"
+            if body.mode == "multitask"
+            else body.thread_id
         )
+        try:
+            with TaskStateStore(config.context_database) as state:
+                saved_task, routing = state.prepare_turn(
+                    query=body.query,
+                    thread=task_thread,
+                    workspace=config.workspace,
+                    mode=body.mode,
+                    execution=body.execution_mode,
+                    allow_write=body.allow_write,
+                    owner=task_id,
+                    lease_seconds=config.task_timeout_seconds + 60,
+                    task_id=body.continuation_task_id,
+                    known_secrets=tuple(p.api_key for p in task_providers),
+                    semantic=semantic_classifier(
+                        config, task_providers, thread=task_thread
+                    ),
+                )
+        except TaskConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         effective_allow_write = (
             body.allow_write
             and routing.mutation_requested
             and body.mode not in {"ask", "plan"}
+            and (saved_task is None or saved_task.allow_write)
         )
         execution_thread_id = (
             f"{body.thread_id}:multitask:{task_id}"
@@ -1390,7 +1736,23 @@ def create_app(
                     raise _TaskCancelledError
                 mode_instruction = _WORK_MODES[body.mode]
                 query = f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}"
+                task_controls = getattr(runtime, "set_turn_controls", None)
+                if callable(task_controls):
+                    task_controls(
+                        cancelled=cancelled,
+                        task=saved_task,
+                    )
+                resource_policy = getattr(runtime, "set_resource_request", None)
+                instruction_policy = getattr(runtime, "set_user_instruction", None)
+                if callable(instruction_policy):
+                    instruction_policy(body.query)
+                if callable(resource_policy):
+                    resource_policy(
+                        saved_task.objective if saved_task else body.query,
+                        manual=manual_model,
+                    )
                 active_job_id = ""
+                active_job_status = "unknown"
                 resolved_routing = routing
                 routing_policy = getattr(runtime, "set_routing_scope", None)
                 if callable(routing_policy):
@@ -1407,11 +1769,17 @@ def create_app(
                     audit: AuditProgress | None,
                     event: str,
                 ) -> None:
-                    nonlocal active_job_id
+                    nonlocal active_job_id, active_job_status
                     active_job_id = progress.job_id
+                    active_job_status = progress.status
                     payload: dict[str, object] = progress.as_dict()
                     if audit is not None:
                         payload["audit"] = audit.as_dict()
+                    if saved_task is not None:
+                        with TaskStateStore(config.context_database) as state:
+                            checkpoint = state.checkpoint(saved_task)
+                        payload["active_task_id"] = saved_task.id
+                        payload["next_step"] = checkpoint.get("next_step", "")
                     event_name = {
                         "replanned": "job_replanned",
                         "verification": "job_verification",
@@ -1444,7 +1812,12 @@ def create_app(
                         },
                     )
                     job_answer = runtime.run_autopilot_job(
-                        query,
+                        (
+                            f"Режим работы: {body.mode}. {mode_instruction}\n\n"
+                            f"{saved_task.objective}"
+                            if saved_task is not None
+                            else query
+                        ),
                         thread_id=execution_thread_id,
                         allow_write=effective_allow_write,
                         progress_callback=chat_job_progress,
@@ -1507,7 +1880,7 @@ def create_app(
                                 auto_context=body.auto_context,
                                 diagnostic_source="web",
                                 diagnostic_task_id=task_id,
-                                diagnostic_request_id=task_id,
+                                parent_request_id=task_id,
                             )
                         finally:
                             if callable(mutation_policy):
@@ -1544,6 +1917,17 @@ def create_app(
                             resolved_routing,
                         )
                 metadata = runtime._provider_failover_middleware.runtime_metadata()
+                outcome = "partial" if saved_task is not None else "completed"
+                if active_job_id:
+                    outcome = {
+                        "complete": "completed",
+                        "blocked": "blocked",
+                        "cancelled": "cancelled",
+                    }.get(active_job_status, "partial")
+                if saved_task is not None and outcome == "completed":
+                    outcome = (
+                        "partial"  # Operator, not worker completion, closes a task.
+                    )
                 emit(
                     "message",
                     {
@@ -1568,8 +1952,45 @@ def create_app(
                     "routing": resolved_routing.as_dict(),
                     "requested_provider": task_providers[0].name,
                     "requested_model": task_providers[0].model,
+                    "task_status": outcome,
+                    "active_task_id": saved_task.id if saved_task else None,
                 }
 
+        def tracked_operation(emit, cancelled):
+            outcome = "blocked"
+            evidence = "turn_failed; inspect diagnostics"
+            try:
+                result = operation(emit, cancelled)
+                outcome = str(result.get("task_status", "partial"))
+                evidence = f"request:{task_id}; outcome:{outcome}"
+                return result
+            finally:
+                if saved_task is not None:
+                    with TaskStateStore(config.context_database) as state:
+                        state.finish(
+                            saved_task,
+                            "cancelled" if cancelled.is_set() else outcome,
+                            evidence,
+                        )
+
+        parent_request_id = diagnostics.start_request(
+            query=body.query,
+            thread_id=body.thread_id,
+            operation_kind="web_chat_parent",
+            source="web",
+            app_version=__version__,
+            provider_priority=[
+                {
+                    "provider": item.name,
+                    "model": item.model,
+                    "base_url": item.base_url,
+                }
+                for item in task_providers
+            ],
+            baseline_checkpoint_id=None,
+            task_id=task_id,
+            request_id=task_id,
+        )
         tasks.submit(
             (
                 f"chat_multitask_{'autopilot' if use_autopilot else 'turn'}"
@@ -1578,9 +1999,9 @@ def create_app(
                 if use_autopilot
                 else "chat"
             ),
-            operation,
+            tracked_operation,
             task_id=task_id,
-            request_id=task_id,
+            request_id=parent_request_id,
         )
         return _request_payload(
             request,
@@ -1590,6 +2011,7 @@ def create_app(
             requested_provider=task_providers[0].name,
             requested_model=task_providers[0].model,
             routing=routing.as_dict(),
+            active_task=saved_task.public() if saved_task is not None else None,
         )
 
     @app.post("/api/chat/{task_id}/cancel")
@@ -1598,6 +2020,8 @@ def create_app(
             tasks.cancel(task_id)
         except KeyError as exc:
             raise HTTPException(404, "Task not found") from exc
+        with TaskStateStore(config.context_database) as store:
+            store.cancel_owner(task_id)
         return _request_payload(request, task_id=task_id, status="cancelling")
 
     @app.get("/api/events/{task_id}")
@@ -1634,7 +2058,13 @@ def create_app(
                 event_name = str(event["event"])
                 data = json.dumps(event["data"], ensure_ascii=False)
                 yield f"event: {event_name}\ndata: {data}\n\n"
-                if event_name in {"completed", "cancelled", "failed"}:
+                if event_name in {
+                    "completed",
+                    "partial",
+                    "blocked",
+                    "cancelled",
+                    "failed",
+                }:
                     break
 
         return StreamingResponse(stream(), media_type="text/event-stream")
@@ -1686,7 +2116,7 @@ def create_app(
         if include_query and allow_remote:
             raise HTTPException(403, "Query disclosure is disabled in remote mode")
         try:
-            item = diagnostics.request(request_id, include_query=include_query)
+            item = diagnostics.resolve_request(request_id, include_query=include_query)
         except KeyError as exc:
             raise HTTPException(404, "Diagnostic request not found") from exc
         return _request_payload(request, item=item)
@@ -1700,7 +2130,7 @@ def create_app(
         if include_query and allow_remote:
             raise HTTPException(403, "Query disclosure is disabled in remote mode")
         try:
-            item = diagnostics.request(request_id, include_query=include_query)
+            item = diagnostics.resolve_request(request_id, include_query=include_query)
         except KeyError as exc:
             raise HTTPException(404, "Diagnostic request not found") from exc
         return _request_payload(request, format="diagnostic-v1", item=item)
@@ -1745,6 +2175,8 @@ def create_app(
                         "context_index_failed",
                         "Не удалось индексировать выбранный путь внутри /workspace.",
                     ) from exc
+                finally:
+                    remember_retrieval(store.retrieval_status())
             emit(
                 "scan_progress",
                 {
@@ -1813,6 +2245,7 @@ def create_app(
         with _hybrid_context_store(config) as store:
             hits = store.search(query, limit=limit, source=source)
             retrieval = store.retrieval_status()
+            remember_retrieval(retrieval)
         return _request_payload(
             request,
             items=[
@@ -2278,7 +2711,8 @@ def create_app(
         refresh: bool = False,
     ):
         try:
-            models = provider_registry.models(provider_name, refresh=refresh)
+            provider_registry.models(provider_name, refresh=refresh)
+            choices = provider_registry.recent_model_choices(provider_name)
         except ConfigurationError as exc:
             raise HTTPException(404, "Провайдер не настроен на сервере.") from exc
         except _PublicTaskError as exc:
@@ -2296,7 +2730,17 @@ def create_app(
         return _request_payload(
             request,
             provider=("zhipu" if provider_name.casefold() == "glm" else provider_name),
-            models=list(models),
+            models=[item["id"] for item in choices],
+            model_details=choices,
+            date_note=(
+                "До 5 моделей: даты официальных релизов или выпуска по API; иначе "
+                "даты создания записи каталога (не подтверждённый релиз). "
+                "Без дат порядок не подтверждён."
+            ),
+            release_dates_complete=all(
+                item["date_basis"] in {"provider_release", "official_release"}
+                for item in choices
+            ),
             partial=False,
             cached=not refresh,
         )
@@ -2486,6 +2930,42 @@ def create_app(
         ]
         return _request_payload(request, values=values, items=items)
 
+    @app.get("/api/model-routing")
+    def model_routing_settings(request: Request):
+        return _request_payload(
+            request,
+            settings=routing_settings.model_dump(mode="json"),
+            mode=(
+                "adaptive"
+                if routing_settings.enabled and routing_settings.profiles
+                else "configured-chain"
+            ),
+            warning=routing_load_warning,
+            effective_next_request=True,
+        )
+
+    @app.put("/api/model-routing")
+    def update_model_routing(request: Request, body: AdaptiveRoutingRequest):
+        nonlocal config, routing_settings, routing_load_warning
+        try:
+            updated_config = _apply_routing_settings(config, body)
+            _persist_routing_settings(routing_path, body)
+        except (OSError, ConfigurationError, ValueError, TypeError):
+            raise HTTPException(
+                422,
+                "Не удалось сохранить корректную политику выбора моделей.",
+            ) from None
+        config = updated_config
+        routing_settings = body
+        routing_load_warning = None
+        app.state.config = config
+        return _request_payload(
+            request,
+            settings=body.model_dump(mode="json"),
+            mode=("adaptive" if body.enabled and body.profiles else "configured-chain"),
+            effective_next_request=True,
+        )
+
     @app.put("/api/settings")
     def update_settings(request: Request, body: SettingsRequest):
         nonlocal config
@@ -2506,6 +2986,10 @@ def create_app(
             for name, value in body.values.items():
                 os.environ[str(_SETTINGS[name]["environment"])] = str(value)
             updated_config = AppConfig.from_env(config.project_root)
+            updated_config = _apply_routing_settings(
+                updated_config,
+                routing_settings,
+            )
             updated_config.prepare_directories()
         except Exception:
             for name, previous_value in previous.items():

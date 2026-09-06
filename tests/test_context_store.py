@@ -6,7 +6,11 @@ import pytest
 
 from context_agent.context_store import ContextStore, chunk_text
 from context_agent.errors import PathSecurityError
-from context_agent.vector_index import VectorChunk, VectorSearchHit
+from context_agent.vector_index import (
+    FastEmbedQdrantIndex,
+    VectorChunk,
+    VectorSearchHit,
+)
 
 
 class _FakeVectorIndex:
@@ -91,7 +95,14 @@ def test_hybrid_search_fuses_semantic_hits_and_survives_vector_failure(
         store.add_text("memory://semantic", "Выручка продавца на маркетплейсе")
         semantic = store.search("совершенно другой запрос", limit=3)
         assert semantic[0].source == "memory://semantic"
-        assert store.retrieval_status()["mode"] == "hybrid"
+        status = store.retrieval_status()
+        assert status["mode"] == "hybrid"
+        assert status["strategy"] == "rrf"
+        assert status["vector_state"] == "ready"
+        assert status["active_backends"] == [
+            "sqlite-fts5-bm25",
+            "fastembed-qdrant",
+        ]
 
     failing_vector = _FakeVectorIndex(fail_search=True)
     with ContextStore(
@@ -101,6 +112,23 @@ def test_hybrid_search_fuses_semantic_hits_and_survives_vector_failure(
         store.add_text("memory://lexical", "LEXICAL_FALLBACK_ANCHOR")
         lexical = store.search("LEXICAL_FALLBACK_ANCHOR", limit=3)
         assert lexical[0].source == "memory://lexical"
+
+
+def test_vector_status_redacts_backend_exception_details(tmp_path: Path) -> None:
+    vector = FastEmbedQdrantIndex(
+        tmp_path / "vectors",
+        enabled=True,
+        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        batch_size=2,
+    )
+    vector._last_error = "RuntimeError: C:\\secret\\document.txt contains TOKEN_VALUE"
+
+    status = vector.status()
+
+    assert status["last_error"] == "vector_backend_unavailable"
+    assert status["last_error_type"] == "RuntimeError"
+    assert "secret" not in str(status)
+    assert "TOKEN_VALUE" not in str(status)
 
 
 def test_index_pages_resume_and_report_incremental_counts(tmp_path: Path) -> None:
@@ -221,7 +249,10 @@ def test_one_million_lines_keep_beginning_and_end_searchable(tmp_path: Path) -> 
     document = source_root / "million-lines.txt"
     with document.open("w", encoding="utf-8", newline="\n") as stream:
         stream.write("FIRST_MILLION_LINE_ANCHOR\n")
-        for _ in range(999_999):
+        for _ in range(499_998):
+            stream.write("ordinary scalable context line\n")
+        stream.write("MIDDLE_MILLION_LINE_ANCHOR\n")
+        for _ in range(499_999):
             stream.write("ordinary scalable context line\n")
         stream.write("LAST_MILLION_LINE_ANCHOR\n")
 
@@ -235,8 +266,10 @@ def test_one_million_lines_keep_beginning_and_end_searchable(tmp_path: Path) -> 
         assert report.files_indexed == 1
         assert report.chunks_written > 1_000
         first = store.search("FIRST_MILLION_LINE_ANCHOR")
+        middle = store.search("MIDDLE_MILLION_LINE_ANCHOR")
         last = store.search("LAST_MILLION_LINE_ANCHOR")
         assert first[0].chunk_index == 0
+        assert 0 < middle[0].chunk_index < report.chunks_written - 1
         assert last[0].chunk_index == report.chunks_written - 1
 
 

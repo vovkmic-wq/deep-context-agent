@@ -1,5 +1,194 @@
 # Статус реализации
 
+## Bounded progress recovery 0.26.0 — реализовано, 2026-09-06
+
+Выполнены `DEEP_CONTEXT_AGENT_0_26_BOUNDED_PROGRESS_RECOVERY_PROMPT.md` и
+`AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md` (P01–P15, A01–A26). Исправлен
+инцидент 0.25.0, где успешные шаги модели исчерпывали recursion/failure retries,
+а runtime не мог доказать следующий шаг. Кодовая версия повышена до 0.26.0.
+
+| Область | Состояние |
+| --- | --- |
+| P01/P02: runtime ledger, forced checkpoint, soft yield | Реализовано: receipts, counters и next operation сохраняются до ответа модели |
+| P03/P04: интервалы чтения, виды прогресса, лимиты | Реализовано: versioned range union, page/byte budgets, duplicate-range guard |
+| P05/P06: узкие units и execution escalation | Реализовано: soft yield не расходует failure retries, escalation ограничена правами и бюджетами |
+| P07/P08: parent/child диагностика и UI counters | Реализовано: parent task связывает child attempts, необработанные ошибки журналируются с redaction |
+| P09: миграции/restart/crash safety | Реализовано и проверено продолжением после перезапуска на той же SQLite |
+| P10/P11: автоматические и повторные live-тесты | PASS; точные результаты приведены ниже |
+| P12–P15: выпуск, adaptive routing, memory UI, retrieval eval | Реализовано; финальная публикация фиксируется коммитом релиза |
+
+Дополнительно реализованы единый Unicode-aware token estimator, сохраняемые Web-
+настройки adaptive profiles, фактический индикатор `FTS5/BM25 + vector`, локальный
+FastEmbed/Qdrant с lexical fallback и golden retrieval metrics hit@k/MRR. Ошибка,
+найденная live-проверкой (`Conversational Autopilot exhausted without terminal
+state`), устранена: persistent workflow использует общий лимит work units, а
+достижение потолка даёт контролируемый `work_unit_limit_exhausted`, не assertion.
+
+Live evidence на изолированных workspace/SQLite (существующие ключи, без записи
+секретов в Git):
+
+- `doctor --live`: Zhipu `glm-5.3` и резерв OpenAI доступны, memory mode `hybrid`;
+- resume/routing: `%TEMP%\dca-resume-routing-live-m9v_6z43\result.json` и
+  `%TEMP%\dca-resume-routing-live-nmxyvzho\result.json` — PASS, audit runs 0;
+- bounded progress, два независимых прогона `scripts/live_bounded_progress.py
+  --repeat 2`: PASS; jobs `7fe11482671abcbaa8e24495` и
+  `ccef18df14bde8a594a550e1`, 14 успешных read receipts, пять страниц одного
+  файла и ровно одна результирующая запись в каждом прогоне;
+- Web browser: версия 0.26.0, sticky chat header, adaptive profiles сохраняются
+  после restart, первая индексация `indexed=1`, повторная `unchanged=1`, hybrid
+  retrieval показывает `FTS5/BM25 + vector` после ленивой загрузки модели.
+
+Финальная автоматическая регрессия 2026-09-06: `pytest -ra` — **369 passed,
+1 skipped** за 41.05 s; skip относится только к недоступному созданию Windows
+symlink. Ruff check/format — PASS, 83 Python-файла; mypy — PASS, 27 source
+modules; TypeScript noEmit, production bundle и два Web bundle/model tests —
+PASS; compileall и pip check — PASS; из чистого sdist успешно собраны
+`deep_context_agent-0.26.0.tar.gz` и wheel 0.26.0.
+
+Границы подтверждения: это локальный single-user Web runtime; первый запуск
+FastEmbed скачивает модель. В одном раннем диагностическом прогоне реальный GLM
+timeout корректно перешёл на OpenAI fallback. Нагрузочный многопользовательский
+benchmark и live-сбор данных Ozon в приёмку Deep Context Agent не входят.
+
+## Task resume / model resources 0.25.0 — 2026-09-04
+
+Выполнено по `DEEP_CONTEXT_AGENT_0_25_RESUME_MODEL_ROUTING_PROMPT.md` и
+`TASK_RESUME_MODEL_ROUTING_SPEC.md` (R1–R6). Существующие изменения 0.24 и
+пользовательские prompts сохранены, Ozon workspace и рабочий сервер не изменялись.
+
+1. **R1:** additive SQLite `task_checkpoints`, исходная цель, план, следующий шаг,
+   отдельные tool receipts; task/job identity не зависит от текста продолжения.
+   CAS/owner/revision/lease защищают сохранение и terminal от устаревшего worker.
+2. **R2:** общий Web/CLI structured intent resolver. Точные команды локальны;
+   неоднозначные отсылки используют ограниченный classifier с JSON-schema,
+   timeout и журналом. Структурированный intent возвращается в routing metadata.
+   Неизвестный ID/низкая confidence/ошибка/несколько задач не создают новый аудит.
+3. **R2:** пересечение прежних прав с текущими Ask/Plan/allow-write/read-only;
+   актуальная инструкция передаётся отдельно от исходной цели и checkpoint.
+   Логи, служебные XML-теги и имена `resume.txt` не создают разрешений.
+4. **R3:** project-change/project-test используют execute units без audit manifest.
+   Следующий шаг продолжается из checkpoint, пауза сохраняется; успешный worker
+   не закрывает общую задачу без оператора. CLI `job` проверен на двух units.
+5. **R4:** конфигурируемые fast/standard/reasoning profiles, high-risk-first,
+   tools/context/full schemas/checkpoint/output reserve, local-only, optional
+   cost/latency ceilings. Ручной выбор сохраняет приоритет. Fallback выбирается
+   только среди допустимых кандидатов и не переисполняет tools.
+6. **R5:** выбранная модель, оценка размера/стоимости и причина выбора в actual
+   model attempts; intent/task ID/next step в Web/SSE. UI запоминает auto/manual,
+   heartbeat подписан как время последней активности, partial не скрывается.
+7. **R6:** регрессии и повторные live через реальный Web runtime на отдельных
+   SQLite. Разработка → лог → restart → точная длинная команда → тот же task/job,
+   файл LIVE_A/LIVE_B, затем Ask без записи. Audit runs: **0**.
+
+Live evidence (локальные временные файлы, не включаются в Git):
+
+- `%TEMP%/dca-resume-routing-live-p5g78cew/result.json`: PASS первого полного
+  сценария после исправлений.
+- `%TEMP%/dca-resume-routing-live-0hshoohy/result.json`: повторный PASS,
+  job `352264b87cce756bad6025ca`, 15 actual model attempts. Использованы существующие
+  GLM-5.3/OpenAI; реальный GLM timeout 45 s завершился fallback без потери прогресса.
+- `%TEMP%/dca-resume-routing-live-5ruqawva/result.json`: отдельный classifier PASS,
+  `zhipu/glm-5.3`, effort `low`, request `c2565e00f7134aacbb05da34944eecbe`.
+- Исправления, найденные именно live: будущее «продолжение» внутри новой задачи;
+  имя файла `resume.txt`; GLM-5.3 не принимает отключённое thinking. Для classifier
+  используются enabled/low согласно
+  [официальной документации GLM-5.3](https://docs.z.ai/guides/llm/glm-5.3).
+
+Проверки версии 0.25.0:
+
+- pytest: **353 passed, 1 skipped**, 32.14 s; skip — создание Windows symlink.
+- Ruff check/format: PASS, 76 Python files; mypy: PASS, 25 source modules.
+- TypeScript noEmit, production bundle, model choices tests: PASS;
+  JS+CSS — 62 307 bytes. Это проверки сборки, не ручной визуальный UX-аудит.
+- compileall и pip check: PASS; wheel и sdist 0.25.0 собраны.
+- Изменения runtime покрыты реальными live API-вызовами, переходы прав и лимиты —
+  детерминированными регрессиями. Нагрузочный многопользовательский production
+  benchmark не проводился; область применения остаётся локальной.
+
+Границы подтверждения:
+
+- Профили в пользовательском `.env.local` не создавались автоматически. Без них
+  остаётся configured-chain, а не заявленная экономия от разных моделей.
+  В live каждый реальный ID назначался нескольким tier для проверки механизма;
+  сравнение качества/стоимости трёх различных моделей не проводилось.
+- Оценка complexity/risk объяснимая эвристическая, а не гарантия точной семантики.
+  Semantic fallback ограничен интерпретацией продолжения и не выдаёт полномочий.
+- Латентность/надёжность process-local, тарифы/качество задаёт оператор;
+  оценка стоимости на вызов не равна счёту провайдера или бюджету всей задачи.
+- Старые job/history не импортируются как новые полномочия. Если сохранённой
+  задачи нет, требуется новая прямая постановка задачи; старый текст лога не годится.
+- Работающий сервер не перезапущен: уже импортированный старый runtime заменяется
+  только после перезапуска. Git commit/push в этом этапе не выполнялся.
+
+## Task continuity / reliability / model choices 0.24.0 — 2026-09-03
+
+Реализовано по `DEEP_CONTEXT_AGENT_0_24_TASK_CONTINUITY_PROMPT.md`:
+
+1. Существовавшие пользовательские untracked prompts не изменены. Baseline:
+   298 passed, 1 Windows symlink skip; исходный commit ad308270.
+2. `TaskStateStore` в context SQLite хранит цель прямого запроса, scope/rights,
+   workflow, состояние, revision, lease и ссылку на результат хода. История и
+   детали persistent job остаются в прежних Context/Autopilot stores.
+3. Общий Web/CLI resolver: разработка → боковой лог → продолжение; Ask/Plan/
+   allow-write ограничивают возобновлённые права. Текущие права добавляются к
+   каждому вызову модели. Данные логов не создают полномочий.
+4. Diagnostics schema 3 сохраняет каждую реальную model attempt до и после
+   inference, effective temperature/reasoning effort, hash, usage, finish/stop,
+   retry и cancellation. Crash-left attempts становятся interrupted, без
+   выдуманного количества токенов или длительности.
+5. Conservative повтор одинаковых абзацев: off/observe/enforce; code fences,
+   JSON, tool calls и таблицы исключаются. No-progress использует новые реальные
+   tool evidence, а не количество обещаний в тексте.
+6. Output/call/time budgets; transient-only retries; отказ от graph replay;
+   проверка отмены/lease/deadline перед model/tool calls. Responses incomplete и
+   Chat Completions length не переходят к исполнению неполных tool calls.
+7. Saved task отделён от retrieval. Невыполненный одиночный этап остаётся partial;
+   оператор явно закрывает задачу. Нельзя молча выбрать одну из нескольких задач.
+8. Web/SSE: partial/blocked/cancelled/completed, persistent terminal, JSONL terminal,
+   выбор saved task и кнопки закрытия/отмены с optimistic revision check.
+9. Регрессии покрывают Web/CLI continuity, revoked write, Ask, другую область,
+   занятость/устаревший owner/истечение lease, отмену после записи, повтор текста,
+   tool no-progress, budgets, миграцию, crash recovery и сохранность диагностики.
+10. Изолированный live через реальный Web runtime с существующим ключом:
+    создание файла → анализ лога (0 tools) → новый экземпляр приложения с теми же
+    SQLite → read/edit/read → Ask без изменения файла. Два прогона PASS.
+11. Обновлены глобальные ТЗ, управляющий и системный prompts, README, CHANGELOG,
+    пример конфигурации. Версии Python и Web согласованы: 0.24.0.
+12. Каталоги Web/провайдеров: пять выбираемых моделей, даты с provenance, full
+    catalog validation, alias/snapshot dedup, сохранение старой активной модели.
+    Для OpenAI model switch не переносит несовместимый effort `none` в Pro.
+
+Проверки:
+
+- pytest: **324 passed, 1 skipped** (Windows не разрешает создание symlink).
+- Ruff check/format, mypy (22 source files), compileall, pip check — PASS.
+- TypeScript noEmit, production bundle, отдельный тест model choices — PASS.
+- Wheel и sdist 0.24.0 собираются; отсутствовавший локальный hatchling установлен.
+- Live continuity evidence: `%TEMP%/dca-continuity-live-4__0sxqz/data/diagnostics.sqlite3`.
+  Запросы: `9016dbc76aa549878800898025b5de6d`, `ee40983d650b4a799f8c82f56d1f7d24`,
+  `7d382228c4a54d45bbdf0cf7e8014394`, `b8295d43dc67455f82ea1a74fa3d27d9`.
+  Первый прогон: `%TEMP%/dca-continuity-live-uesccal4`; подтверждён также реальный
+  failover после timeout GLM к OpenAI. Ключи не выводились и не изменялись.
+- Read-only live каталоги: GLM — 10 подходящих ID, OpenAI — 63 до удаления дублей;
+  оба возвращают пять choices. Это не live-inference всех десяти моделей.
+
+Границы подтверждения:
+
+- Выполнение предназначено для локального однопользовательского приложения.
+  После crash lease становится доступным по истечении task budget + 60 секунд;
+  немедленного распределённого определения смерти owner нет.
+- Sync HTTP нельзя считать подтверждённо остановленным на сервере после cancel;
+  остановка проверяется на границах вызовов. Streaming repetition detector и
+  семантический классификатор повторов не реализованы и не заявляются.
+- Для GLM-5-Turbo в текущем каталоге дата сортировки — created, не подтверждённая
+  дата релиза. Известные API-релизы дополнены официальными источниками:
+  https://docs.z.ai/release-notes/new-released,
+  https://openai.com/index/gpt-5-6/,
+  https://openai.com/index/introducing-gpt-5-5/.
+- В этом этапе не выполнялись ручной browser UX-прогон и inference каждой модели.
+  Пользовательский Ozon workspace, текущий сервер и его задачи не перезапускались.
+  Изменения локальные; публикация Git в текущем этапе не выполнялась.
+
 ## Structured data-aware routing 0.23.0 — 2026-09-03
 
 - Добавлен immutable RoutingDecision с независимыми execution/workflow/scope,

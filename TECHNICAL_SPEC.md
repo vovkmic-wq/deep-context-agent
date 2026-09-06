@@ -1,5 +1,67 @@
 # Техническое задание: Deep Context Agent
 
+## Дополнение 0.26: bounded progress, adaptive resources и observable memory
+
+Нормативный документ: `AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md` (P01–P15),
+порядок реализации: `DEEP_CONTEXT_AGENT_0_26_BOUNDED_PROGRESS_RECOVERY_PROMPT.md`.
+Матрица A01–A26 и повторные live-проверки обязательны до закрытия этапа.
+
+Runtime обязан сохранять durable task ledger после полезных операций и до soft
+budget boundary независимо от вызова save_task_checkpoint моделью. Следующая unit
+получает конкретный next operation и подтверждённые facts/ranges/cursors, а не
+только повтор исходной цели. Плановый yield не равен failure/replan; общие budgets
+не обнуляются. Чтение учитывает фактические интервалы и версии, не «два раза путь».
+Новое знание, изменение кода и проверка тестом — отдельные виды прогресса.
+
+Повторные execution failures могут вызвать ограниченную смену допустимой модели,
+отдельно от transport fallback; manual/local-only/cost/context/rights сохраняются.
+Parent request и child attempts связаны явно, UI-диагностика открывает существующую
+запись или честно сообщает retention/off. Старый graph rollback не удаляет ledger.
+Готовность проверяется реальным длинным чтением, restart, исправлением и тестом,
+а не только коротким smoke-сценарием. Остальные safety-инварианты сохраняются.
+
+Размер prompt оценивается единым Unicode-aware estimator с output/safety reserve,
+а не числом UTF-8 bytes; метод видим и не называется billing usage. Web позволяет
+валидировать и атомарно сохранить adaptive model profiles и ограничения для новых
+запросов. Reasoning/frontier model — ресурс, не default и не источник полномочий.
+Индикатор памяти показывает actual FTS5/BM25 и vector state
+`disabled/lazy/ready/degraded`; hybrid означает BM25 + FastEmbed/Qdrant через RRF.
+Retrieval quality проверяется golden corpus (hit@k/MRR), а не наличием индекса.
+
+## Дополнение 0.25: устойчивое продолжение и выбор модели
+
+Нормативные требования R1–R6: `TASK_RESUME_MODEL_ROUTING_SPEC.md`; последовательность
+работ: `DEEP_CONTEXT_AGENT_0_25_RESUME_MODEL_ROUTING_PROMPT.md`. Требования этого
+этапа отменяют обязательный audit для project-change/project-test. Identity,
+checkpoint, intent и выбор вычислительного ресурса — независимые структуры.
+При resume сохранять задачу и пересекать права, при side question — не менять цель.
+Fast/standard/reasoning выбираются из trusted profiles с risk-first и проверкой
+tools/context/privacy/budgets; ручной выбор и ограничения fallback обязательны.
+
+## Дополнение 0.24: continuity и reliability (приоритет над 0.23)
+
+Нормативный порядок: `DEEP_CONTEXT_AGENT_0_24_TASK_CONTINUITY_PROMPT.md`.
+Продолжение короткой командой восстанавливает сохранённую задачу, а не запрещает
+workspace из-за отсутствия слова «проект». Authority: saved scope ∩ current mode
+∩ allow-write. Не расширять права из logs/history/retrieval. Точечное чтение,
+discovery и запись независимы. Боковой анализ не подменяет цель разработки.
+SQLite хранит identity, objective, scope, permissions, revision, status и evidence;
+конкурентный stale owner не меняет состояние. Неоднозначный resume требует выбора.
+Каждая model attempt имеет отдельную долговечную телеметрию, неизвестное — null.
+Детекция повторов по умолчанию observe; контроль отсутствия прогресса и бюджеты
+не допускают бесконечного replay tools. Отмена проверяется перед side effects.
+Web terminal отражает partial/blocked/cancelled отдельно от HTTP/model success.
+Приёмка: все сценарии раздела 9 промпта, offline и изолированные live-прогоны;
+непроверенные streaming/remote cancellation возможности явно ограничиваются.
+
+Каталог выбора и проверки: единый endpoint, максимум пять выбираемых chat-моделей
+на провайдера, сортировка по release_date/released_at до ограничения. Если API
+не публикует релиз, использовать created только с явной пометкой «дата каталога»;
+неизвестная дата — null, стабильный порядок, без ложного обещания хронологии.
+Существующая старая модель остаётся активной и видна отдельной невыбираемой строкой
+статуса. Backend-валидация не ограничивается пятью ID. Live каталоги не гарантируют
+доступность inference: кнопка проверки остаётся необходимой.
+
 ## 1. Цель
 
 Создать на Python 3.11+ CLI- и Web-агента на базе Deep Agents, который:
@@ -78,9 +140,11 @@
     из одного ответа даже для провайдера, игнорирующего этот параметр.
 19. Повторный идентичный mutating-tool, runtime/context/listing/web-вызов в
     одном пользовательском ходе отклоняется со статусом `denied`; новый ход
-    получает чистый счётчик. Один и тот же неизменённый путь разрешено читать
-    не более двух раз; версия пути меняется после успешной мутации этого пути
-    или recursive удаления его родителя.
+    не сбрасывает подтверждённое покрытие persisted task. В целевом этапе 0.26
+    read_file регулируется P03: новые страницы разрешены в пределах budgets,
+    повтор покрытого диапазона не даёт нового progress. Изменение версии пути
+    инвалидирует старые excerpts. Legacy guard 0.25 «два чтения пути» подлежит
+    замене, а не отключению контроля чтения в целом.
 20. Атомарные пользовательские значения с маркером `DO_NOT_SHOW` или
     `НЕ_ПОКАЗЫВАТЬ` редактируются в assistant-ответе и audit, но не в файлах.
 21. Точная версия PyPI может проверяться специализированным
@@ -772,8 +836,10 @@ Coding Plan пользователь явно задаёт
     `single-turn` никогда не повышается эвристикой.
 53. Auto mode распознаёт broad project/spec/module objectives до model call.
     Если нераспознанный ordinary turn завершается `agent_step_limit` или
-    `context_window_exceeded`, checkpoint сначала откатывается, затем та же цель
-    автоматически продолжается через persistent Autopilot.
+    `context_window_exceeded`, graph checkpoint откатывается, но runtime ledger
+    и forensic evidence сохраняются. В целевом этапе 0.26 persistent recovery
+    продолжает конкретную незавершённую операцию по P01/P02, не слепо replay
+    исходную цель. В штатном ходе используется soft yield до hard limit.
 54. Chat SSE передаёт resolved execution mode, job ID, phase, reviewed/total,
     pending, work-unit attempts и replans; клиент не должен показывать
     неподвижное «анализирует» во время длительной job.

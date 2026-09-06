@@ -397,6 +397,10 @@ class FastEmbedQdrantIndex:
     def status(self) -> dict[str, object]:
         """Return safe lazy-loader status without forcing a model download."""
 
+        error_type = (
+            self._last_error.partition(":")[0].strip() if self._last_error else None
+        )
+
         return {
             "enabled": self.enabled,
             "backend": "qdrant-local",
@@ -410,7 +414,11 @@ class FastEmbedQdrantIndex:
             "batch_size": self.batch_size,
             "loaded": self._ready,
             "fallback": "sqlite-fts5-bm25",
-            "last_error": self._last_error,
+            # The exception body may contain local paths, payload excerpts or
+            # dependency internals.  Runtime diagnostics keep the full error;
+            # the Web API receives only a stable, non-sensitive category.
+            "last_error": "vector_backend_unavailable" if self._last_error else None,
+            "last_error_type": error_type,
         }
 
     def close(self) -> None:

@@ -476,11 +476,15 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
 
 def _runtime(args: argparse.Namespace, base_dir: Path) -> AgentRuntime:
     providers = ProviderConfig.priority_from_env(args.provider, args.providers)
-    return AgentRuntime(
+    runtime = AgentRuntime(
         _app_config(base_dir),
         providers[0],
         fallback_provider_configs=providers[1:],
     )
+    policy = getattr(runtime, "set_default_model_policy", None)
+    if callable(policy):
+        policy(manual=bool(args.provider or args.providers))
+    return runtime
 
 
 def read_prompt_file(path: Path) -> str:
@@ -563,7 +567,7 @@ def read_chat_query() -> str | None:
 def _run_ask(args: argparse.Namespace, base_dir: Path) -> int:
     with _runtime(args, base_dir) as runtime:
         print(
-            runtime.ask(
+            getattr(runtime, "ask_user", runtime.ask)(
                 resolve_ask_query(args),
                 thread_id=args.thread,
                 auto_context=not args.no_auto_context,
@@ -639,7 +643,7 @@ def _run_job(args: argparse.Namespace, base_dir: Path) -> int:
 
     with _runtime(args, base_dir) as runtime:
         print(
-            runtime.run_autopilot_job(
+            getattr(runtime, "run_user_job", runtime.run_autopilot_job)(
                 resolve_ask_query(args),
                 thread_id=args.thread,
                 allow_write=args.allow_write,
@@ -822,7 +826,7 @@ def _run_chat(args: argparse.Namespace, base_dir: Path) -> int:
             if not query:
                 continue
             try:
-                answer = runtime.ask(
+                answer = getattr(runtime, "ask_user", runtime.ask)(
                     query,
                     thread_id=args.thread,
                     auto_context=not args.no_auto_context,

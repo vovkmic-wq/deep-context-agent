@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,10 +18,50 @@ from context_agent.errors import AgentError
 from context_agent.project_audit import ProjectAuditStore
 from context_agent.runtime import AgentRuntime
 from context_agent.web import (
+    TaskRegistry,
     _agent_failure_code,
     _is_benign_windows_pipe_reset,
     create_app,
 )
+
+
+def test_background_failure_keeps_redacted_exception_in_parent_journal(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "diagnostics.sqlite3"
+    secret = "TASK_FAILURE_SECRET_91827"
+    with DiagnosticStore(database, known_secrets=(secret,)) as journal:
+        request_id = journal.start_request(
+            query="run background task",
+            thread_id="web",
+            operation_kind="web_chat_parent",
+            source="web",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            request_id="parent-failure",
+        )
+        registry = TaskRegistry(journal, logging.getLogger("test-web-task"))
+
+        def fail(_emit, _cancel):
+            raise ValueError(f"backend failed at C:/private/{secret}.txt")
+
+        task_id = registry.submit(
+            "test",
+            fail,
+            task_id="task-failure",
+            request_id=request_id,
+        )
+        task = registry.get(task_id)
+        assert task.done.wait(timeout=5)
+        registry.close()
+        record = journal.request("parent-failure")
+
+    assert record["status"] == "failed"
+    assert record["error_code"] == "background_task_failed"
+    serialized = json.dumps(record, ensure_ascii=False)
+    assert "ValueError" in serialized
+    assert secret not in serialized
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -890,8 +931,10 @@ def test_structured_web_log_contains_safe_correlation_only(
     client.get(f"/api/events/{task_id}")
     log = (config.data_dir / "context-agent-server.jsonl").read_text(encoding="utf-8")
 
-    record = json.loads(log.splitlines()[-1])
-    assert record["event_code"] == "provider_chain_failed"
+    records = [json.loads(line) for line in log.splitlines()]
+    record = records[-1]
+    assert record["event_code"] == "task_failed"
+    assert any(item["event_code"] == "provider_chain_failed" for item in records)
     assert record["fields"]["task_id"] == task_id
     assert "SECRET_LOG_DETAIL_75291" not in log
 
@@ -1045,7 +1088,9 @@ def test_provider_model_can_return_to_configured_model_after_catalog_refresh(
     )
 
     assert selected.status_code == 200
-    assert refreshed.json()["models"] == ["selected-model", "test-model"]
+    # A configured ID absent from the current catalog remains valid for existing
+    # tasks, but is shown as status rather than a new selectable catalog option.
+    assert refreshed.json()["models"] == ["selected-model"]
     assert restored.status_code == 200
     assert restored.json()["model"] == "test-model"
 
@@ -1075,6 +1120,92 @@ def test_settings_and_work_modes_include_russian_explanations(tmp_path: Path) ->
     assert all(" / " in item["label"] for item in settings["items"])
     assert runtime["work_modes"] == ["agent", "ask", "plan", "debug", "multitask"]
     assert invalid.status_code == 422
+
+
+def test_runtime_reports_actual_memory_backends(tmp_path: Path) -> None:
+    client, _csrf, _config_value = _client(tmp_path)
+
+    retrieval = client.get("/api/runtime").json()["retrieval"]
+
+    assert retrieval["mode"] == "lexical-only"
+    assert retrieval["strategy"] == "bm25"
+    assert retrieval["vector_state"] == "disabled"
+    assert retrieval["active_backends"] == ["sqlite-fts5-bm25"]
+    assert retrieval["external_document_transfer"] is False
+
+
+def test_adaptive_routing_settings_are_validated_applied_and_persisted(
+    tmp_path: Path,
+) -> None:
+    client, csrf, config = _client(tmp_path)
+    profile = {
+        "provider": "lmstudio",
+        "model": "test-model",
+        "tier": "fast",
+        "tools": True,
+        "context_tokens": 8192,
+        "input_usd_per_million": None,
+        "output_usd_per_million": None,
+        "latency_ms": 100.0,
+        "quality": 0.6,
+        "enabled": True,
+    }
+    payload = {
+        "enabled": True,
+        "profiles": [profile],
+        "cost_limit_usd": 0,
+        "latency_budget_ms": 2500,
+        "local_only": True,
+        "execution_escalation_enabled": True,
+        "manual_execution_escalation": False,
+        "failure_threshold": 3,
+        "max_escalations": 1,
+    }
+
+    response = client.put(
+        "/api/model-routing",
+        json=payload,
+        headers={"x-csrf-token": csrf},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "adaptive"
+    assert client.app.state.config.model_local_only is True
+    assert client.app.state.config.model_latency_budget_ms == 2500
+    path = config.data_dir / "model-routing.json"
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["profiles"] == [profile]
+    assert "api_key" not in path.read_text(encoding="utf-8").casefold()
+
+    with TestClient(create_app(config, (_provider(),))) as restarted:
+        restored = restarted.get("/api/model-routing").json()
+        assert restored["settings"]["local_only"] is True
+        assert restored["settings"]["failure_threshold"] == 3
+        assert restored["mode"] == "adaptive"
+
+
+def test_adaptive_routing_rejects_invalid_profile_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    client, csrf, config = _client(tmp_path)
+    invalid = client.put(
+        "/api/model-routing",
+        json={
+            "enabled": True,
+            "profiles": [
+                {
+                    "provider": "lmstudio",
+                    "model": "test-model",
+                    "tier": "frontier",
+                    "context_tokens": 8192,
+                }
+            ],
+        },
+        headers={"x-csrf-token": csrf},
+    )
+
+    assert invalid.status_code == 422
+    assert not (config.data_dir / "model-routing.json").exists()
 
 
 @pytest.mark.parametrize(

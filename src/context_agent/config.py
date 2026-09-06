@@ -339,6 +339,17 @@ class AppConfig:
     vector_store: str = "qdrant"
     external_embedding_fallback: bool = False
     model_call_retries: int = 3
+    model_output_tokens: int = 8192
+    task_model_attempts: int = 80
+    task_timeout_seconds: int = 900
+    no_progress_limit: int = 8
+    repetition_mode: str = "observe"
+    semantic_routing_enabled: bool = True
+    semantic_routing_timeout: int = 10
+    model_profiles: str = ""
+    model_cost_limit_usd: float = 0
+    model_latency_budget_ms: int = 0
+    model_local_only: bool = False
     model_retry_initial_delay: float = 1.0
     model_retry_max_delay: float = 15.0
     web_retry_attempts: int = 3
@@ -357,6 +368,13 @@ class AppConfig:
     autopilot_unit_timeout_seconds: int = 900
     autopilot_unit_batch_size: int = 2
     autopilot_recursion_limit: int = 40
+    autopilot_soft_model_calls_per_unit: int = 8
+    autopilot_max_read_pages_per_file: int = 512
+    autopilot_max_read_bytes_per_file: int = 64 * 1024 * 1024
+    execution_escalation_enabled: bool = True
+    manual_execution_escalation: bool = False
+    execution_escalation_failure_threshold: int = 2
+    execution_escalation_max_events: int = 2
     project_check_timeout_seconds: int = 300
     project_check_output_max_chars: int = 20_000
     failure_log_mode: str = "redacted"
@@ -366,6 +384,25 @@ class AppConfig:
 
     def __post_init__(self) -> None:
         resolved_workspace = self.workspace.resolve()
+        from context_agent.model_routing import parse_profiles
+
+        parse_profiles(self.model_profiles)
+        if not 1 <= self.semantic_routing_timeout <= 30:
+            raise ConfigurationError("semantic_routing_timeout must be 1..30 seconds")
+        if not 0 <= self.model_cost_limit_usd <= 1000:
+            raise ConfigurationError("model_cost_limit_usd must be 0..1000")
+        if not 0 <= self.model_latency_budget_ms <= 600_000:
+            raise ConfigurationError("model_latency_budget_ms must be 0..600000")
+        for name, minimum, maximum in (
+            ("model_output_tokens", 256, 131072),
+            ("task_model_attempts", 1, 1000),
+            ("task_timeout_seconds", 10, 86400),
+            ("no_progress_limit", 2, 100),
+        ):
+            if not minimum <= getattr(self, name) <= maximum:
+                raise ConfigurationError(f"{name} must be in {minimum}..{maximum}")
+        if self.repetition_mode not in {"off", "observe", "enforce"}:
+            raise ConfigurationError("repetition_mode must be off, observe or enforce")
         resolved_data_dir = self.data_dir.resolve()
         if resolved_data_dir == resolved_workspace or resolved_data_dir.is_relative_to(
             resolved_workspace
@@ -483,6 +520,27 @@ class AppConfig:
             raise ConfigurationError(
                 "AGENT_AUTOPILOT_RECURSION_LIMIT must be between 25 and 100"
             )
+        if not 2 <= self.autopilot_soft_model_calls_per_unit <= 100:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_SOFT_MODEL_CALLS_PER_UNIT must be between 2 and 100"
+            )
+        if not 8 <= self.autopilot_max_read_pages_per_file <= 10_000:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_MAX_READ_PAGES_PER_FILE must be between 8 and 10000"
+            )
+        if not 1_048_576 <= self.autopilot_max_read_bytes_per_file <= 2**31:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_MAX_READ_BYTES_PER_FILE must be between "
+                "1 MiB and 2 GiB"
+            )
+        if not 1 <= self.execution_escalation_failure_threshold <= 10:
+            raise ConfigurationError(
+                "AGENT_EXECUTION_ESCALATION_FAILURE_THRESHOLD must be between 1 and 10"
+            )
+        if not 0 <= self.execution_escalation_max_events <= 10:
+            raise ConfigurationError(
+                "AGENT_EXECUTION_ESCALATION_MAX_EVENTS must be between 0 and 10"
+            )
         if not 10 <= self.project_check_timeout_seconds <= 3_600:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS must be between 10 and 3600"
@@ -576,6 +634,27 @@ class AppConfig:
                 "AGENT_RETRIEVAL_LIMIT",
                 8,
             ),
+            model_output_tokens=_int_setting(values, "AGENT_MODEL_OUTPUT_TOKENS", 8192),
+            task_model_attempts=_int_setting(values, "AGENT_TASK_MODEL_ATTEMPTS", 80),
+            task_timeout_seconds=_int_setting(
+                values, "AGENT_TASK_TIMEOUT_SECONDS", 900
+            ),
+            no_progress_limit=_int_setting(values, "AGENT_NO_PROGRESS_LIMIT", 8),
+            repetition_mode=values.get("AGENT_REPETITION_MODE", "observe"),
+            semantic_routing_enabled=_bool_setting(
+                values, "AGENT_SEMANTIC_ROUTING", True
+            ),
+            semantic_routing_timeout=_int_setting(
+                values, "AGENT_SEMANTIC_ROUTING_TIMEOUT", 10
+            ),
+            model_profiles=values.get("AGENT_MODEL_PROFILES", ""),
+            model_cost_limit_usd=_float_setting(
+                values, "AGENT_MODEL_COST_LIMIT_USD", 0
+            ),
+            model_latency_budget_ms=_int_setting(
+                values, "AGENT_MODEL_LATENCY_BUDGET_MS", 0
+            ),
+            model_local_only=_bool_setting(values, "AGENT_MODEL_LOCAL_ONLY", False),
             auto_context_max_chars=_int_setting(
                 values,
                 "AGENT_AUTO_CONTEXT_MAX_CHARS",
@@ -715,6 +794,41 @@ class AppConfig:
                 values,
                 "AGENT_AUTOPILOT_RECURSION_LIMIT",
                 40,
+            ),
+            autopilot_soft_model_calls_per_unit=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_SOFT_MODEL_CALLS_PER_UNIT",
+                8,
+            ),
+            autopilot_max_read_pages_per_file=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_MAX_READ_PAGES_PER_FILE",
+                512,
+            ),
+            autopilot_max_read_bytes_per_file=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_MAX_READ_BYTES_PER_FILE",
+                64 * 1024 * 1024,
+            ),
+            execution_escalation_enabled=_bool_setting(
+                values,
+                "AGENT_EXECUTION_ESCALATION_ENABLED",
+                True,
+            ),
+            manual_execution_escalation=_bool_setting(
+                values,
+                "AGENT_MANUAL_EXECUTION_ESCALATION",
+                False,
+            ),
+            execution_escalation_failure_threshold=_int_setting(
+                values,
+                "AGENT_EXECUTION_ESCALATION_FAILURE_THRESHOLD",
+                2,
+            ),
+            execution_escalation_max_events=_int_setting(
+                values,
+                "AGENT_EXECUTION_ESCALATION_MAX_EVENTS",
+                2,
             ),
             project_check_timeout_seconds=_int_setting(
                 values,

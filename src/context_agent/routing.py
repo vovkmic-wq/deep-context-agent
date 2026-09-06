@@ -24,6 +24,7 @@ Workflow = Literal[
 Scope = Literal["message", "attachment", "file", "project"]
 
 PROJECT_WORKFLOWS = frozenset({"project-audit", "project-change", "project-test"})
+AUDIT_WORKFLOWS = frozenset({"project-audit"})
 
 _FENCE_LINE_PATTERN = re.compile(r"^\s*(```|~~~)")
 _BLOCKQUOTE_PATTERN = re.compile(r"^\s*>")
@@ -123,6 +124,7 @@ class RoutingDecision:
     instruction_chars: int
     excluded_data_chars: int
     mutation_requested: bool
+    intent: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-safe payload without user or attachment content."""

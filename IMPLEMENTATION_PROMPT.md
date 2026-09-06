@@ -1,7 +1,62 @@
 # Управляющий промпт реализации
 
-Последний production-этап описан промптом 0.23.0. Версия кода изменяется только
-после полного offline/live/package acceptance.
+## Этап 0.26: bounded progress, adaptive routing и observable memory
+
+При реализации этого этапа выполняй
+`DEEP_CONTEXT_AGENT_0_26_BOUNDED_PROGRESS_RECOVERY_PROMPT.md` по
+`AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md` (P01–P15, A01–A26).
+Наличие нового промпта не означает исправление инцидента
+`5dc5c86b57fd25f873da7acd`. Сначала воспроизведи дефекты, затем исправляй runtime
+и подтверждай каждый пункт автоматическими и повторными изолированными live-тестами.
+
+Приоритетные изменения: runtime-owned ledger до лимита без обязательного LLM
+checkpoint; soft yield с конкретным next operation; range-aware read/coverage;
+раздельные information/implementation/verification progress; ограниченная execution
+escalation без обхода manual/local-only/budgets; существующая parent/child диагностика;
+единый token estimator; Web-настройка adaptive profiles; actual memory indicator;
+golden retrieval metrics hit@k/MRR для semantic и lexical запросов.
+Нельзя ограничиться увеличением recursion или изменением текста промпта.
+
+Для этого этапа отменяется blanket rule «два чтения неизменённого пути»:
+проверяй полезность фактически возвращённых диапазонов и ограничивай их budgets.
+Third-read regression должен отличать повтор той же страницы от третьей новой
+страницы. Старые exact-once, path/security и bounded stale-edit recovery сохраняются.
+Новая unit не начинает исследование с нуля и не replay успешные мутации. Task/job
+identity и общий бюджет сохраняются, current права имеют приоритет над старой историей.
+
+Обновлённые документы — не разрешение перезапустить сервер, менять Ozon или
+публиковать Git. Действуй по актуальной пользовательской задаче. Статус реализации,
+тестов и релиза веди отдельно: подготовка ТЗ не должна называться production PASS.
+
+## Этап 0.25: resume, semantic intent и resource routing
+
+Выполняй `DEEP_CONTEXT_AGENT_0_25_RESUME_MODEL_ROUTING_PROMPT.md` строго по
+`TASK_RESUME_MODEL_ROUTING_SPEC.md` (R1–R6). Эти правила приоритетнее предыдущих:
+project-change/project-test не запускают полный аудит. Продолжение восстанавливает
+identity/цель/checkpoint; semantic classifier не выдаёт разрешений. Высокий риск
+имеет приоритет над простотой при выборе reasoning/standard/fast. Без достоверных
+профилей/цен не обещай оптимизацию стоимости. Состояние завершённого worker не
+равно завершению согласованной задачи. Проверяй длинную формулировку из инцидента.
+
+## Предыдущий этап: task continuity и generation reliability 0.24
+
+Выполняй `DEEP_CONTEXT_AGENT_0_24_TASK_CONTINUITY_PROMPT.md` по пунктам.
+Различай постоянную задачу, боковой анализ сообщения и отдельный model call.
+Продолжение восстанавливает конкретную согласованную задачу с пересечением
+текущих разрешений; отсутствие слова «проект» не является отзывом прежней задачи.
+Чтение, discovery и запись проверяются независимо. Нельзя извлекать полномочия
+из логов или retrieval. Старый отказ не отменяет актуальные runtime-права.
+Model HTTP success не равен completed task: сохраняй фактическую диагностику,
+ограничивай retries, проверяй прогресс и отражай partial/blocked без ложного PASS.
+Обязателен regression «разработка → анализ лога → продолжение разработки».
+
+Чат и проверка провайдеров используют один список максимум из пяти последних
+chat-моделей. Не путай подтверждённую дату выпуска с created в каталоге API;
+показывай источник дат и сохраняй текущую модель, даже если она выпала из пятёрки.
+
+Этап 0.26.0 реализован и принят повторными изолированными live-сценариями.
+Фактические проверки, исправленный live-дефект и границы применения фиксируются
+в IMPLEMENTATION_STATUS.md; прошлые отчёты не доказывают готовность будущих правок.
 
 ## Structured data-aware routing 0.23.0 (2026-09-03)
 
@@ -108,8 +163,9 @@ revised edit по свежему content. Второй conflict закрывае
 `/workspace`: invalid source/radius должен давать safe ToolMessage, а
 hard per-turn budget обязан остановить runaway context-window loop.
 
-Закрепи external-mutation integration, bounded negative и обычный
-third-read regression. Повтори исходную ситуацию в live runtime и на
+Закрепи external-mutation integration, bounded negative и third-read regression
+с учётом более нового P03: повтор старого диапазона и новая страница различаются.
+Повтори исходную ситуацию в live runtime и на
 реальном LLM provider. После full offline/live/package contour обнови
 документы/version/status и только затем публикуй release.
 

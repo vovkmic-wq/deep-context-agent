@@ -14,11 +14,32 @@ from typing import Final
 from uuid import uuid4
 
 _TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
-    {"blocked", "cancelled", "complete"}
+    {"partial", "blocked", "cancelled", "complete"}
 )
 _CONTROL_STATUSES: Final[frozenset[str]] = frozenset({"running", "paused", "cancelled"})
 _REPORT_LIMIT: Final[int] = 100_000
 _SUMMARY_LIMIT: Final[int] = 4_000
+
+
+def _covered_units(intervals: list[tuple[int, int]]) -> int:
+    """Return the size of a union of half-open integer intervals."""
+
+    total = 0
+    current_start = -1
+    current_end = -1
+    for start, end in sorted(intervals):
+        if end <= start:
+            continue
+        if current_start < 0:
+            current_start, current_end = start, end
+        elif start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    if current_start >= 0:
+        total += current_end - current_start
+    return total
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +64,13 @@ class AutopilotProgress:
     last_heartbeat_at: float | None = None
     active_unit_started_at: float | None = None
     workflow: str = "project-audit"
+    yielded_units: int = 0
+    file_reads: int = 0
+    unique_lines_read: int = 0
+    changed_files: int = 0
+    checks_run: int = 0
+    escalation_count: int = 0
+    next_operation: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -68,6 +96,13 @@ class AutopilotProgress:
             "last_heartbeat_at": self.last_heartbeat_at,
             "active_unit_started_at": self.active_unit_started_at,
             "workflow": self.workflow,
+            "yielded_units": self.yielded_units,
+            "file_reads": self.file_reads,
+            "unique_lines_read": self.unique_lines_read,
+            "changed_files": self.changed_files,
+            "checks_run": self.checks_run,
+            "escalation_count": self.escalation_count,
+            "next_operation": self.next_operation,
             "terminal": self.terminal,
         }
 
@@ -257,6 +292,7 @@ class AutopilotStore:
         exclude_patterns: tuple[str, ...] = (),
         lease_seconds: int = 900,
         workflow: str = "project-audit",
+        task_identity: str | None = None,
     ) -> tuple[AutopilotProgress, AutopilotLease]:
         """Create/resume a stable identity and claim an exclusive lease."""
 
@@ -286,6 +322,7 @@ class AutopilotStore:
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             workflow=workflow,
+            task_identity=task_identity,
         )
         token = uuid4().hex
         now = time.time()
@@ -348,6 +385,7 @@ class AutopilotStore:
                               ?, ?, NULL)
                     ON CONFLICT(id) DO UPDATE SET
                         status = 'running',
+                        mode = excluded.mode,
                         phase = CASE
                             WHEN autopilot_jobs.phase = 'complete' THEN 'complete'
                             ELSE autopilot_jobs.phase
@@ -375,7 +413,7 @@ class AutopilotStore:
                         workflow,
                         json.dumps(include_patterns, ensure_ascii=False),
                         json.dumps(exclude_patterns, ensure_ascii=False),
-                        "audit" if workflow.startswith("project-") else "execute",
+                        "audit" if workflow == "project-audit" else "execute",
                         batch_size,
                         token,
                         lease_until,
@@ -401,10 +439,22 @@ class AutopilotStore:
         include_patterns: tuple[str, ...] = (),
         exclude_patterns: tuple[str, ...] = (),
         workflow: str = "project-audit",
+        task_identity: str | None = None,
     ) -> str:
         """Return the stable identity shared by CLI, Web, and the store."""
 
         mode = "allow-write" if allow_write else "read-only"
+        if task_identity is not None:
+            identity = "\0".join(
+                (
+                    "saved-task-v2",
+                    str(workspace.resolve()).casefold(),
+                    thread_id.strip(),
+                    task_identity,
+                    workflow,
+                )
+            )
+            return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         identity_parts = [
             "deep-context-autopilot-v1",
             str(workspace.resolve()).casefold(),
@@ -540,6 +590,120 @@ class AutopilotStore:
     def complete_unit(self, lease: AutopilotLease, unit_id: str, summary: str) -> None:
         self._finish_unit(lease, unit_id, "complete", None, summary)
 
+    def yield_unit(self, lease: AutopilotLease, unit_id: str, summary: str) -> None:
+        """Commit a planned handoff without counting it as a failed unit."""
+
+        self._finish_unit(lease, unit_id, "yielded", "soft_yield", summary)
+
+    def set_next_operation(self, lease: AutopilotLease, operation: str) -> None:
+        self._leased_update(
+            lease,
+            "next_operation = ?, checkpoint_revision = checkpoint_revision + 1, "
+            "updated_at = ?",
+            (operation[:1_000], time.time()),
+        )
+
+    def record_tool_receipt(
+        self,
+        lease: AutopilotLease,
+        unit_id: str,
+        receipt: dict[str, object],
+    ) -> None:
+        """Durably store one sanitized runtime-owned tool receipt."""
+
+        with self._lock, self._connection:
+            self._require_lease(lease)
+            active = self._connection.execute(
+                "SELECT 1 FROM autopilot_work_units WHERE id = ? AND job_id = ? "
+                "AND lease_generation = ? AND status = 'running'",
+                (unit_id, lease.job_id, lease.generation),
+            ).fetchone()
+            if active is None:
+                raise AutopilotLeaseError("Autopilot work unit is not active")
+            ordinal = int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM autopilot_tool_receipts "
+                    "WHERE unit_id = ?",
+                    (unit_id,),
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """
+                INSERT INTO autopilot_tool_receipts(
+                    id, job_id, unit_id, ordinal, operation, target, status,
+                    content_version, before_sha256, after_sha256,
+                    requested_offset, requested_limit, start_line, end_line,
+                    next_cursor, bytes_returned, result_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    lease.job_id,
+                    unit_id,
+                    ordinal,
+                    str(receipt.get("name") or "unknown")[:100],
+                    str(receipt.get("path") or "")[:2_000],
+                    str(receipt.get("status") or "unknown")[:50],
+                    str(receipt.get("content_version") or "")[:200],
+                    str(receipt.get("before_sha256") or "")[:64],
+                    str(receipt.get("content_sha256") or "")[:64],
+                    receipt.get("requested_offset"),
+                    receipt.get("requested_limit"),
+                    receipt.get("start_line"),
+                    receipt.get("end_line"),
+                    receipt.get("next_offset"),
+                    receipt.get("bytes_returned"),
+                    receipt.get("result_count"),
+                    time.time(),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE autopilot_jobs SET checkpoint_revision = "
+                "checkpoint_revision + 1, updated_at = ? WHERE id = ?",
+                (time.time(), lease.job_id),
+            )
+
+    def record_escalation(
+        self,
+        lease: AutopilotLease,
+        *,
+        previous_provider: str,
+        previous_model: str,
+        provider: str,
+        model: str,
+        reason: str,
+    ) -> AutopilotProgress:
+        """Persist an explainable execution escalation without credentials."""
+
+        with self._lock:
+            self._require_lease(lease)
+            row = self._connection.execute(
+                "SELECT escalation_history FROM autopilot_jobs WHERE id = ?",
+                (lease.job_id,),
+            ).fetchone()
+            try:
+                history = json.loads(str(row["escalation_history"] or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                history = []
+        history.append(
+            {
+                "previous_provider": previous_provider[:64],
+                "previous_model": previous_model[:200],
+                "provider": provider[:64],
+                "model": model[:200],
+                "reason": reason[:200],
+                "created_at": time.time(),
+            }
+        )
+        payload = json.dumps(history[-10:], ensure_ascii=False, sort_keys=True)
+        self._leased_update(
+            lease,
+            "escalation_count = escalation_count + 1, escalation_history = ?, "
+            "updated_at = ?",
+            (payload, time.time()),
+        )
+        return self.progress(lease.job_id)
+
     def fail_unit(
         self,
         lease: AutopilotLease,
@@ -601,6 +765,16 @@ class AutopilotStore:
             updated_at = ?, finished_at = ?
             """,
             (report[:_REPORT_LIMIT], now, now),
+        )
+        return self.progress(lease.job_id)
+
+    def mark_partial(self, lease: AutopilotLease, report: str) -> AutopilotProgress:
+        """A finished worker is resumable work, not a verified complete objective."""
+        self._leased_update(
+            lease,
+            "status='partial', report=?, lease_token=NULL, lease_until=NULL, "
+            "updated_at=?, finished_at=?",
+            (report[:_REPORT_LIMIT], time.time(), time.time()),
         )
         return self.progress(lease.job_id)
 
@@ -723,7 +897,7 @@ class AutopilotStore:
                 SELECT id, status, phase, mode, audit_run_id, batch_size,
                        attempts, replans, verification_status, last_error_code,
                        control_requested, lease_generation, last_heartbeat_at,
-                       workflow
+                       workflow, escalation_count, next_operation
                 FROM autopilot_jobs WHERE id = ?
                 """,
                 (job_id,),
@@ -748,6 +922,34 @@ class AutopilotStore:
                 """,
                 (job_id,),
             ).fetchone()
+            receipt_rows = self._connection.execute(
+                """
+                SELECT operation, target, status, start_line, end_line
+                FROM autopilot_tool_receipts WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchall()
+        intervals: dict[str, list[tuple[int, int]]] = {}
+        for receipt in receipt_rows:
+            if (
+                str(receipt["operation"]) == "read_file"
+                and str(receipt["status"]) == "success"
+                and receipt["start_line"] is not None
+                and receipt["end_line"] is not None
+            ):
+                intervals.setdefault(str(receipt["target"]), []).append(
+                    (int(receipt["start_line"]), int(receipt["end_line"]) + 1)
+                )
+        unique_lines = sum(_covered_units(values) for values in intervals.values())
+        changed_files = len(
+            {
+                str(item["target"])
+                for item in receipt_rows
+                if str(item["operation"])
+                in {"write_file", "edit_file", "make_directory", "remove_path"}
+                and str(item["status"]) == "success"
+            }
+        )
         return AutopilotProgress(
             job_id=str(row["id"]),
             status=str(row["status"]),
@@ -779,6 +981,23 @@ class AutopilotStore:
                 else None
             ),
             workflow=str(row["workflow"] or "project-audit"),
+            yielded_units=counts.get("yielded", 0),
+            file_reads=sum(
+                1
+                for item in receipt_rows
+                if str(item["operation"]) == "read_file"
+                and str(item["status"]) == "success"
+            ),
+            unique_lines_read=unique_lines,
+            changed_files=changed_files,
+            checks_run=sum(
+                1
+                for item in receipt_rows
+                if str(item["operation"]) == "run_project_checks"
+                and str(item["status"]) == "success"
+            ),
+            escalation_count=int(row["escalation_count"] or 0),
+            next_operation=str(row["next_operation"] or ""),
         )
 
     def details(self, job_id: str, *, unit_limit: int = 100) -> dict[str, object]:
@@ -802,6 +1021,20 @@ class AutopilotStore:
                     (job_id, max(1, min(unit_limit, 500))),
                 ).fetchall()
             ]
+            receipts = [
+                dict(item)
+                for item in self._connection.execute(
+                    """
+                    SELECT id, unit_id, ordinal, operation, target, status,
+                           content_version, before_sha256, after_sha256,
+                           requested_offset, requested_limit, start_line, end_line,
+                           next_cursor, bytes_returned, result_count, created_at
+                    FROM autopilot_tool_receipts WHERE job_id = ?
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (job_id, max(1, min(unit_limit * 20, 2_000))),
+                ).fetchall()
+            ]
         details = dict(row)
         details.pop("lease_token", None)
         details.pop("lease_until", None)
@@ -818,6 +1051,7 @@ class AutopilotStore:
                 details[name] = []
         details["progress"] = self.progress(job_id).as_dict()
         details["work_units"] = units
+        details["tool_receipts"] = receipts
         return details
 
     def list_jobs(self, *, workspace: Path, limit: int = 50) -> list[dict[str, object]]:
@@ -940,6 +1174,10 @@ class AutopilotStore:
                     lease_until REAL,
                     lease_generation INTEGER NOT NULL DEFAULT 0,
                     last_heartbeat_at REAL,
+                    checkpoint_revision INTEGER NOT NULL DEFAULT 0,
+                    next_operation TEXT NOT NULL DEFAULT '',
+                    escalation_count INTEGER NOT NULL DEFAULT 0,
+                    escalation_history TEXT NOT NULL DEFAULT '[]',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     finished_at REAL
@@ -970,6 +1208,33 @@ class AutopilotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_autopilot_units_job
                     ON autopilot_work_units(job_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS autopilot_tool_receipts (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL
+                        REFERENCES autopilot_jobs(id) ON DELETE CASCADE,
+                    unit_id TEXT NOT NULL
+                        REFERENCES autopilot_work_units(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    content_version TEXT NOT NULL DEFAULT '',
+                    before_sha256 TEXT NOT NULL DEFAULT '',
+                    after_sha256 TEXT NOT NULL DEFAULT '',
+                    requested_offset INTEGER,
+                    requested_limit INTEGER,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    next_cursor INTEGER,
+                    bytes_returned INTEGER,
+                    result_count INTEGER,
+                    created_at REAL NOT NULL,
+                    UNIQUE(unit_id, ordinal)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_autopilot_receipts_job
+                    ON autopilot_tool_receipts(job_id, created_at);
                 """
             )
             columns = {
@@ -985,6 +1250,10 @@ class AutopilotStore:
                 "lease_generation": "INTEGER NOT NULL DEFAULT 0",
                 "last_heartbeat_at": "REAL",
                 "workflow": "TEXT NOT NULL DEFAULT 'project-audit'",
+                "checkpoint_revision": "INTEGER NOT NULL DEFAULT 0",
+                "next_operation": "TEXT NOT NULL DEFAULT ''",
+                "escalation_count": "INTEGER NOT NULL DEFAULT 0",
+                "escalation_history": "TEXT NOT NULL DEFAULT '[]'",
             }
             for name, declaration in migrations.items():
                 if name not in columns:

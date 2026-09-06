@@ -5,6 +5,97 @@
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-09-06
+
+### Добавлено
+
+- Durable runtime ledger для успешных tool receipts, range coverage, счётчиков и
+  конкретной следующей операции между Autopilot units и перезапуском процесса.
+- Range-aware чтение: разные страницы неизменившегося файла разрешены в пределах
+  page/byte budgets, а повтор уже покрытого диапазона отклоняется.
+- Единый Unicode-aware estimator размера prompt с offline fallback и явной
+  уверенностью оценки.
+- Web API/UI для сохраняемых adaptive profiles `fast/standard/reasoning`, лимитов
+  стоимости/latency, local-only и execution escalation.
+- Фактический индикатор памяти `FTS5/BM25 + vector` и состояния vector слоя;
+  offline golden retrieval evaluation с hit@k/MRR.
+- Воспроизводимый live harness `scripts/live_bounded_progress.py`.
+
+### Исправлено
+
+- Soft yield больше не расходует failure retries persistent workflow. Длинная
+  targeted-задача продолжает работу до общего лимита work units без assertion.
+- Исчерпание work-unit ceiling завершается контролируемым blocked state
+  `work_unit_limit_exhausted` с сохранённым прогрессом.
+- Необработанная ошибка фоновой Web-задачи сохраняет redacted exception chain
+  в parent diagnostics, одновременно оставляя безопасный публичный SSE-текст.
+- Статус недоступного vector backend больше не раскрывает локальные пути и сырые
+  исключения.
+
+### Проверено
+
+- Два независимых GLM-5.3 Flash live-прогона: 14 чтений, пять страниц одного
+  файла, restart/resume, partial terminal event и ровно одна итоговая запись.
+- Resume/routing live-сценарии на чистых SQLite, `doctor --live` и browser
+  acceptance adaptive settings/hybrid memory/reindex/sticky header — PASS.
+- `pytest -ra`: 369 passed, 1 planned Windows symlink skip; остальные финальные
+  статические проверки зафиксированы в `IMPLEMENTATION_STATUS.md`.
+
+## [0.25.0] — 2026-09-04
+
+### Исправлено
+
+- Длинная команда продолжения сохраняет task/job identity и исходную цель.
+- Project-change/project-test больше не запускают обязательный полный аудит.
+- Служебный XML closing tag не считается внешним файловым путём; `resume.txt`
+  не считается командой продолжения. Будущее «продолжить» внутри новой задачи
+  не подменяет её основную команду.
+- Новая команда передаётся отдельно от старой цели: прежняя пауза не становится
+  постоянным запретом продолжения. Worker completion не закрывает бизнес-задачу.
+
+### Добавлено
+
+- SQLite checkpoints плана, следующего шага и отдельно подтверждённых tool receipts;
+  CAS/lease fencing, восстановление между Web/CLI units и после restart.
+- Strict semantic intent fallback с ограниченным вызовом и журналом; результаты
+  классификатора не выдают полномочий. GLM-5.3 classifier использует enabled/low.
+- Конфигурируемые fast/standard/reasoning profiles, risk-first routing, фильтры
+  tools/context/cost/latency/local-only, process-local provider cooldown.
+- Ручной/адаптивный выбор в чате, фактическая модель и причина выбора в metadata;
+  текущая цепочка сохраняется без профилей, неизвестные цены не выдумываются.
+- Изолированный live harness `scripts/live_resume_routing.py` и регрессии инцидента.
+
+## [0.24.0] — 2026-09-03
+
+### Добавлено
+
+- Сохранённые authorized tasks, revision/CAS и lease, восстановление области
+  работы при «продолжи», выбор/закрытие задачи в Web, общий resolver Web/CLI.
+- Фактические model attempts в diagnostics schema 3: prompt hash, provider/model,
+  параметры, usage, причины остановки, retry, cancellation и crash recovery.
+- Бюджеты output/model calls/deadline, conservative repetition observe/enforce,
+  контроль отсутствия нового tool evidence, отмена до следующих side effects.
+
+### Исправлено
+
+- Разработка → анализ лога → продолжение больше не наследует ложный постоянный
+  запрет workspace; старые сообщения не переопределяют актуальные runtime-права.
+- Ask/Plan и отозванное разрешение записи ограничивают сохранённую задачу.
+- Web terminal/SSE различают partial, blocked, cancelled и completed; JSONL
+  фиксирует терминальное событие дополнительно к подробностям ошибки.
+- Единые списки до пяти моделей в чате и проверке провайдеров: сортировка по
+  подтверждённым датам, явно подписанный fallback на created, без дублей snapshots
+  при наличии alias и без самовольной смены текущей модели.
+- При смене OpenAI-модели не переносится несовместимый reasoning effort `none`
+  от GPT-5.6 в Pro. Truncated Responses/Chat Completions не принимаются за успех.
+
+### Ограничения
+
+- Sync inference: отмена проверяется на границах model/tool calls, удалённое
+  завершение не подтверждается; детектор повторов не анализирует поток токенов.
+- Каталог не гарантирует inference-доступность. Даты релиза не публикуются всеми
+  провайдерами; неизвестные значения не заменяются вымышленными.
+
 ## [0.23.0] — 2026-09-03
 
 ### Добавлено

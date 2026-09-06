@@ -1702,7 +1702,7 @@ def test_duplicate_read_only_and_web_calls_are_denied_within_turn(
     ]
 
 
-def test_third_read_without_path_mutation_is_denied(tmp_path: Path) -> None:
+def test_duplicate_read_range_is_denied_without_path_mutation(tmp_path: Path) -> None:
     read_call = {
         "name": "read_file",
         "args": {"file_path": "/workspace/repeat.txt"},
@@ -1727,9 +1727,49 @@ def test_third_read_without_path_mutation_is_denied(tmp_path: Path) -> None:
 
     assert [entry.status for entry in runtime.last_tool_audit] == [
         "success",
-        "success",
+        "denied",
         "denied",
     ]
+
+
+def test_third_distinct_read_page_is_allowed(tmp_path: Path) -> None:
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "file_path": "/workspace/pages.txt",
+                            "offset": offset,
+                            "limit": 100,
+                        },
+                        "id": f"read-{offset}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+            for offset in (0, 100, 200)
+        ]
+        + [AIMessage(content="Three distinct pages complete.")]
+    )
+    app_config = _app_config(tmp_path)
+    app_config.prepare_directories()
+    (app_config.workspace / "pages.txt").write_text(
+        "\n".join(f"line-{index}" for index in range(350)),
+        encoding="utf-8",
+    )
+
+    with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        runtime.ask("Прочитай страницы /workspace/pages.txt последовательно.")
+
+    assert [entry.status for entry in runtime.last_tool_audit] == [
+        "success",
+        "success",
+        "success",
+    ]
+    assert [entry.start_line for entry in runtime.last_tool_audit] == [1, 101, 201]
 
 
 def test_stale_edit_allows_one_fresh_read_and_revised_retry(tmp_path: Path) -> None:
@@ -1811,7 +1851,7 @@ def test_stale_edit_allows_one_fresh_read_and_revised_retry(tmp_path: Path) -> N
     assert target.read_text(encoding="utf-8") == "VALUE = 3\n"
     assert [entry.status for entry in runtime.last_tool_audit] == [
         "success",
-        "success",
+        "denied",
         "error",
         "success",
         "success",
@@ -1887,7 +1927,7 @@ def test_second_stale_edit_exhausts_recovery_read(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "CURRENT\n"
     assert [entry.status for entry in runtime.last_tool_audit] == [
         "success",
-        "success",
+        "denied",
         "error",
         "success",
         "error",
@@ -2009,7 +2049,7 @@ def test_recursive_parent_removal_opens_a_new_child_read_state(
 
     assert [entry.status for entry in runtime.last_tool_audit] == [
         "success",
-        "success",
+        "denied",
         "success",
         "error",
     ]

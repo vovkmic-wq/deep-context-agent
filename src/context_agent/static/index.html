@@ -62,7 +62,7 @@
               </aside>
               <div class="chat-main">
                 <div class="chat-header">
-                  <div><p class="eyebrow">Текущая задача</p><h2 id="chat-title">Чат с агентом</h2><small id="current-thread-label">web</small></div>
+                  <div class="chat-identity"><p class="eyebrow">Текущая задача</p><h2 id="chat-title">Чат с агентом</h2><small id="current-thread-label">web</small><span id="memory-badge" class="memory-badge" title="Фактически активные механизмы поиска контекста">Память: проверка…</span></div>
                   <div class="chat-controls">
                     <label class="compact-label">Режим / Mode
                       <select id="chat-mode">
@@ -74,11 +74,24 @@
                         <option value="auto">Авто — большие задачи в Autopilot</option><option value="autopilot">Autopilot — выполнить до результата</option><option value="single-turn">Обычный ответ — один ход</option>
                       </select>
                     </label>
+                    <label class="compact-label">Продолжить задачу / Resume task
+                      <select id="chat-task" title="Выбор применяется только к команде «продолжи»">
+                        <option value="">Автоматически / Auto</option>
+                      </select>
+                    </label>
                     <label class="compact-label">Профиль / Preset
                       <select id="chat-model-preset">
                         <option value="auto">Авто / Auto</option><option value="quality">Качество / Quality</option><option value="balanced">Баланс / Balanced</option><option value="economy">Экономия / Economy</option><option value="local">Локально / Local</option>
                       </select>
                     </label>
+                    <label class="compact-label">Выбор ресурса / Model routing
+                      <select id="chat-model-policy" title="Авто использует настроенные fast/standard/reasoning профили; без профилей — текущую цепочку">
+                        <option value="auto">Авто по задаче / Adaptive</option>
+                        <option value="manual">Выбранная модель / Manual</option>
+                      </select>
+                    </label>
+                    <button type="button" id="finish-saved-task" title="Отметить выбранную сохранённую задачу завершённой">Завершить задачу / Close</button>
+                    <button type="button" id="cancel-saved-task" title="Отменить выбранную сохранённую задачу">Отменить задачу / Cancel</button>
                     <label class="compact-label">Провайдер / Provider
                       <select id="chat-provider" aria-describedby="chat-model-status"></select>
                     </label>
@@ -146,6 +159,22 @@
                 <label>Модель / Model<input id="custom-provider-model" required placeholder="model-name"></label>
                 <label class="full">OpenAI-compatible Base URL<input id="custom-provider-url" type="url" required placeholder="http://127.0.0.1:1234/v1"><span class="help">Локальный HTTP разрешён только для localhost. Для удалённого URL нужен HTTPS и ключ в серверной переменной <code>CUSTOM_COMPANY_API_KEY</code>.</span></label>
                 <div class="form-actions full"><button type="submit">Создать и добавить / Create and add</button></div>
+              </form>
+            </details>
+            <details class="surface adaptive-routing" open>
+              <summary>Адаптивный выбор моделей / Adaptive model routing</summary>
+              <form id="adaptive-routing-form" class="form-grid">
+                <label class="toggle full"><input id="adaptive-enabled" type="checkbox"> Подбирать модель по сложности, инструментам и риску / Enable adaptive routing</label>
+                <label>Лимит стоимости, USD / Cost limit<input id="adaptive-cost-limit" type="number" min="0" max="1000" step="0.0001" value="0"><span class="help">0 — без лимита. Неизвестная стоимость не проходит ненулевой лимит.</span></label>
+                <label>Бюджет задержки, мс / Latency budget<input id="adaptive-latency-budget" type="number" min="0" max="600000" step="1" value="0"><span class="help">0 — без лимита. Учитывается измеренная или заданная задержка.</span></label>
+                <label class="toggle"><input id="adaptive-local-only" type="checkbox"> Только локальные модели / Local only</label>
+                <label class="toggle"><input id="adaptive-escalation" type="checkbox"> Повышать класс модели после подтверждённых сбоев / Escalate on failures</label>
+                <label class="toggle"><input id="adaptive-manual-escalation" type="checkbox"> Разрешить повышение и при ручном выборе / Manual escalation</label>
+                <label>Сбоев до повышения / Failure threshold<input id="adaptive-failure-threshold" type="number" min="1" max="10" step="1" value="2"></label>
+                <label>Максимум повышений / Max escalations<input id="adaptive-max-escalations" type="number" min="0" max="10" step="1" value="2"></label>
+                <label class="full">Профили моделей JSON / Model profiles JSON<textarea id="adaptive-profiles" rows="10" spellcheck="false" aria-describedby="adaptive-help">[]</textarea></label>
+                <p id="adaptive-help" class="help full">Каждый профиль содержит provider, model, tier (fast/standard/reasoning), tools, context_tokens и quality. Стоимость и задержка могут быть null. Frontier-модель вызывается только для сложной или рискованной задачи, а не по умолчанию.</p>
+                <div class="form-actions full"><button type="submit">Сохранить политику / Save policy</button><span id="adaptive-routing-status" class="provider-status" aria-live="polite">Политика ещё не загружена.</span></div>
               </form>
             </details>
             <div id="providers-output" class="provider-list" aria-live="polite"></div>

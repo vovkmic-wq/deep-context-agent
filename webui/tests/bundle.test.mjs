@@ -26,6 +26,9 @@ for (const required of [
   "dca_enter_send",
   "dca_chat_execution",
   "dca_chat_mode",
+  "dca_model_policy",
+  "chat-model-policy",
+  "model_policy",
   "job_progress",
   "job_heartbeat",
   "job_deadline",
@@ -36,6 +39,10 @@ for (const required of [
   "expected_sha256",
   "Log analysis",
   "project-audit",
+  "/api/model-routing",
+  "adaptive-routing-form",
+  "memory-badge",
+  "vector_state",
 ]) {
   if (!source.includes(required)) {
     throw new Error(`Production bundle is missing feature: ${required}`);

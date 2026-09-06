@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deep-context-agent"
-version = "0.23.0"
+version = "0.26.0"
 description = "A persistent, searchable Deep Agents CLI and secure local web UI."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
@@ -44,7 +44,16 @@ context-agent = "context_agent.cli:main"
 packages = ["src/context_agent"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/webui", "/README.md", "/pyproject.toml"]
+include = [
+  "/src", "/tests", "/webui", "/scripts", "/README.md", "/pyproject.toml",
+  "/TECHNICAL_SPEC.md", "/IMPLEMENTATION_PROMPT.md", "/IMPLEMENTATION_STATUS.md",
+  "/WEB_INTERFACE_TECHNICAL_SPECIFICATION.md", "/CHANGELOG.md",
+  "/DEEP_CONTEXT_AGENT_0_24_TASK_CONTINUITY_PROMPT.md",
+  "/DEEP_CONTEXT_AGENT_0_25_RESUME_MODEL_ROUTING_PROMPT.md",
+  "/DEEP_CONTEXT_AGENT_0_26_BOUNDED_PROGRESS_RECOVERY_PROMPT.md",
+  "/AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md",
+  "/TASK_RESUME_MODEL_ROUTING_SPEC.md",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers -p no:cacheprovider"

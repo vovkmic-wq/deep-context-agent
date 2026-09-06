@@ -1,5 +1,64 @@
 # Техническое задание: веб-интерфейс Deep Context Agent
 
+## Дополнение 0.26: handoff, adaptive routing и observable memory
+
+Нормативные требования: `AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md`, прежде
+всего P07/P08/P14/P15; реализация по промпту 0.26. Runtime остаётся общим с CLI, отдельная вкладка
+Autopilot не добавляется.
+
+- Статус показывает конкретный этап, новые страницы/строки, changed files,
+  проверки и soft yield/resume; unit counts не обозначают число файлов.
+- Разделены timestamp heartbeat, elapsed и полезный progress delta. Failed unit
+  с сохранёнными чтениями имеет partial evidence, но не implementation PASS.
+- Смена модели после повторных неудач отображается с причиной и реальным
+  provider/model. Manual требует отдельного trusted opt-in для execution escalation;
+  согласованный transport fallback не меняет значения. Нет скрытого обхода local-only.
+- Принятая задача имеет реальную parent diagnostic запись. Child request IDs,
+  job/unit IDs и Web task ID не подменяются. Кнопка «Диагностика» открывает aggregate
+  и последнюю failed attempt, в том числе для legacy task через поиск её children.
+- SSE/status после restart сохраняют terminal, counters и связь диагностики.
+  Отсутствующий из-за retention/off журнал обозначается явно, без нерабочей ссылки.
+- UI не раскрывает содержимое файлов, ключи, raw errors или абсолютные системные
+  пути. Новые DTO/status values требуют схемных, API, SSE/reload и browser тестов.
+- Не предлагать пользователю вручную выбирать размер этапов. Сохранять безопасную
+  остановку при нехватке обязательного выбора, прав или бюджета.
+- Закреплённый заголовок чата показывает фактическую память: FTS5/BM25 и vector
+  `disabled/lazy/ready/degraded`. Индикатор обновляется после поиска/индексации,
+  не запускает download модели и явно показывает lexical fallback.
+- На вкладке Providers доступна adaptive policy: enable, профили
+  fast/standard/reasoning, cost, latency, local-only и bounded escalation. Политика
+  атомарно сохраняется без ключей и применяется только к следующим запросам.
+- Overview показывает mode/vector/embedding; UI не называет configured hybrid
+  фактически готовым, пока vector backend не наблюдался как ready.
+
+## Дополнение 0.25: продолжение и объяснимый выбор LLM
+
+Применять R1–R6 из `TASK_RESUME_MODEL_ROUTING_SPEC.md`. Chat API возвращает
+структурированный intent и task ID; resume не создаёт новую задачу по тексту
+формулировки. Неоднозначность отображается как необходимость выбрать задачу, не
+как запуск аудита. Статус показывает следующий пункт и выбранный ресурс с причиной;
+heartbeat подписывается как время последней активности. Model routing применяется
+только в auto, ручной выбор сохраняется. Метаданные не содержат цели/секретов.
+
+## Дополнение 0.24: задача и достоверный terminal
+
+Выполнять `DEEP_CONTEXT_AGENT_0_24_TASK_CONTINUITY_PROMPT.md`.
+Chat API разрешает continuation по persisted task identity, thread и workspace;
+неоднозначность/занятость возвращает понятный conflict, не запускает LLM.
+Текущие Ask/Plan и allow-write ограничивают прежние разрешения. Runtime каждый
+ход получает актуальный scope. Анализ лога не заменяет активную задачу.
+API предоставляет ограниченный список resumable tasks и явный task selection.
+SSE/UI различают completed/partial/blocked/failed/cancelled и показывают task ID,
+revision, reason и фактический provider/model. Reload сохраняет terminal.
+Отмена не выдаётся за подтверждённое прекращение удалённого inference.
+
+Выбор/проверка моделей в чате и на вкладке провайдеров: не более пяти выбираемых
+моделей на провайдера, общий серверный список и правила сортировки по основному ТЗ.
+Неизвестные даты не выдумывать; created помечать как дату каталога, не релиз.
+Текущую модель вне пятёрки показывать невыбираемой строкой состояния, не сбрасывать
+выбор и не менять уже выполняющийся запрос. Контролы закрытия/отмены saved task
+используют revision/CAS; только явное подтверждение пользователя закрывает задачу.
+
 ## 1. Назначение
 
 Создать локальный production-интерфейс для Deep Context Agent, который даёт

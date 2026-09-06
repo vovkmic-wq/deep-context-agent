@@ -1,5 +1,7 @@
 "use strict";
 
+import { fillModelChoices } from "./model_choices";
+
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Payload = Record<string, Json>;
 
@@ -115,7 +117,7 @@ function streamTask(
   handler: (name: string, data: Payload) => void,
 ): EventSource {
   const stream = new EventSource(`/api/events/${encodeURIComponent(taskId)}`);
-  const terminal = new Set(["completed", "cancelled", "failed"]);
+  const terminal = new Set(["completed", "partial", "blocked", "cancelled", "failed"]);
   let terminalSeen = false;
   let recoveryPending = false;
   for (const name of [
@@ -131,6 +133,8 @@ function streamTask(
     "scan_progress",
     "result",
     "completed",
+    "partial",
+    "blocked",
     "cancelled",
     "failed",
   ]) {
@@ -320,6 +324,8 @@ async function sendChatMessage(): Promise<void> {
         execution_mode: value("chat-execution"),
         provider: value("chat-provider"),
         model: value("chat-model"),
+        model_policy: value("chat-model-policy"),
+        continuation_task_id: value("chat-task") || undefined,
       }),
     });
     taskId = text(result.task_id);
@@ -369,6 +375,12 @@ async function sendChatMessage(): Promise<void> {
       }
       if (name === "message") {
         pending.textContent = text(data.text);
+        const metadata = data.runtime as Payload | undefined;
+        const modelRoute = metadata?.model_routing as Payload | undefined;
+        if (metadata) {
+          element("chat-model-status").textContent =
+            `Фактически: ${text(metadata.provider)} / ${text(metadata.model)} · ${text(modelRoute?.mode)} · ${text(modelRoute?.reason)}`;
+        }
         pending.parentElement?.classList.remove("pending");
         activeChatJob = text(data.job_id) || activeChatJob;
       }
@@ -380,7 +392,12 @@ async function sendChatMessage(): Promise<void> {
         pending.textContent = "Операция отменена.";
         pending.parentElement?.classList.remove("pending");
       }
-      if (["completed", "cancelled", "failed"].includes(name)) {
+      if (name === "partial" || name === "blocked") {
+        const label = name === "partial" ? "Частичный результат" : "Задача остановлена";
+        pending.textContent += `\n\n${label}. ${text(data.message)} Диагностика: ${text(data.request_id)}.`;
+        pending.parentElement?.classList.remove("pending");
+      }
+      if (["completed", "partial", "blocked", "cancelled", "failed"].includes(name)) {
         activeChatTasks.delete(taskId);
         updateCancelButton();
         void Promise.all([refreshThreads(), refreshChatJobs()]);
@@ -447,7 +464,8 @@ function formatJobProgress(data: Payload, eventName: string): string {
   const fileProgress = total
     ? `, файлы ${reviewed || "0"}/${total}, ожидают ${pending || "0"}`
     : "";
-  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, связь ${heartbeat}${fileProgress}, units ${text(data.completed_units)}/${text(data.attempts)}, interrupted ${text(data.interrupted_units)}, replans ${text(data.replans)}.`;
+  const nextStep = data.next_step ? ` Следующий шаг: ${text(data.next_step)}.` : "";
+  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, последняя активность в ${heartbeat}${fileProgress}, units ${text(data.completed_units)}/${text(data.attempts)}, interrupted ${text(data.interrupted_units)}, replans ${text(data.replans)}.${nextStep}`;
 }
 
 function showJobSummary(data: Payload): void {
@@ -468,6 +486,25 @@ function showJobSummary(data: Payload): void {
 }
 
 async function refreshChatJobs(): Promise<void> {
+  const selected = value("chat-task");
+  const objectives = await api<{items: Payload[]}>(
+    `/api/threads/${encodeURIComponent(currentThread)}/active-tasks`,
+  );
+  const selector = element<HTMLSelectElement>("chat-task");
+  selector.replaceChildren(new Option("Автоматически / Auto", ""));
+  for (const task of objectives.items) {
+    if (["partial", "blocked", "interrupted", "running"].includes(text(task.status))) {
+      const option = new Option(
+        `${text(task.task_id).slice(0, 8)} · ${text(task.workflow)} · ${text(task.status)} · r${text(task.revision)}`,
+        text(task.task_id),
+      );
+      option.dataset.revision = text(task.revision);
+      selector.add(option);
+    }
+  }
+  if (Array.from(selector.options).some((option) => option.value === selected)) {
+    selector.value = selected;
+  }
   const output = element("chat-job-list");
   output.replaceChildren();
   const result = await api<{ items: Payload[]; request_id: string }>(
@@ -729,25 +766,17 @@ async function loadProviderModelOptions(
       models: Json[];
       partial: boolean;
       message?: string;
+      date_note?: string;
+      model_details?: Payload[];
       request_id: string;
     }>(`/api/providers/${encodeURIComponent(provider)}/models`);
     if (generation !== providerRenderGeneration || !select.isConnected) return;
-    const models = result.models.map((model) => text(model));
-    if (configuredModel && !models.includes(configuredModel)) {
-      models.unshift(configuredModel);
-    }
-    select.replaceChildren();
-    for (const model of models) {
-      const option = document.createElement("option");
-      option.value = model;
-      option.textContent = model;
-      select.append(option);
-    }
-    select.value = configuredModel || models[0] || "";
+    const models = result.models.map((model) => text(model)).slice(0, 5);
+    fillModelChoices(select, models, configuredModel, result.model_details);
     select.disabled = models.length === 0;
     select.title = result.partial
       ? `Частичный список: ${text(result.message)}`
-      : `Доступно моделей: ${models.length}`;
+      : `${result.date_note || "Последние модели"} В списке: ${models.length}`;
   } catch (error) {
     if (generation !== providerRenderGeneration || !select.isConnected) return;
     select.disabled = !configuredModel;
@@ -990,24 +1019,18 @@ async function loadChatModels(
       models: Json[];
       partial: boolean;
       message?: string;
+      date_note?: string;
+      model_details?: Payload[];
       request_id: string;
     }>(`/api/providers/${encodeURIComponent(provider)}/models`);
     if (requestNumber !== modelCatalogRequest) return;
-    const previous = preferred || select.value;
-    select.replaceChildren();
-    for (const model of result.models) {
-      const option = document.createElement("option");
-      option.value = text(model);
-      option.textContent = text(model);
-      select.append(option);
-    }
-    if (result.models.some((model) => text(model) === previous)) {
-      select.value = previous;
-    }
+    const configured = providerCatalog.find((item) => text(item.provider) === provider);
+    const previous = preferred || text(configured?.model);
+    fillModelChoices(select, result.models.map((model) => text(model)), previous, result.model_details);
     select.disabled = !result.models.length;
     element("chat-model-status").textContent = result.partial
       ? `Частичный список: ${text(result.message)} Текущую модель можно использовать.`
-      : `Доступно моделей: ${result.models.length}. Выбор сохранится для этой задачи.`;
+      : `${result.date_note || "Последние модели"} В списке: ${result.models.length}. Выбор сохранится для этой задачи.`;
   } catch (error) {
     if (requestNumber !== modelCatalogRequest) return;
     const providerItem = providerCatalog.find(
@@ -1052,6 +1075,10 @@ async function saveThreadModelPreference(): Promise<void> {
 }
 
 async function applyModelPreset(preset: string): Promise<void> {
+  if (preset === "auto") {
+    setModelPolicy("auto");
+    return;
+  }
   const configured = providerCatalog.filter((item) => Boolean(item.configured));
   if (!configured.length) return;
   const active = activeProviders[0] || text(configured[0]?.provider);
@@ -1089,6 +1116,7 @@ async function applyModelPreset(preset: string): Promise<void> {
     );
     if (matching) modelSelect.value = matching;
   }
+  setModelPolicy("manual");
   await saveThreadModelPreference();
 }
 
@@ -1147,16 +1175,44 @@ async function loadSettings(): Promise<void> {
   }
 }
 
-async function bootstrap(): Promise<void> {
-  const runtime = await api<Payload>("/api/runtime");
-  csrfToken = text(runtime.csrf_token);
-  element("runtime-badge").textContent =
-    `${text(runtime.provider)}/${text(runtime.model)}`;
-  element("workspace-badge").textContent = text(runtime.workspace);
+function renderMemoryStatus(retrieval: Payload): void {
+  const vector =
+    retrieval.vector && typeof retrieval.vector === "object"
+      ? (retrieval.vector as Payload)
+      : {};
+  const state = text(retrieval.vector_state) || "disabled";
+  const label =
+    state === "ready"
+      ? "Память: RAG · FTS5/BM25 + vector"
+      : state === "lazy"
+        ? "Память: RAG · vector загружается лениво"
+        : state === "degraded"
+          ? "Память: FTS5/BM25 · vector недоступен"
+          : "Память: FTS5/BM25";
+  const badge = element("memory-badge");
+  badge.textContent = label;
+  badge.classList.toggle("degraded", state === "degraded");
+  badge.title = [
+    `Режим: ${text(retrieval.mode) || "lexical-only"}`,
+    `Лексический поиск: ${text(retrieval.lexical) || "sqlite-fts5-bm25"}`,
+    `Векторный поиск: ${state}`,
+    text(vector.model) ? `Embedding: ${text(vector.model)}` : "",
+    text(vector.last_error) ? `Ошибка: ${text(vector.last_error)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function renderRuntimeOverview(runtime: Payload): void {
   const retrieval =
     runtime.retrieval && typeof runtime.retrieval === "object"
       ? (runtime.retrieval as Payload)
       : {};
+  const vector =
+    retrieval.vector && typeof retrieval.vector === "object"
+      ? (retrieval.vector as Payload)
+      : {};
+  renderMemoryStatus(retrieval);
   const metrics = element("overview-grid");
   metrics.replaceChildren();
   for (const [name, metricValue] of [
@@ -1165,7 +1221,8 @@ async function bootstrap(): Promise<void> {
     ["Активные задачи", runtime.active_tasks],
     ["Провайдеров в цепочке", (runtime.provider_priority as Json[]).length],
     ["Память / Memory", retrieval.mode],
-    ["Embedding", retrieval.embedding_model],
+    ["Вектор / Vector", retrieval.vector_state],
+    ["Embedding", vector.model],
   ] as Array<[string, Json]>) {
     const node = document.createElement("div");
     node.className = "metric";
@@ -1174,6 +1231,91 @@ async function bootstrap(): Promise<void> {
     node.append(strong, document.createTextNode(name));
     metrics.append(node);
   }
+}
+
+async function refreshRuntimeStatus(renderOverview = false): Promise<Payload> {
+  const runtime = await api<Payload>("/api/runtime");
+  if (runtime.csrf_token) csrfToken = text(runtime.csrf_token);
+  element("runtime-badge").textContent =
+    `${text(runtime.provider)}/${text(runtime.model)}`;
+  element("workspace-badge").textContent = text(runtime.workspace);
+  const retrieval =
+    runtime.retrieval && typeof runtime.retrieval === "object"
+      ? (runtime.retrieval as Payload)
+      : {};
+  renderMemoryStatus(retrieval);
+  if (renderOverview) renderRuntimeOverview(runtime);
+  return runtime;
+}
+
+async function loadAdaptiveRouting(): Promise<void> {
+  const result = await api<{ settings: Payload; request_id: string }>(
+    "/api/model-routing",
+  );
+  const settings = result.settings;
+  element<HTMLInputElement>("adaptive-enabled").checked = Boolean(settings.enabled);
+  element<HTMLInputElement>("adaptive-local-only").checked = Boolean(
+    settings.local_only,
+  );
+  element<HTMLInputElement>("adaptive-escalation").checked = Boolean(
+    settings.execution_escalation_enabled,
+  );
+  element<HTMLInputElement>("adaptive-manual-escalation").checked = Boolean(
+    settings.manual_execution_escalation,
+  );
+  element<HTMLInputElement>("adaptive-cost-limit").value = text(
+    settings.cost_limit_usd,
+  );
+  element<HTMLInputElement>("adaptive-latency-budget").value = text(
+    settings.latency_budget_ms,
+  );
+  element<HTMLInputElement>("adaptive-failure-threshold").value = text(
+    settings.failure_threshold,
+  );
+  element<HTMLInputElement>("adaptive-max-escalations").value = text(
+    settings.max_escalations,
+  );
+  element<HTMLTextAreaElement>("adaptive-profiles").value = JSON.stringify(
+    settings.profiles || [],
+    null,
+    2,
+  );
+  const count = Array.isArray(settings.profiles) ? settings.profiles.length : 0;
+  element("adaptive-routing-status").textContent = settings.enabled
+    ? `Адаптивный режим: профилей ${count}. Изменения применяются к следующему запросу.`
+    : "Адаптивный режим выключен: используется приоритетная цепочка провайдеров.";
+}
+
+async function saveAdaptiveRouting(): Promise<void> {
+  let profiles: Json;
+  try {
+    profiles = JSON.parse(value("adaptive-profiles")) as Json;
+  } catch {
+    throw new Error("Профили моделей должны быть корректным JSON-массивом.");
+  }
+  if (!Array.isArray(profiles)) {
+    throw new Error("Профили моделей должны быть JSON-массивом.");
+  }
+  await api("/api/model-routing", {
+    method: "PUT",
+    body: JSON.stringify({
+      enabled: checked("adaptive-enabled"),
+      profiles,
+      cost_limit_usd: Number(value("adaptive-cost-limit")),
+      latency_budget_ms: Number(value("adaptive-latency-budget")),
+      local_only: checked("adaptive-local-only"),
+      execution_escalation_enabled: checked("adaptive-escalation"),
+      manual_execution_escalation: checked("adaptive-manual-escalation"),
+      failure_threshold: Number(value("adaptive-failure-threshold")),
+      max_escalations: Number(value("adaptive-max-escalations")),
+    }),
+  });
+  await Promise.all([loadAdaptiveRouting(), refreshRuntimeStatus(true)]);
+  showToast("Политика адаптивного выбора моделей сохранена");
+}
+
+async function bootstrap(): Promise<void> {
+  await refreshRuntimeStatus(true);
   const health = await api<Payload>("/api/health");
   element("health").textContent = JSON.stringify(health, null, 2);
   await refreshProviders();
@@ -1181,6 +1323,7 @@ async function bootstrap(): Promise<void> {
     refreshChatJobs(),
     refreshThreads(),
     loadSettings(),
+    loadAdaptiveRouting(),
     loadDirectory("/workspace", false),
     loadThreadModelPreference(currentThread),
   ]);
@@ -1261,6 +1404,25 @@ chatQuery.addEventListener("keydown", (event) => {
 });
 
 const enterSend = element<HTMLInputElement>("enter-send");
+for (const [id, status] of [["finish-saved-task", "completed"], ["cancel-saved-task", "cancelled"]]) {
+  element(id).addEventListener("click", async () => {
+    const select = element<HTMLSelectElement>("chat-task");
+    const revision = Number(select.selectedOptions[0]?.dataset.revision);
+    if (!select.value || !revision) {
+      showToast("Сначала выберите конкретную сохранённую задачу.");
+      return;
+    }
+    if (!window.confirm(status === "completed" ? "Вы подтверждаете завершение выбранной задачи?" : "Отменить выбранную задачу?")) return;
+    try {
+      await api(`/api/threads/${encodeURIComponent(currentThread)}/active-tasks/${encodeURIComponent(select.value)}`, {
+        method: "PATCH", body: JSON.stringify({status, revision}),
+      });
+      await refreshChatJobs();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Ошибка состояния задачи");
+    }
+  });
+}
 enterSend.checked = window.localStorage.getItem("dca_enter_send") === "true";
 enterSend.addEventListener("change", () => {
   window.localStorage.setItem("dca_enter_send", String(enterSend.checked));
@@ -1287,10 +1449,24 @@ chatMode.value = ["agent", "ask", "plan", "debug", "multitask"].includes(
 applyChatMode(chatMode.value, false);
 chatMode.addEventListener("change", () => applyChatMode(chatMode.value));
 
+function setModelPolicy(policy: string): void {
+  const normalized = policy === "manual" ? "manual" : "auto";
+  element<HTMLSelectElement>("chat-model-policy").value = normalized;
+  window.localStorage.setItem("dca_model_policy", normalized);
+  element("chat-model-status").textContent = normalized === "auto"
+    ? "Автовыбор по задаче. Без настроенных профилей используется цепочка провайдеров."
+    : "Ручной выбор модели для следующего запроса; согласованный резерв сохраняется.";
+}
+setModelPolicy(window.localStorage.getItem("dca_model_policy") || "auto");
+element("chat-model-policy").addEventListener("change", () =>
+  setModelPolicy(value("chat-model-policy")),
+);
+
 element<HTMLSelectElement>("chat-provider").addEventListener(
   "change",
   async () => {
     try {
+      setModelPolicy("manual");
       await loadChatModels(value("chat-provider"));
       await saveThreadModelPreference();
     } catch (error) {
@@ -1300,6 +1476,7 @@ element<HTMLSelectElement>("chat-provider").addEventListener(
 );
 
 element<HTMLSelectElement>("chat-model").addEventListener("change", () => {
+  setModelPolicy("manual");
   void saveThreadModelPreference().catch((error: Error) =>
     showToast(error.message),
   );
@@ -1338,7 +1515,11 @@ element<HTMLFormElement>("context-form").addEventListener(
     try {
       const query = encodeURIComponent(value("context-query"));
       const limit = Number(value("context-limit"));
-      const result = await api<{ items: Payload[]; request_id: string }>(
+      const result = await api<{
+        items: Payload[];
+        retrieval?: Payload;
+        request_id: string;
+      }>(
         `/api/context/search?query=${query}&limit=${limit}`,
       );
       for (const item of result.items) {
@@ -1351,6 +1532,9 @@ element<HTMLFormElement>("context-form").addEventListener(
       }
       if (!result.items.length) {
         output.append(card("Нет результатов", "Попробуйте более точный запрос."));
+      }
+      if (result.retrieval && typeof result.retrieval === "object") {
+        renderMemoryStatus(result.retrieval as Payload);
       }
     } catch (error) {
       showToast(error instanceof Error ? error.message : "Ошибка поиска");
@@ -1390,11 +1574,12 @@ element("index-workspace").addEventListener("click", async () => {
           `${partial ? "Частичный результат" : "Готово"}: просмотрено ${text(report.files_scanned)}, новых ${text(report.files_indexed)}, без изменений ${text(report.files_unchanged)}, пропущено ${text(report.files_skipped)}, фрагментов ${text(report.chunks_written)}.${partial ? " Нажмите «Продолжить индексацию»." : ""}`,
           partial ? "normal" : "success",
         );
+        void refreshRuntimeStatus(true).catch(() => undefined);
       }
       if (name === "failed") {
         setOperationStatus("index-status", text(data.message), "error");
       }
-      if (["completed", "cancelled", "failed"].includes(name)) {
+      if (["completed", "partial", "blocked", "cancelled", "failed"].includes(name)) {
         button.disabled = false;
       }
     });
@@ -1462,6 +1647,14 @@ element<HTMLFormElement>("custom-provider-form").addEventListener(
   (event) => {
     event.preventDefault();
     void createCustomProvider().catch((error: Error) => showToast(error.message));
+  },
+);
+
+element<HTMLFormElement>("adaptive-routing-form").addEventListener(
+  "submit",
+  (event) => {
+    event.preventDefault();
+    void saveAdaptiveRouting().catch((error: Error) => showToast(error.message));
   },
 );
 

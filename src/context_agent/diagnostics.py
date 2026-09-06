@@ -35,7 +35,7 @@ _PROVIDER_KEY_PATTERN = re.compile(
     r"(?i)\b(?:sk-(?:proj-)?|zai[-_]|ya29\.)[a-z0-9_-]{10,}"
 )
 _MARKED_SECRET_PATTERN = re.compile(r"(?iu)\b(?:DO_NOT_SHOW|НЕ_ПОКАЗЫВАТЬ)[=:][^\s,;]+")
-_TERMINAL_EVENTS = frozenset({"completed", "cancelled", "failed"})
+_TERMINAL_EVENTS = frozenset({"completed", "partial", "blocked", "cancelled", "failed"})
 _SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
@@ -76,6 +76,20 @@ def classify_failure(exc: BaseException) -> str:
     for _depth in range(8):
         if current is None:
             break
+        code = getattr(current, "code", None)
+        if code in {
+            "task_cancelled",
+            "task_deadline",
+            "model_attempt_budget",
+            "no_verified_progress",
+            "generation_truncated",
+            "generation_repetition",
+            "task_authority_lost",
+            "model_route_unavailable",
+            "soft_yield",
+            "runtime_ledger_unavailable",
+        }:
+            return str(code)
         parts.extend((type(current).__name__, str(current)))
         current = current.__cause__ or current.__context__
     normalized = " ".join(parts).casefold()
@@ -201,7 +215,7 @@ def _neutral_query_preview(text: str) -> str:
 class DiagnosticStore:
     """Thread-safe SQLite journal deliberately isolated from agent rollback."""
 
-    schema_version = 2
+    schema_version = 3
 
     def __init__(
         self,
@@ -301,6 +315,16 @@ class DiagnosticStore:
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS model_generations (
+            attempt_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL REFERENCES request_attempts(request_id)
+                ON DELETE CASCADE,
+            created_at_utc TEXT NOT NULL,
+            finished_at_utc TEXT,
+            metadata_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS model_generations_request
+        ON model_generations(request_id);
         """
         try:
             with self._lock, self._connection:
@@ -325,6 +349,100 @@ class DiagnosticStore:
                 self._connection.execute(f"PRAGMA user_version={self.schema_version}")
         except sqlite3.Error as exc:
             raise DiagnosticStoreError("Cannot initialize diagnostics SQLite") from exc
+
+    def record_model_attempt(
+        self, request_id: str, record: Mapping[str, object]
+    ) -> None:
+        """Commit a bounded metadata-only attempt before inference and at its end."""
+        safe: dict[str, object] = {}
+        for name in (
+            "attempt_id",
+            "provider",
+            "model",
+            "status",
+            "finish_reason",
+            "stop_reason",
+            "error_type",
+            "cancellation",
+            "reasoning_effort",
+        ):
+            value = record.get(name)
+            safe[name] = (
+                None
+                if value is None
+                else _safe_name(
+                    redact_sensitive_text(str(value), known_secrets=self.known_secrets)
+                )
+            )
+        for name in (
+            "ordinal",
+            "input_tokens",
+            "output_tokens",
+            "duration_ms",
+            "max_output_tokens",
+            "retry_count",
+        ):
+            value = record.get(name)
+            safe[name] = value if type(value) is int and value >= 0 else None
+        model = redact_sensitive_text(
+            str(record.get("model", "unknown")),
+            known_secrets=self.known_secrets,
+        )
+        safe["model"] = model if re.fullmatch(r"[\w./:-]{1,200}", model) else "unknown"
+        digest = str(record.get("prompt_sha256", ""))
+        safe["prompt_sha256"] = digest if _SHA256_PATTERN.fullmatch(digest) else None
+        safe["repetition_detected"] = bool(record.get("repetition_detected", False))
+        route = record.get("model_route")
+        if isinstance(route, dict):
+            safe["model_route"] = {
+                key: redact_sensitive_text(value, known_secrets=self.known_secrets)[
+                    :200
+                ]
+                if isinstance(value, str)
+                else value
+                for key, value in route.items()
+                if key
+                in {
+                    "mode",
+                    "reason",
+                    "tier",
+                    "input_tokens_estimate",
+                    "estimated_cost_usd",
+                    "eligible_candidates",
+                }
+                and isinstance(value, (str, int, float, type(None)))
+            }
+        temperature = record.get("temperature")
+        safe["temperature"] = (
+            temperature
+            if isinstance(temperature, (int, float)) and 0 <= temperature <= 2
+            else None
+        )
+        finished = utc_now() if record.get("status") != "running" else None
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO model_generations VALUES (?,?,?,?,?) "
+                "ON CONFLICT(attempt_id) DO UPDATE SET "
+                "finished_at_utc=excluded.finished_at_utc, "
+                "metadata_json=excluded.metadata_json",
+                (safe["attempt_id"], request_id, utc_now(), finished, _json(safe)),
+            )
+
+    def model_attempts(self, request_id: str) -> list[dict[str, object]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM model_generations WHERE request_id=? "
+                "ORDER BY rowid LIMIT 1000",
+                (request_id,),
+            ).fetchall()
+        return [
+            {
+                **json.loads(row["metadata_json"]),
+                "created_at_utc": row["created_at_utc"],
+                "finished_at_utc": row["finished_at_utc"],
+            }
+            for row in rows
+        ]
 
     def _query_payload(self, query: str) -> tuple[str | None, str, str, int, bool]:
         raw = query.encode("utf-8")
@@ -481,6 +599,40 @@ class DiagnosticStore:
                 "provider_unavailable",
             },
         )
+
+    def finish_parent(
+        self,
+        request_id: str | None,
+        *,
+        status: str,
+        duration_ms: int,
+        error_code: str | None = None,
+    ) -> None:
+        """Finish an accepted async parent without inventing child evidence."""
+
+        if request_id is None or status not in {
+            "completed",
+            "partial",
+            "blocked",
+            "cancelled",
+            "failed",
+        }:
+            return
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE request_attempts
+                SET status = ?, finished_at_utc = ?, duration_ms = ?, error_code = ?
+                WHERE request_id = ? AND status = 'in_progress'
+                """,
+                (
+                    status,
+                    utc_now(),
+                    max(0, duration_ms),
+                    error_code[:100] if error_code else None,
+                    request_id,
+                ),
+            )
 
     def _finish_request(
         self,
@@ -764,6 +916,22 @@ class DiagnosticStore:
             },
         }
         with self._lock, self._connection:
+            for row in self._connection.execute(
+                "SELECT g.attempt_id, g.metadata_json FROM model_generations g "
+                "JOIN request_attempts r ON r.request_id=g.request_id "
+                "WHERE r.status='in_progress' AND g.finished_at_utc IS NULL"
+            ).fetchall():
+                metadata = json.loads(row["metadata_json"])
+                metadata.update(
+                    status="interrupted",
+                    stop_reason="process_restart_or_crash",
+                    cancellation="remote_unconfirmed",
+                )
+                self._connection.execute(
+                    "UPDATE model_generations SET finished_at_utc=?,metadata_json=? "
+                    "WHERE attempt_id=?",
+                    (now, _json(metadata), row["attempt_id"]),
+                )
             requests = self._connection.execute(
                 """
                 UPDATE request_attempts
@@ -837,12 +1005,65 @@ class DiagnosticStore:
                 "exception_chain": json.loads(str(row["exception_chain_json"])),
                 "baseline_checkpoint_id": row["baseline_checkpoint_id"],
                 "retryable": bool(row["retryable"]),
+                "model_generations": self.model_attempts(request_id),
             }
         )
+        with self._lock:
+            children = self._connection.execute(
+                """
+                SELECT request_id, parent_request_id, task_id, thread_id,
+                       operation_kind, source, app_version, status,
+                       created_at_utc, finished_at_utc, duration_ms, query_mode,
+                       query_sha256, query_bytes, query_truncated, query_preview,
+                       provider_priority_json, provider_attempts_json,
+                       rollback_attempted, rollback_success,
+                       rollback_checkpoint_rows, rollback_write_rows,
+                       filesystem_side_effects, error_code
+                FROM request_attempts WHERE parent_request_id = ?
+                ORDER BY created_at_utc, rowid LIMIT 1000
+                """,
+                (request_id,),
+            ).fetchall()
+        result["children"] = [self._summary(child) for child in children]
         if include_query:
             result["query"] = row["query_text"]
             result["query_available"] = row["query_text"] is not None
         return result
+
+    def resolve_request(
+        self,
+        reference_id: str,
+        *,
+        include_query: bool = False,
+    ) -> dict[str, object]:
+        """Resolve a request, Web task, or legacy task reference."""
+
+        try:
+            return self.request(reference_id, include_query=include_query)
+        except KeyError:
+            pass
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT request_id FROM request_attempts
+                WHERE task_id = ?
+                ORDER BY created_at_utc DESC, rowid DESC LIMIT 1
+                """,
+                (reference_id,),
+            ).fetchone()
+            if row is None:
+                task = self._connection.execute(
+                    "SELECT request_id FROM web_tasks WHERE task_id = ?",
+                    (reference_id,),
+                ).fetchone()
+                request_id = (
+                    str(task["request_id"]) if task and task["request_id"] else ""
+                )
+            else:
+                request_id = str(row["request_id"])
+        if not request_id:
+            raise KeyError(reference_id)
+        return self.request(request_id, include_query=include_query)
 
     @staticmethod
     def _summary(row: sqlite3.Row) -> dict[str, object]:
