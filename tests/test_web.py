@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -851,6 +852,163 @@ def test_terminal_task_replays_after_web_process_restart(
     assert status.json()["terminal"]["retryable"] is True
     assert "event: failed" in replay.text
     assert "PRIVATE_RESTART_DETAIL" not in replay.text
+
+
+def test_web_startup_reconciles_queued_autopilot_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    objective = "Resume this queued audit"
+    with AutopilotStore(config.autopilot_database) as store:
+        job_id = store.enqueue(
+            thread_id="restart-scheduler",
+            objective=objective,
+            workspace=config.workspace,
+            allow_write=False,
+            batch_size=1,
+        )
+
+    class _RecoveredRuntime:
+        def __enter__(self) -> _RecoveredRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def run_autopilot_job(self, requested: str, **kwargs: object) -> str:
+            assert requested == objective
+            with AutopilotStore(config.autopilot_database) as store:
+                progress, lease = store.start_or_resume(
+                    thread_id=str(kwargs["thread_id"]),
+                    objective=requested,
+                    workspace=config.workspace,
+                    allow_write=bool(kwargs["allow_write"]),
+                    batch_size=1,
+                )
+                store.mark_complete(lease, "Recovered after restart")
+            return f"completed {progress.job_id}"
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _RecoveredRuntime(),
+    )
+    with TestClient(create_app(config, (_provider(),))) as client:
+        deadline = time.monotonic() + 5
+        status = "queued"
+        while time.monotonic() < deadline and status != "complete":
+            status = str(client.get(f"/api/jobs/{job_id}").json()["job"]["status"])
+            if status != "complete":
+                time.sleep(0.01)
+
+    assert status == "complete"
+
+
+def test_resume_preserves_project_change_workflow_phase_and_job_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    objective = "Implement the saved service change"
+    with AutopilotStore(config.autopilot_database) as store:
+        progress, lease = store.start_or_resume(
+            thread_id="resume-project-change",
+            objective=objective,
+            workspace=config.workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+        )
+        store.transition_phase(lease, "plan", reason="discovery-covered")
+        store.transition_phase(lease, "implement", reason="operation-ready")
+        blocked = store.mark_blocked(
+            lease,
+            error_code="implementation_blocked_missing_information",
+            safe_message="One prerequisite was missing.",
+        )
+        job_id = progress.job_id
+        revision = blocked.checkpoint_revision
+
+    class _RecoveredRuntime:
+        _provider_failover_middleware = SimpleNamespace(
+            runtime_metadata=lambda: {
+                "provider": "lmstudio",
+                "model": "test-model",
+            }
+        )
+
+        def __enter__(self) -> _RecoveredRuntime:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def run_autopilot_job(self, requested: str, **kwargs: object) -> str:
+            assert requested == objective
+            assert kwargs["workflow"] == "project-change"
+            with AutopilotStore(config.autopilot_database) as store:
+                running, current_lease = store.start_or_resume(
+                    thread_id=str(kwargs["thread_id"]),
+                    objective=requested,
+                    workspace=config.workspace,
+                    allow_write=bool(kwargs["allow_write"]),
+                    batch_size=1,
+                    workflow=str(kwargs["workflow"]),
+                )
+                assert running.job_id == job_id
+                assert running.phase == "implement"
+                store.mark_complete(current_lease, "Resumed exact task")
+            return "Resumed exact task"
+
+    monkeypatch.setattr(
+        "context_agent.web._runtime_factory",
+        lambda *_args, **_kwargs: _RecoveredRuntime(),
+    )
+    with TestClient(create_app(config, (_provider(),))) as client:
+        csrf = str(client.get("/api/runtime").json()["csrf_token"])
+        stale = client.post(
+            f"/api/jobs/{job_id}/resume",
+            json={"revision": revision - 1},
+            headers={"x-csrf-token": csrf},
+        )
+        resumed = client.post(
+            f"/api/jobs/{job_id}/resume",
+            json={"revision": revision},
+            headers={"x-csrf-token": csrf},
+        )
+        stream = client.get(f"/api/events/{resumed.json()['task_id']}")
+        details = client.get(f"/api/jobs/{job_id}").json()["job"]
+
+    assert stale.status_code == 409
+    assert resumed.status_code == 202
+    assert resumed.json()["job_id"] == job_id
+    assert "event: completed" in stream.text
+    assert details["workflow"] == "project-change"
+    assert details["status"] == "complete"
+
+
+def test_sse_last_event_id_replays_only_newer_persisted_events(tmp_path: Path) -> None:
+    client, csrf, config = _client(tmp_path)
+    (config.workspace / "replay.txt").write_text("REPLAY\n", encoding="utf-8")
+    started = client.post(
+        "/api/context/index",
+        json={"path": "/workspace"},
+        headers={"x-csrf-token": csrf},
+    )
+    task_id = str(started.json()["task_id"])
+    first = client.get(f"/api/events/{task_id}")
+    replay = client.get(
+        f"/api/events/{task_id}",
+        headers={"Last-Event-ID": "1"},
+    )
+
+    assert first.status_code == 200
+    assert "id: 1\n" in first.text
+    assert replay.status_code == 200
+    assert "id: 1\n" not in replay.text
+    assert "event: completed" in replay.text
 
 
 def test_diagnostic_api_hides_query_by_default_and_purges_explicit_id(

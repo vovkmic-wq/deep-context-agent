@@ -329,6 +329,7 @@ async function sendChatMessage(): Promise<void> {
       }),
     });
     taskId = text(result.task_id);
+    activeChatJob = text(result.job_id) || activeChatJob;
     activeChatTasks.add(taskId);
     updateCancelButton();
     const initialRouting =
@@ -465,7 +466,23 @@ function formatJobProgress(data: Payload, eventName: string): string {
     ? `, файлы ${reviewed || "0"}/${total}, ожидают ${pending || "0"}`
     : "";
   const nextStep = data.next_step ? ` Следующий шаг: ${text(data.next_step)}.` : "";
-  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, последняя активность в ${heartbeat}${fileProgress}, units ${text(data.completed_units)}/${text(data.attempts)}, interrupted ${text(data.interrupted_units)}, replans ${text(data.replans)}.${nextStep}`;
+  const activeRemaining = Math.max(
+    0,
+    Number(data.active_time_remaining_seconds || 0),
+  );
+  const wallRemaining = Math.max(
+    0,
+    Number(data.wall_time_remaining_seconds || 0),
+  );
+  const budgets =
+    data.active_time_limit_seconds || data.wall_time_limit_seconds
+      ? `, модель / model ${Math.round(Number(data.model_turn_timeout_seconds || 0))} с, этап / unit осталось ${Math.round(Number(data.unit_time_remaining_seconds || 0))} с, активно / active осталось ${Math.round(activeRemaining)} с, срок / TTL ${Math.round(wallRemaining)} с`
+      : "";
+  const discovery =
+    Number(data.discovery_units || 0) || text(data.phase) === "discover"
+      ? `, изучение ${text(data.discovery_units)}, точечное ${text(data.targeted_discovery_units)}, чтения ${text(data.file_reads)}, поиски ${text(data.discovery_searches)}, строки ${text(data.unique_lines_read)}`
+      : "";
+  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, последняя активность в ${heartbeat}${fileProgress}, units завершено ${text(data.completed_units)}, передано ${text(data.yielded_units)}, ошибок ${text(data.failed_units)}, прервано ${text(data.interrupted_units)}, replans ${text(data.replans)}, файлов изменено ${text(data.changed_files)}, проверок ${text(data.checks_run)}${discovery}${budgets}.${nextStep}`;
 }
 
 function showJobSummary(data: Payload): void {
@@ -480,7 +497,7 @@ function showJobSummary(data: Payload): void {
   status.hidden = false;
   setOperationStatus(
     "chat-job-status",
-    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · generation ${text(progress.lease_generation)} · units ${text(progress.completed_units)}/${text(progress.attempts)} · interrupted ${text(progress.interrupted_units)} · replans ${text(progress.replans)}.`,
+    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · generation ${text(progress.lease_generation)} · завершено ${text(progress.completed_units)} · передано ${text(progress.yielded_units)} · ошибки ${text(progress.failed_units)} · прервано ${text(progress.interrupted_units)} · изучение ${text(progress.discovery_units)} (точечное ${text(progress.targeted_discovery_units)}) · изменено файлов ${text(progress.changed_files)} · проверок ${text(progress.checks_run)} · model ${Math.round(Number(progress.model_turn_timeout_seconds || 0))} с · unit осталось ${Math.round(Number(progress.unit_time_remaining_seconds || 0))} с · active осталось ${Math.round(Number(progress.active_time_remaining_seconds || 0))} с · TTL ${Math.round(Number(progress.wall_time_remaining_seconds || 0))} с.`,
     job.status === "complete" ? "success" : "normal",
   );
 }
@@ -520,6 +537,8 @@ async function refreshChatJobs(): Promise<void> {
     return;
   }
   for (const item of jobs) {
+    const row = document.createElement("div");
+    row.className = "job-row";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "thread-item";
@@ -531,7 +550,34 @@ async function refreshChatJobs(): Promise<void> {
         .then(showJobSummary)
         .catch((error: Error) => showToast(error.message));
     });
-    output.append(button);
+    row.append(button);
+    const status = text(item.status);
+    const revision = Number(item.checkpoint_revision || 0);
+    const controls: Array<[string, string]> = [];
+    if (status === "running") controls.push(["Пауза", "pause"]);
+    if (["paused", "partial", "blocked"].includes(status)) {
+      controls.push(["Продолжить", "resume"]);
+    }
+    if (!["complete", "cancelled"].includes(status)) {
+      controls.push(["Отмена", "cancel"]);
+    }
+    for (const [label, action] of controls) {
+      const control = document.createElement("button");
+      control.type = "button";
+      control.className = "job-control";
+      control.textContent = label;
+      control.addEventListener("click", () => {
+        const jobId = text(item.id);
+        void api(`/api/jobs/${encodeURIComponent(jobId)}/${action}`, {
+          method: "POST",
+          body: JSON.stringify({ revision }),
+        })
+          .then(() => refreshChatJobs())
+          .catch((error: Error) => showToast(error.message));
+      });
+      row.append(control);
+    }
+    output.append(row);
     if (text(item.id) === activeChatJob) {
       button.classList.add("active");
     }

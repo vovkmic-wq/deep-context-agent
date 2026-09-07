@@ -4062,9 +4062,9 @@ class AgentRuntime:
         return response
 
     def run_autopilot_job(self, objective: str, **kwargs: Any) -> str:
-        """Share one bounded execution budget across all persistent units."""
+        """Run a persistent job with unit and durable task budgets."""
         self._persistent_budget = True
-        self._reliability.start_budget()
+        self._reliability.start_budget(persistent=True)
         try:
             return self._run_autopilot_job_impl(objective, **kwargs)
         finally:
@@ -4086,6 +4086,7 @@ class AgentRuntime:
         diagnostic_source: str = "cli",
         diagnostic_task_id: str | None = None,
         workflow: str = "project-audit",
+        task_identity: str | None = None,
     ) -> str:
         """Run one objective durably without equating persistence with audit."""
 
@@ -4121,7 +4122,19 @@ class AgentRuntime:
             exclude_patterns=selected_exclude,
             lease_seconds=self.app_config.autopilot_lease_seconds,
             workflow=workflow,
-            task_identity=self._saved_task.id if self._saved_task else None,
+            task_identity=(
+                task_identity
+                if task_identity is not None
+                else self._saved_task.id
+                if self._saved_task
+                else None
+            ),
+            model_turn_timeout_seconds=self.app_config.model_turn_timeout_seconds,
+            unit_timeout_seconds=self.app_config.autopilot_unit_timeout_seconds,
+            active_time_limit_seconds=(
+                self.app_config.autopilot_task_active_time_seconds
+            ),
+            wall_time_limit_seconds=self.app_config.autopilot_max_wall_time_seconds,
         )
         if job_progress.status == "complete":
             self._emit_autopilot_progress(
@@ -4187,6 +4200,18 @@ class AgentRuntime:
         for _ in range(self.app_config.autopilot_max_work_units):
             job_progress = self.autopilot_store.progress(lease.job_id)
             audit_progress = self.project_audit_store.progress(audit_progress.run_id)
+            budget_error = self.autopilot_store.budget_error(lease.job_id)
+            if budget_error is not None:
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code=budget_error,
+                    safe_message=(
+                        "Persistent task time budget was exhausted; verified "
+                        "progress and diagnostics were preserved."
+                    ),
+                    callback=progress_callback,
+                )
             if job_progress.requested_status in {"paused", "cancelled"}:
                 job_progress = self.autopilot_store.honor_requested_control(lease)
                 self._emit_autopilot_progress(
@@ -4218,7 +4243,8 @@ class AgentRuntime:
                 callback=progress_callback,
             )
             self._reliability.begin_unit(
-                self.app_config.autopilot_soft_model_calls_per_unit
+                self.app_config.autopilot_soft_model_calls_per_unit,
+                timeout_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             self._active_autopilot_receipt_context = (lease, unit_id)
             try:
@@ -4528,6 +4554,7 @@ class AgentRuntime:
 
         targeted = workflow in {"targeted-review", "targeted-change"}
         development = workflow in {"project-change", "project-test"}
+        phase_machine = development and allow_write
         self._tool_call_policy_middleware.set_routing_scope(
             workspace_reads_allowed=targeted or development,
             project_scan_allowed=development,
@@ -4536,6 +4563,20 @@ class AgentRuntime:
             allow_write and workflow in {"targeted-change", "project-change"}
         )
         progress = self.autopilot_store.progress(lease.job_id)
+        persisted_job = self.autopilot_store.details(lease.job_id, unit_limit=1)
+        raw_task_identity = persisted_job.get("task_identity")
+        durable_task_identity = str(raw_task_identity) if raw_task_identity else None
+        has_saved_task = (
+            durable_task_identity is not None or self._saved_task is not None
+        )
+
+        def durable_checkpoint() -> dict[str, Any]:
+            checkpoint = self._task_checkpoint()
+            if checkpoint or durable_task_identity is None:
+                return checkpoint
+            with TaskStateStore(self.app_config.context_database) as state:
+                return state.checkpoint_by_id(durable_task_identity)
+
         self._emit_autopilot_progress(progress_callback, progress, None, "started")
         # This method is entered only for an explicitly persistent workflow.
         # A targeted task can legitimately cross many successful soft-yield
@@ -4545,6 +4586,18 @@ class AgentRuntime:
         stagnant = 0
         for attempt in range(max_attempts):
             progress = self.autopilot_store.progress(lease.job_id)
+            budget_error = self.autopilot_store.budget_error(lease.job_id)
+            if budget_error is not None:
+                return self._block_autopilot(
+                    lease,
+                    None,
+                    error_code=budget_error,
+                    safe_message=(
+                        "Persistent task time budget was exhausted; verified "
+                        "progress and diagnostics were preserved."
+                    ),
+                    callback=progress_callback,
+                )
             if progress.requested_status in {"paused", "cancelled"}:
                 progress = self.autopilot_store.honor_requested_control(lease)
                 self._emit_autopilot_progress(
@@ -4554,20 +4607,117 @@ class AgentRuntime:
                     progress.status,
                 )
                 return self._format_autopilot_response(progress)
+            phase = progress.phase
+            if phase_machine:
+                if phase not in {
+                    "discover",
+                    "targeted-discovery",
+                    "plan",
+                    "implement",
+                    "verify",
+                    "repair",
+                }:
+                    phase = "discover"
+                    progress = self.autopilot_store.transition_phase(
+                        lease,
+                        phase,
+                        reason="resume-project-change",
+                    )
+                discovery_exhausted = (
+                    progress.discovery_units >= self.app_config.discovery_max_units
+                    or progress.file_reads >= self.app_config.discovery_max_reads
+                    or progress.unique_lines_read
+                    >= self.app_config.discovery_max_unique_lines
+                    or progress.discovery_searches
+                    >= self.app_config.discovery_max_searches
+                )
+                if phase == "discover" and has_saved_task:
+                    self.autopilot_store.transition_phase(
+                        lease,
+                        "plan",
+                        reason="saved-task-objective-known",
+                    )
+                    phase = "implement"
+                    progress = self.autopilot_store.transition_phase(
+                        lease,
+                        phase,
+                        reason="saved-task-operation-ready",
+                    )
+                elif phase == "discover" and discovery_exhausted:
+                    self.autopilot_store.transition_phase(
+                        lease,
+                        "plan",
+                        reason="discovery-budget-exhausted",
+                    )
+                    phase = "implement"
+                    progress = self.autopilot_store.transition_phase(
+                        lease,
+                        phase,
+                        reason="bounded-plan-ready",
+                    )
+                elif phase == "plan":
+                    phase = "implement"
+                    progress = self.autopilot_store.transition_phase(
+                        lease,
+                        phase,
+                        reason="bounded-plan-ready",
+                    )
+                if (
+                    phase in {"implement", "repair"}
+                    and not has_saved_task
+                    and progress.changed_files > 0
+                    and progress.last_progress_kind == "implementation"
+                ):
+                    phase = "verify"
+                    progress = self.autopilot_store.transition_phase(
+                        lease,
+                        phase,
+                        reason="reconciled-existing-mutation-receipt",
+                    )
+                if phase == "verify":
+                    verification = self._run_autopilot_verification(
+                        lease=lease,
+                        objective=objective,
+                        callback=progress_callback,
+                        audit_progress=None,
+                        diagnostic_source=diagnostic_source,
+                        diagnostic_task_id=diagnostic_task_id,
+                    )
+                    if verification is not None:
+                        return verification
+                    report = (
+                        "Persistent development task completed with verified "
+                        "workspace changes."
+                    )
+                    progress = self.autopilot_store.mark_complete(lease, report)
+                    self._emit_autopilot_progress(
+                        progress_callback,
+                        progress,
+                        None,
+                        "complete",
+                    )
+                    return self._format_autopilot_response(progress, message=report)
+            self._tool_call_policy_middleware.set_routing_scope(
+                workspace_reads_allowed=targeted or development,
+                project_scan_allowed=development and phase == "discover",
+            )
+            self._tool_call_policy_middleware.set_mutations_allowed(
+                allow_write and phase in {"implement", "repair"}
+            )
             self.autopilot_store.renew_lease(
                 lease,
                 self.app_config.autopilot_lease_seconds,
             )
-            checkpoint_before_unit = self._task_checkpoint()
-            next_operation = str(
-                checkpoint_before_unit.get("next_step")
-                or progress.next_operation
-                or "targeted-discovery"
+            checkpoint_before_unit = durable_checkpoint()
+            next_operation = self._conversational_next_operation(
+                phase,
+                objective,
+                checkpoint_before_unit,
             )
             self.autopilot_store.set_next_operation(lease, next_operation)
             unit_id, sequence, worker_thread = self.autopilot_store.begin_unit(
                 lease,
-                phase="execute",
+                phase=phase,
                 batch_size=1,
                 deadline_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
@@ -4577,10 +4727,19 @@ class AgentRuntime:
                 audit_progress=None,
                 callback=progress_callback,
             )
-            request = self._build_conversational_work_unit(objective, workflow)
-            before_checkpoint = self._task_checkpoint()
+            request = self._build_conversational_work_unit(
+                objective,
+                workflow,
+                phase=phase,
+            )
+            before_checkpoint = durable_checkpoint()
+            before_progress = self.autopilot_store.progress(lease.job_id)
+            before_mutations = self.autopilot_store.verified_mutation_count(
+                lease.job_id
+            )
             self._reliability.begin_unit(
-                self.app_config.autopilot_soft_model_calls_per_unit
+                self.app_config.autopilot_soft_model_calls_per_unit,
+                timeout_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             self._active_autopilot_receipt_context = (lease, unit_id)
             try:
@@ -4621,9 +4780,86 @@ class AgentRuntime:
                         unit_id,
                         f"Conversational unit {sequence} reached a safe boundary.",
                     )
+                    yielded_progress = self.autopilot_store.progress(lease.job_id)
+                    information_delta = (
+                        yielded_progress.file_reads > before_progress.file_reads
+                        or yielded_progress.unique_lines_read
+                        > before_progress.unique_lines_read
+                        or yielded_progress.discovery_searches
+                        > before_progress.discovery_searches
+                    )
+                    if phase_machine and phase == "implement":
+                        if (
+                            self.autopilot_store.verified_mutation_count(lease.job_id)
+                            > before_mutations
+                        ):
+                            yielded_progress = self.autopilot_store.transition_phase(
+                                lease,
+                                "verify",
+                                reason="implementation-receipt",
+                            )
+                        elif (
+                            information_delta
+                            and yielded_progress.targeted_discovery_units
+                            < self.app_config.targeted_discovery_max_units
+                        ):
+                            yielded_progress = self.autopilot_store.transition_phase(
+                                lease,
+                                "targeted-discovery",
+                                reason="implementation-evidence-gap",
+                            )
+                        else:
+                            return self._block_autopilot(
+                                lease,
+                                None,
+                                error_code=(
+                                    "implementation_blocked_missing_information"
+                                ),
+                                safe_message=(
+                                    "Implementation unit produced no mutation receipt; "
+                                    "the exact missing prerequisite is preserved in "
+                                    "the checkpoint."
+                                ),
+                                callback=progress_callback,
+                            )
+                    elif phase_machine and phase == "targeted-discovery":
+                        if not information_delta:
+                            return self._block_autopilot(
+                                lease,
+                                None,
+                                error_code=(
+                                    "discovery_exhausted_without_implementation"
+                                ),
+                                safe_message=(
+                                    "Targeted discovery produced no new evidence; "
+                                    "broad discovery will not be restarted."
+                                ),
+                                callback=progress_callback,
+                            )
+                        yielded_progress = self.autopilot_store.transition_phase(
+                            lease,
+                            "implement",
+                            reason="targeted-evidence-covered",
+                        )
+                    elif (
+                        phase_machine
+                        and phase == "discover"
+                        and yielded_progress.discovery_units
+                        >= self.app_config.discovery_max_units
+                    ):
+                        self.autopilot_store.transition_phase(
+                            lease,
+                            "plan",
+                            reason="discovery-handoff-limit",
+                        )
+                        yielded_progress = self.autopilot_store.transition_phase(
+                            lease,
+                            "implement",
+                            reason="bounded-plan-ready",
+                        )
                     self._emit_autopilot_progress(
                         progress_callback,
-                        self.autopilot_store.progress(lease.job_id),
+                        yielded_progress,
                         None,
                         "yielded",
                     )
@@ -4642,6 +4878,8 @@ class AgentRuntime:
                     "provider_unavailable",
                     "rate_limited",
                     "provider_chain_failed",
+                    "model_turn_timeout",
+                    "unit_deadline",
                 }
                 if (
                     retryable
@@ -4715,7 +4953,125 @@ class AgentRuntime:
                 f"Conversational worker {worker_thread} completed.",
             )
             consecutive_failures = 0
-            checkpoint = self._task_checkpoint()
+            completed_progress = self.autopilot_store.progress(lease.job_id)
+            checkpoint = durable_checkpoint()
+            if has_saved_task and checkpoint.get("pause"):
+                progress = self.autopilot_store.mark_partial(lease, answer)
+                self._emit_autopilot_progress(
+                    progress_callback,
+                    progress,
+                    None,
+                    "partial",
+                )
+                return answer
+            if phase_machine and phase == "discover":
+                self.autopilot_store.transition_phase(
+                    lease,
+                    "plan",
+                    reason="minimal-discovery-complete",
+                )
+                self.autopilot_store.transition_phase(
+                    lease,
+                    "implement",
+                    reason="bounded-plan-ready",
+                )
+                self._emit_autopilot_progress(
+                    progress_callback,
+                    self.autopilot_store.progress(lease.job_id),
+                    None,
+                    "phase_transition",
+                )
+                continue
+            if phase_machine and phase == "implement":
+                mutation_completed = (
+                    self.autopilot_store.verified_mutation_count(lease.job_id)
+                    > before_mutations
+                )
+                if not mutation_completed:
+                    information_delta = (
+                        completed_progress.file_reads > before_progress.file_reads
+                        or completed_progress.unique_lines_read
+                        > before_progress.unique_lines_read
+                        or completed_progress.discovery_searches
+                        > before_progress.discovery_searches
+                    )
+                    if (
+                        information_delta
+                        and completed_progress.targeted_discovery_units
+                        < self.app_config.targeted_discovery_max_units
+                    ):
+                        self.autopilot_store.transition_phase(
+                            lease,
+                            "targeted-discovery",
+                            reason="implementation-evidence-gap",
+                        )
+                        continue
+                    return self._block_autopilot(
+                        lease,
+                        None,
+                        error_code="implementation_blocked_missing_information",
+                        safe_message=(
+                            "Implementation unit produced no verified workspace "
+                            "mutation. Broad discovery will not be restarted."
+                        ),
+                        callback=progress_callback,
+                    )
+                if has_saved_task and checkpoint.get("next_step"):
+                    self.autopilot_store.set_next_operation(
+                        lease,
+                        self._conversational_next_operation(
+                            "implement",
+                            objective,
+                            checkpoint,
+                        ),
+                    )
+                    self._emit_autopilot_progress(
+                        progress_callback,
+                        self.autopilot_store.progress(lease.job_id),
+                        None,
+                        "next_step",
+                    )
+                    continue
+                if has_saved_task:
+                    partial = self.autopilot_store.mark_partial(lease, answer)
+                    self._emit_autopilot_progress(
+                        progress_callback,
+                        partial,
+                        None,
+                        "partial",
+                    )
+                    return answer
+                self.autopilot_store.transition_phase(
+                    lease,
+                    "verify",
+                    reason="implementation-receipt",
+                )
+                continue
+            if phase_machine and phase == "targeted-discovery":
+                information_delta = (
+                    completed_progress.file_reads > before_progress.file_reads
+                    or completed_progress.unique_lines_read
+                    > before_progress.unique_lines_read
+                    or completed_progress.discovery_searches
+                    > before_progress.discovery_searches
+                )
+                if not information_delta:
+                    return self._block_autopilot(
+                        lease,
+                        None,
+                        error_code="discovery_exhausted_without_implementation",
+                        safe_message=(
+                            "Targeted discovery produced no new evidence; broad "
+                            "discovery will not be restarted."
+                        ),
+                        callback=progress_callback,
+                    )
+                self.autopilot_store.transition_phase(
+                    lease,
+                    "implement",
+                    reason="targeted-evidence-covered",
+                )
+                continue
             self.autopilot_store.set_next_operation(
                 lease,
                 str(checkpoint.get("next_step") or "verify-current-scope"),
@@ -4778,15 +5134,85 @@ class AgentRuntime:
         )
 
     @staticmethod
-    def _build_conversational_work_unit(objective: str, workflow: str) -> str:
+    def _conversational_next_operation(
+        phase: str,
+        objective: str,
+        checkpoint: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Build a bounded scheduler-owned operation; model text is not authority."""
+
+        operation = {
+            "discover": "read_file",
+            "targeted-discovery": "read_file",
+            "plan": "produce_plan",
+            "implement": "edit_file",
+            "verify": "run_checks",
+            "repair": "edit_file",
+        }.get(phase, "analyze")
+        next_step = str(checkpoint.get("next_step") or "").strip()
+        structured_phase = (
+            phase
+            if phase
+            in {
+                "discover",
+                "targeted-discovery",
+                "plan",
+                "implement",
+                "verify",
+                "repair",
+            }
+            else "discover"
+        )
+        return {
+            "phase": structured_phase,
+            "operation": operation,
+            "target": "",
+            "objective": (next_step or objective)[:2_000],
+            "required_evidence_ids": [],
+            "expected_effect": {
+                "discover": "bounded relevant evidence",
+                "targeted-discovery": "one missing prerequisite resolved",
+                "plan": "executable implementation operation",
+                "implement": "verified workspace mutation receipt",
+                "verify": "allowlisted check results",
+                "repair": "verified repair mutation receipt",
+            }.get(phase, "bounded answer"),
+            "verification_commands": [],
+            "blocking_conditions": [],
+        }
+
+    @staticmethod
+    def _build_conversational_work_unit(
+        objective: str,
+        workflow: str,
+        *,
+        phase: str = "execute",
+    ) -> str:
         development = workflow in {"project-change", "project-test"}
         control = json.dumps(
-            {"phase": "execute", "workflow": workflow, "project_scan": development},
+            {"phase": phase, "workflow": workflow, "project_scan": development},
             ensure_ascii=False,
         )
         if development:
+            phase_instruction = {
+                "discover": (
+                    "Perform only minimal targeted discovery. Do not inventory the "
+                    "whole project. Produce an executable next step."
+                ),
+                "targeted-discovery": (
+                    "Read only the exact missing prerequisite. Do not glob, grep, "
+                    "list, or inventory the project."
+                ),
+                "implement": (
+                    "Implement the known next operation now. Do not restart broad "
+                    "discovery. This unit must produce a real mutation receipt or "
+                    "state one exact blocker."
+                ),
+                "repair": "Repair only the current verified check failure.",
+            }.get(phase, "Execute only the current bounded phase.")
             return (
                 f"{_AUTOPILOT_WORK_UNIT_MARKER}\n{control}\n</autopilot_work_unit>\n\n"
+                f"{phase_instruction} "
                 "Execute the next bounded step of the saved development task. "
                 "This is NOT a full project audit. Use the trusted task checkpoint "
                 "to resume; do not restart discovery or read every file. Read only "
@@ -4817,7 +5243,7 @@ class AgentRuntime:
         lease: Any,
         objective: str,
         callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
-        audit_progress: AuditProgress,
+        audit_progress: AuditProgress | None,
         diagnostic_source: str,
         diagnostic_task_id: str | None,
     ) -> str | None:
@@ -4876,11 +5302,13 @@ class AgentRuntime:
                 unit_id,
                 "Production checks passed."
                 if passed
+                else "No production checks are configured."
+                if not results
                 else "Production checks found failures.",
             )
             job_progress = self.autopilot_store.record_verification(
                 lease,
-                status="passed" if passed else "failed",
+                status="passed" if passed else "not_run" if not results else "failed",
                 results=serialized,
             )
             self._emit_autopilot_progress(
@@ -4891,6 +5319,23 @@ class AgentRuntime:
             )
             if passed:
                 return None
+            if not results and self._saved_task is not None:
+                partial = self.autopilot_store.mark_partial(
+                    lease,
+                    "No allowlisted project checks are configured; the saved task "
+                    "remains resumable until operator confirmation.",
+                )
+                self._emit_autopilot_progress(
+                    callback,
+                    partial,
+                    audit_progress,
+                    "partial",
+                )
+                return self._format_autopilot_response(
+                    partial,
+                    audit_progress,
+                    "No allowlisted project checks are configured.",
+                )
             if repair_cycle >= self.app_config.autopilot_repair_cycles:
                 return self._block_autopilot(
                     lease,
@@ -4921,7 +5366,8 @@ class AgentRuntime:
                 callback=callback,
             )
             self._reliability.begin_unit(
-                self.app_config.autopilot_soft_model_calls_per_unit
+                self.app_config.autopilot_soft_model_calls_per_unit,
+                timeout_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             self._active_autopilot_receipt_context = (lease, repair_id)
             try:

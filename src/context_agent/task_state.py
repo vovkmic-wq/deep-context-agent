@@ -261,8 +261,13 @@ class TaskStateStore:
         return task, route
 
     def checkpoint(self, task: SavedTask) -> dict[str, Any]:
+        return self.checkpoint_by_id(task.id)
+
+    def checkpoint_by_id(self, task_id: str) -> dict[str, Any]:
+        """Read a checkpoint by durable identity during worker recovery."""
+
         row = self.db.execute(
-            "SELECT payload FROM task_checkpoints WHERE task_id=?", (task.id,)
+            "SELECT payload FROM task_checkpoints WHERE task_id=?", (task_id,)
         ).fetchone()
         return json.loads(row[0]) if row else {}
 
@@ -326,6 +331,43 @@ class TaskStateStore:
             owner=owner,
             lease_until=now + seconds,
             revision=task.revision + 1,
+            status="running",
+        )
+
+    def recover_claim(
+        self,
+        task_id: str,
+        thread: str,
+        workspace: Path,
+        owner: str,
+        seconds: float,
+    ) -> SavedTask:
+        """Fence an owner after its linked Autopilot lease was reconciled."""
+
+        now = time.time()
+        resolved_workspace = str(workspace.resolve())
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT * FROM authorized_tasks WHERE id=? AND thread=? "
+                "AND workspace=? AND status NOT IN ('completed','cancelled')",
+                (task_id, thread, resolved_workspace),
+            ).fetchone()
+            if row is None:
+                raise TaskConflict("Saved task is unavailable for restart recovery")
+            revision = int(row["revision"]) + 1
+            changed = self.db.execute(
+                "UPDATE authorized_tasks SET owner=?, lease_until=?, "
+                "status='running', revision=? WHERE id=? AND revision=?",
+                (owner, now + seconds, revision, task_id, int(row["revision"])),
+            ).rowcount
+            if changed != 1:
+                raise TaskConflict("Saved task changed during restart recovery")
+        return replace(
+            self._decode(row),
+            owner=owner,
+            lease_until=now + seconds,
+            revision=revision,
             status="running",
         )
 

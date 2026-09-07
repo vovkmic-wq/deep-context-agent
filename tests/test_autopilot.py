@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage
 from context_agent.autopilot import (
     AutopilotHeartbeat,
     AutopilotLeaseError,
+    AutopilotRevisionError,
     AutopilotStore,
 )
 from context_agent.config import AppConfig, ProviderConfig
@@ -629,6 +630,162 @@ def test_autopilot_configuration_bounds(tmp_path: Path) -> None:
         replace(_config(tmp_path), autopilot_max_work_units=0)
 
 
+def test_durable_budgets_structured_operation_and_revision_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_values = iter((100.0, 101.0))
+    monkeypatch.setattr(
+        "context_agent.autopilot.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with AutopilotStore(tmp_path / "data" / "autopilot.sqlite3") as store:
+        job_id = store.enqueue(
+            thread_id="durable",
+            objective="Implement one bounded change",
+            workspace=workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+            active_time_limit_seconds=120,
+            wall_time_limit_seconds=600,
+        )
+        queued = store.progress(job_id)
+        assert queued.status == "queued"
+        assert queued.phase == "discover"
+        running, lease = store.start_or_resume(
+            thread_id="durable",
+            objective="Implement one bounded change",
+            workspace=workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+            active_time_limit_seconds=120,
+            wall_time_limit_seconds=600,
+        )
+        store.set_next_operation(
+            lease,
+            {
+                "phase": "implement",
+                "operation": "create_file",
+                "target": "/workspace/new.py",
+                "objective": "Create the implementation file",
+                "required_evidence_ids": [],
+                "expected_effect": "new file",
+                "verification_commands": ["python -m pytest -q"],
+                "blocking_conditions": [],
+            },
+        )
+        unit_id, _, _ = store.begin_unit(
+            lease,
+            phase="discover",
+            batch_size=1,
+        )
+        store.yield_unit(lease, unit_id, "handoff with evidence")
+        progress = store.progress(job_id)
+        assert progress.active_time_seconds > 0
+        assert progress.next_operation_data is not None
+        assert progress.next_operation_data["target"] == "/workspace/new.py"
+        assert progress.discovery_units == 1
+        stale_revision = running.checkpoint_revision
+        with pytest.raises(AutopilotRevisionError, match="revision is stale"):
+            store.set_control_status(
+                job_id,
+                "paused",
+                expected_revision=stale_revision,
+            )
+        with store._connection:
+            store._connection.execute(
+                "UPDATE autopilot_jobs SET active_time_seconds = "
+                "active_time_limit_seconds WHERE id = ?",
+                (job_id,),
+            )
+        assert store.budget_error(job_id) == "task_active_time_exhausted"
+
+        with pytest.raises(ValueError, match="escapes workspace"):
+            store.set_next_operation(
+                lease,
+                {
+                    "phase": "implement",
+                    "operation": "edit_file",
+                    "target": str(tmp_path / "outside.py"),
+                    "objective": "Unsafe target",
+                },
+            )
+
+
+def test_project_change_advances_discover_implement_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    (config.workspace / "source.py").write_text("VALUE = 1\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/source.py"},
+                        "id": "discover-source",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Minimal discovery complete."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/implemented.py",
+                            "content": "IMPLEMENTED = True\n",
+                        },
+                        "id": "implement-file",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Implementation complete."),
+        ]
+    )
+    passed = ProjectCheckResult(
+        check="pytest",
+        command=("python", "-m", "pytest"),
+        return_code=0,
+        duration_seconds=0.01,
+        status="passed",
+        output="1 passed",
+    )
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        response = runtime.run_autopilot_job(
+            "Inspect source.py, implement implemented.py and verify the project.",
+            thread_id="phase-machine",
+            workflow="project-change",
+            allow_write=True,
+        )
+
+    assert "complete" in response
+    assert (config.workspace / "implemented.py").read_text(encoding="utf-8") == (
+        "IMPLEMENTED = True\n"
+    )
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert details["status"] == "complete"
+    assert details["verification_status"] == "passed"
+    phases = {unit["phase"] for unit in details["work_units"]}
+    assert {"discover", "implement", "verify"} <= phases
+
+
 def test_allow_write_job_requires_current_verification_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -714,3 +871,438 @@ def test_persistent_log_analysis_does_not_create_project_audit(
     assert details["audit_run_id"] is None
     assert details["phase"] == "complete"
     assert details["work_units"][0]["phase"] == "execute"
+
+
+def test_duplicate_discovery_evidence_does_not_renew_progress(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with AutopilotStore(tmp_path / "autopilot.sqlite3") as store:
+        progress, lease = store.start_or_resume(
+            thread_id="deduplicated-evidence",
+            objective="Inspect one known file",
+            workspace=workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+        )
+        receipt = {
+            "name": "read_file",
+            "path": "/workspace/source.py",
+            "status": "success",
+            "content_version": "version-1",
+            "start_line": 1,
+            "end_line": 100,
+            "bytes_returned": 500,
+        }
+        first_unit, _, _ = store.begin_unit(
+            lease,
+            phase="discover",
+            batch_size=1,
+        )
+        store.record_tool_receipt(lease, first_unit, receipt)
+        store.yield_unit(lease, first_unit, "first evidence handoff")
+        first = store.progress(progress.job_id)
+        assert first.file_reads == 1
+        assert first.unique_lines_read == 100
+        assert first.renewal_reason == "verified-handoff"
+
+        second_unit, _, _ = store.begin_unit(
+            lease,
+            phase="discover",
+            batch_size=1,
+        )
+        store.record_tool_receipt(lease, second_unit, receipt)
+        store.yield_unit(lease, second_unit, "duplicate evidence handoff")
+        duplicate = store.progress(progress.job_id)
+
+    assert duplicate.file_reads == 1
+    assert duplicate.unique_lines_read == 100
+    assert duplicate.discovery_units == 2
+    assert duplicate.renewal_reason == "no-verified-delta"
+
+
+def test_invalid_phase_transition_is_rejected_and_recorded_transitions_are_visible(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with AutopilotStore(tmp_path / "autopilot.sqlite3") as store:
+        progress, lease = store.start_or_resume(
+            thread_id="phase-validation",
+            objective="Implement a bounded change",
+            workspace=workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+        )
+        with pytest.raises(ValueError, match="discover -> verify"):
+            store.transition_phase(lease, "verify", reason="invalid shortcut")
+        store.transition_phase(lease, "plan", reason="evidence-covered")
+        store.transition_phase(lease, "implement", reason="operation-ready")
+        details = store.details(progress.job_id)
+
+    assert [item["to_phase"] for item in reversed(details["phase_transitions"])] == [
+        "plan",
+        "implement",
+    ]
+
+
+def test_incident_shape_forces_implementation_instead_of_legacy_task_deadline(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        task_timeout_seconds=10,
+        autopilot_soft_model_calls_per_unit=2,
+        discovery_max_units=2,
+        autopilot_retry_attempts=4,
+    )
+    config.prepare_directories()
+    (config.workspace / "first.py").write_text("FIRST = 1\n", encoding="utf-8")
+    (config.workspace / "second.py").write_text("SECOND = 2\n", encoding="utf-8")
+    (config.workspace / "third.py").write_text("THIRD = 3\n", encoding="utf-8")
+    (config.workspace / "fourth.py").write_text("FOURTH = 4\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/first.py"},
+                        "id": "discover-first",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/second.py"},
+                        "id": "discover-second",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/third.py"},
+                        "id": "discover-third",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/fourth.py"},
+                        "id": "discover-fourth",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="I cannot identify a safe mutation."),
+        ]
+    )
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        response = runtime.run_autopilot_job(
+            "Inspect the two files and implement the required safe change.",
+            thread_id="incident-regression",
+            workflow="project-change",
+            allow_write=True,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        job = store.list_jobs(workspace=config.workspace)[0]
+        details = store.details(str(job["id"]))
+    assert "implementation_blocked_missing_information" in response
+    assert details["status"] == "blocked"
+    assert details["last_error_code"] == ("implementation_blocked_missing_information")
+    assert details["progress"]["discovery_units"] == 2
+    assert details["progress"]["yielded_units"] == 2
+    assert details["last_error_code"] != "task_deadline"
+    assert {unit["phase"] for unit in details["work_units"]} == {
+        "discover",
+        "implement",
+    }
+
+
+def test_project_change_allows_one_targeted_discovery_then_requires_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_config(tmp_path), targeted_discovery_max_units=1)
+    config.prepare_directories()
+    for name in ("source.py", "dependency.py", "contract.py"):
+        (config.workspace / name).write_text(f"NAME = {name!r}\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/source.py"},
+                        "id": "initial-discovery",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Initial evidence covered."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/dependency.py"},
+                        "id": "implementation-gap",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="One exact prerequisite is still needed."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/contract.py"},
+                        "id": "targeted-discovery",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Targeted prerequisite covered."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/workspace/result.py",
+                            "content": "RESULT = True\n",
+                        },
+                        "id": "implementation-mutation",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Implementation complete."),
+        ]
+    )
+    passed = ProjectCheckResult(
+        check="pytest",
+        command=("python", "-m", "pytest"),
+        return_code=0,
+        duration_seconds=0.01,
+        status="passed",
+        output="1 passed",
+    )
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        response = runtime.run_autopilot_job(
+            "Implement result.py after resolving one exact prerequisite.",
+            thread_id="targeted-discovery",
+            workflow="project-change",
+            allow_write=True,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert "complete" in response
+    assert details["progress"]["targeted_discovery_units"] == 1
+    assert {unit["phase"] for unit in details["work_units"]} == {
+        "discover",
+        "targeted-discovery",
+        "implement",
+        "verify",
+    }
+    assert (config.workspace / "result.py").read_text(encoding="utf-8") == (
+        "RESULT = True\n"
+    )
+
+
+def test_legacy_autopilot_database_migrates_additively_without_losing_job(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "autopilot.sqlite3"
+    with AutopilotStore(database) as store:
+        job_id = store.enqueue(
+            thread_id="legacy-migration",
+            objective="Preserve this queued job",
+            workspace=workspace,
+            allow_write=False,
+            batch_size=1,
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX IF EXISTS idx_autopilot_receipts_evidence")
+        connection.execute("DROP TABLE IF EXISTS autopilot_phase_transitions")
+        for column in (
+            "task_identity",
+            "next_operation_json",
+            "resume_phase",
+            "model_turn_timeout_seconds",
+            "unit_timeout_seconds",
+            "active_time_seconds",
+            "active_time_limit_seconds",
+            "wall_time_limit_seconds",
+            "wall_deadline_at",
+            "last_progress_kind",
+            "last_progress_at",
+            "renewal_reason",
+        ):
+            connection.execute(f"ALTER TABLE autopilot_jobs DROP COLUMN {column}")
+        for column in ("evidence_fingerprint", "verified_progress"):
+            connection.execute(
+                f"ALTER TABLE autopilot_tool_receipts DROP COLUMN {column}"
+            )
+
+    with AutopilotStore(database) as migrated:
+        details = migrated.details(job_id)
+        job_columns = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "PRAGMA table_info(autopilot_jobs)"
+            ).fetchall()
+        }
+        receipt_columns = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "PRAGMA table_info(autopilot_tool_receipts)"
+            ).fetchall()
+        }
+
+    assert details["thread_id"] == "legacy-migration"
+    assert details["status"] == "queued"
+    assert {
+        "task_identity",
+        "next_operation_json",
+        "resume_phase",
+        "active_time_seconds",
+        "wall_deadline_at",
+    } <= job_columns
+    assert {"evidence_fingerprint", "verified_progress"} <= receipt_columns
+
+
+def test_crash_recovery_counts_heartbeat_active_time_not_process_downtime(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "autopilot.sqlite3"
+    with AutopilotStore(database) as store:
+        progress, lease = store.start_or_resume(
+            thread_id="crash-active-time",
+            objective="Resume after a crash",
+            workspace=workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+        )
+        unit_id, _, _ = store.begin_unit(
+            lease,
+            phase="discover",
+            batch_size=1,
+        )
+        with store._connection:
+            store._connection.execute(
+                "UPDATE autopilot_work_units SET started_at = 100, "
+                "last_heartbeat_at = 110 WHERE id = ?",
+                (unit_id,),
+            )
+            store._connection.execute(
+                "UPDATE autopilot_jobs SET lease_until = 1 WHERE id = ?",
+                (progress.job_id,),
+            )
+
+    with AutopilotStore(database) as recovered:
+        after = recovered.progress(progress.job_id)
+
+    assert after.status == "paused"
+    assert after.phase == "interrupted"
+    assert after.active_time_seconds == 10
+    assert after.interrupted_units == 1
+
+
+def test_crash_after_mutation_receipt_reconciles_to_verify_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    objective = "Create result.py and verify it"
+    result_file = config.workspace / "result.py"
+    result_file.write_text("RESULT = True\n", encoding="utf-8")
+    with AutopilotStore(config.autopilot_database) as store:
+        progress, lease = store.start_or_resume(
+            thread_id="crash-after-mutation",
+            objective=objective,
+            workspace=config.workspace,
+            allow_write=True,
+            batch_size=1,
+            workflow="project-change",
+        )
+        store.transition_phase(lease, "plan", reason="covered")
+        store.transition_phase(lease, "implement", reason="ready")
+        unit_id, _, _ = store.begin_unit(
+            lease,
+            phase="implement",
+            batch_size=1,
+        )
+        store.record_tool_receipt(
+            lease,
+            unit_id,
+            {
+                "name": "write_file",
+                "path": "/workspace/result.py",
+                "status": "success",
+                "content_sha256": "a" * 64,
+            },
+        )
+        with store._connection:
+            store._connection.execute(
+                "UPDATE autopilot_jobs SET lease_until = 1 WHERE id = ?",
+                (progress.job_id,),
+            )
+
+    model = SequenceChatModel(
+        responses=[AIMessage(content="This response must never be requested.")]
+    )
+    passed = ProjectCheckResult(
+        check="pytest",
+        command=("python", "-m", "pytest"),
+        return_code=0,
+        duration_seconds=0.01,
+        status="passed",
+        output="1 passed",
+    )
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        response = runtime.run_autopilot_job(
+            objective,
+            thread_id="crash-after-mutation",
+            workflow="project-change",
+            allow_write=True,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(progress.job_id)
+    assert "complete" in response
+    assert model.generation_attempts == 0
+    assert details["status"] == "complete"
+    assert details["progress"]["interrupted_units"] == 1
+    assert result_file.read_text(encoding="utf-8") == "RESULT = True\n"

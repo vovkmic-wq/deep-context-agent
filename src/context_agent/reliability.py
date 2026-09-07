@@ -69,31 +69,54 @@ class ReliabilityMiddleware(AgentMiddleware):
         self.records: list[dict[str, Any]] = []
         self.start_budget()
 
-    def start_budget(self) -> None:
-        self.deadline = time.monotonic() + self.config.task_timeout_seconds
+    def start_budget(self, *, persistent: bool = False) -> None:
+        """Start a one-shot budget or a persistent scheduler session.
+
+        Persistent jobs own their active-time and wall-clock budgets in the durable
+        job store.  Reusing the legacy one-shot deadline here would make a sequence
+        of successful handoffs expire after ``AGENT_TASK_TIMEOUT_SECONDS``.
+        """
+
+        self.persistent = persistent
+        self.deadline: float | None = (
+            None if persistent else time.monotonic() + self.config.task_timeout_seconds
+        )
         self.attempts = 0
         self.stagnant = 0
         self.seen: set[tuple[Any, ...]] = set()
         self.unit_attempt_start = 0
         self.unit_model_call_limit: int | None = None
+        self.unit_deadline: float | None = None
 
-    def begin_unit(self, model_call_limit: int | None = None) -> None:
+    def begin_unit(
+        self,
+        model_call_limit: int | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         """Start a soft unit budget without resetting task-wide counters."""
 
         self.unit_attempt_start = self.attempts
         self.unit_model_call_limit = model_call_limit
+        self.unit_deadline = (
+            time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        )
 
     def clear_unit(self) -> None:
         """Disable the current unit boundary without resetting the task budget."""
 
         self.unit_model_call_limit = None
+        self.unit_deadline = None
 
     def check(self) -> None:
         if self.cancelled.is_set():
             raise ExecutionStopped("task_cancelled")
         self.authority()
-        if time.monotonic() >= self.deadline:
+        now = time.monotonic()
+        if self.deadline is not None and now >= self.deadline:
             raise ExecutionStopped("task_deadline")
+        if self.unit_deadline is not None and now >= self.unit_deadline:
+            raise ExecutionStopped("unit_deadline")
 
     def wrap_tool_call(self, request: Any, handler: Any) -> Any:
         self.check()
@@ -127,9 +150,16 @@ class ReliabilityMiddleware(AgentMiddleware):
         settings = dict(request.model_settings)
         settings["max_tokens"] = self.config.model_output_tokens
         target = self.provider()
-        settings["timeout"] = min(
-            target.timeout, max(1, self.deadline - time.monotonic())
-        )
+        timeout_candidates = [
+            float(target.timeout),
+            float(self.config.model_turn_timeout_seconds),
+        ]
+        now = time.monotonic()
+        if self.deadline is not None:
+            timeout_candidates.append(max(1.0, self.deadline - now))
+        if self.unit_deadline is not None:
+            timeout_candidates.append(max(1.0, self.unit_deadline - now))
+        settings["timeout"] = min(timeout_candidates)
         request = request.override(
             system_message=SystemMessage(content=system),
             model_settings=settings,
@@ -205,6 +235,9 @@ class ReliabilityMiddleware(AgentMiddleware):
                     raise ExecutionStopped("generation_truncated")
                 if repeated and self.config.repetition_mode == "enforce":
                     raise ExecutionStopped("generation_repetition")
+            elapsed = time.monotonic() - started
+            if elapsed >= self.config.model_turn_timeout_seconds:
+                raise ExecutionStopped("model_turn_timeout")
             self.check()
             record["status"] = "success"
             return response

@@ -310,7 +310,7 @@ def test_web_project_develop_log_long_resume_preserves_job_without_audit(
     with AutopilotStore(cfg.autopilot_database) as store:
         detail = store.details(first_job_id)
         assert detail["audit_run_id"] is None
-        assert {u["phase"] for u in detail["work_units"]} == {"execute"}
+        assert {u["phase"] for u in detail["work_units"]} == {"implement"}
         assert detail["status"] == "partial"
     with sqlite3.connect(cfg.project_audit_database) as db:
         assert db.execute("SELECT count(*) FROM audit_runs").fetchone()[0] == 0
@@ -416,7 +416,7 @@ def test_cli_persistent_development_advances_checkpoint_without_audit(
         assert len(jobs) == 1 and jobs[0]["status"] == "partial"
         detail = runtime.autopilot_store.details(jobs[0]["id"])
         assert len(detail["work_units"]) == 2
-        assert all(u["phase"] == "execute" for u in detail["work_units"])
+        assert all(u["phase"] == "implement" for u in detail["work_units"])
     assert (cfg.workspace / "one.txt").read_text() == "ONE"
     assert (cfg.workspace / "two.txt").read_text() == "TWO"
     with TaskStateStore(cfg.context_database) as state:

@@ -1,5 +1,31 @@
 # Техническое задание: веб-интерфейс Deep Context Agent
 
+## Целевое дополнение 0.27: durable task lifecycle
+
+Реализовывать по `DEEP_CONTEXT_AGENT_0_27_WEB_DURABLE_SCHEDULER_PROMPT.md` и
+`DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md`. Это требования следующего этапа,
+не подтверждение готовности текущего Web runtime 0.26.0. Отдельная вкладка
+Autopilot не возвращается: задача ставится и управляется внутри чата.
+
+- `POST /api/chat`/submit атомарно сохраняет job/queue и отвечает 202; выполнение
+  не принадлежит открытому HTTP handler или SSE.
+- Закрытие вкладки, reconnect и reload не отменяют job и не создают новую unit.
+  SSE имеет sequence/Last-Event-ID replay; server restart выполняет reconciliation.
+- Карточка задачи показывает phase, completed/yielded/failed/interrupted,
+  discovery limits, changed files, checks, last evidence и next operation.
+- Четыре таймера подписаны отдельно: model turn, текущая unit, активное вычисление
+  всей задачи и абсолютный срок жизни. Poll/heartbeat не продлевают budget.
+- Discovery ceiling приводит к PLAN/IMPLEMENT, bounded reasoning escalation или
+  точному blocker. Общая ошибка и бесконечный повтор исследования запрещены.
+- Pause/Resume/Cancel используют CSRF, expected revision и runtime acknowledgement.
+- Planned soft yield не отображается failed; `units=0/11` без расшифровки запрещено.
+- Пользователь не выбирает batch size/размер этапа. Расширенные operator limits
+  имеют пояснения Русский / English и применяются предсказуемо.
+- Диагностика связывает parent/child/unit/model/tool evidence и показывает только
+  redacted данные. Raw prompt, traceback, секреты и host paths в DOM/API запрещены.
+- Acceptance включает disconnect/reconnect, process restart, exact-once mutation,
+  реальный check, controlled blocker и два независимых live browser прогона.
+
 ## Дополнение 0.26: handoff, adaptive routing и observable memory
 
 Нормативные требования: `AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md`, прежде

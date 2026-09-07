@@ -1,5 +1,51 @@
 # Статус реализации
 
+## Durable scheduler 0.27.0 — реализован, 2026-09-07
+
+По diagnostic `83bbc5d39bf7410b87462378c5259487` зафиксирован новый инцидент:
+job `5dc5c86b57fd25f873da7acd` после 7 soft yields остановлен общим
+`task_deadline` за 902.141 s; 12 чтений/960 уникальных строк, 0 changed files,
+0 checks. Provider и vector backend не были причиной остановки.
+
+Созданы `DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md`, основной промт 0.27 и
+отдельный Web-промт. Обновлены глобальные ТЗ/промпт и capability-aware system
+prompt. Выбран production-подход: phase machine + persistent scheduler +
+evidence-driven renewal; раздельные timeout — базовая настройка.
+
+Реализованы независимые model/unit/active/wall бюджеты, конечный автомат фаз,
+ограничение discovery, durable next operation и receipts, lease/CAS fencing,
+crash recovery без списания downtime, Web recovery и SSE replay. Сохранённая
+задача возобновляется по прежнему job/task identity без запуска project audit;
+повторная правка одного файла учитывается как новый подтверждённый прогресс.
+
+Автоматическая регрессия 2026-09-07: Ruff check/format — PASS; `mypy src` — PASS;
+`pytest -ra` — **383 passed, 1 skipped** за 38.57 s. Skip относится только к
+недоступному созданию Windows symlink. TypeScript noEmit, bundle/model tests,
+compileall, pip check и сборка wheel/sdist 0.27.0 — PASS.
+
+Live evidence на независимых чистых SQLite, существующие ключи без печати:
+
+- `doctor --live`: primary `zhipu/glm-5.3`, fallback `openai/gpt-5.6-sol`,
+  `live_response=OK`, hybrid FastEmbed/Qdrant configured;
+- PASS №1: job `0d68f3fc4102d74b33c776ad`, task
+  `5fbacdd4058141a3a1ed8365576fce3c` — 5 yields, 14 чтений, 5 диапазонов,
+  restart/resume, 1 exact-once mutation; primary timeout корректно использовал
+  OpenAI fallback;
+- controlled blocker: job `38d77c035c8167fbf0ec0e32` — после полезных units
+  модель трижды не дала нового evidence; точный `no_verified_progress`, без
+  небезопасной записи;
+- PASS №2: job `7b6355a08d9ce5e506b2122c`, task
+  `493661fade674d1fb11ad1c279f91d2b` — 6 yields, 14 чтений, 5 диапазонов,
+  restart/resume, 1 exact-once mutation.
+
+Оба успешных Web API/SSE прогона подтвердили partial terminal replay после
+перезапуска и отсутствие project-audit manifest. Физические временные каталоги,
+SQLite и live reports не входят в release-артефакты.
+
+Изолированный HTTP smoke на `127.0.0.1:8877`: `/` и `/api/runtime` вернули 200,
+версия 0.27.0, retrieval `hybrid`, model-turn timeout 180 s, active-task budget
+14 400 s и discovery ceiling 2. Сервер штатно остановлен; порт 8765 не затронут.
+
 ## Bounded progress recovery 0.26.0 — реализовано, 2026-09-06
 
 Выполнены `DEEP_CONTEXT_AGENT_0_26_BOUNDED_PROGRESS_RECOVERY_PROMPT.md` и

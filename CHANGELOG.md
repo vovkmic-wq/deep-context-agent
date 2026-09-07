@@ -5,6 +5,34 @@
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-09-07
+
+### Добавлено
+
+- Durable phase machine `discover/plan/implement/verify/repair` с отдельными
+  model-turn, unit, active-task и wall-clock бюджетами.
+- Persistent next-operation contract, phase-transition journal, lease generation,
+  CAS revision, idempotent tool receipts и evidence-driven progress counters.
+- Восстановление Web jobs и SSE replay по sequence/`Last-Event-ID` после рестарта.
+- Настройки scheduler и Web-индикаторы фаз, бюджетов, прогресса и управления.
+
+### Исправлено
+
+- Устранён incident `task_deadline`, где discovery занимал весь общий бюджет без
+  мутаций: широкое исследование ограничено и сменяется конкретной операцией.
+- Повторная правка одного файла считается отдельным подтверждённым прогрессом.
+- Resume использует durable task identity/checkpoint и не запускает аудит проекта.
+- Downtime после crash не списывается как активное время worker.
+
+### Проверено
+
+- Ruff, mypy и 383 pytest-теста проходят; один Windows symlink-тест пропущен по
+  возможностям ОС. Остальные release/live результаты приведены в
+  `IMPLEMENTATION_STATUS.md`.
+- Два независимых Zhipu/OpenAI live-прогона подтвердили Web SSE restart/resume,
+  soft yields, exact-once mutation и отсутствие audit manifest; отдельный прогон
+  подтвердил безопасный terminal blocker `no_verified_progress`.
+
 ## [0.26.0] — 2026-09-06
 
 ### Добавлено

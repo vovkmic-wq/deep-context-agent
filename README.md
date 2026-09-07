@@ -5,7 +5,14 @@ CLI-агент на Python и Deep Agents с долговременным SQLite
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
 Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
-## Устойчивое выполнение и наблюдаемые ресурсы — 0.26.0
+## Durable scheduler и наблюдаемые ресурсы — 0.27.0
+
+Persistent-задача теперь отделена от одного model turn: используются независимые
+таймауты model/unit, бюджет активной работы и wall-clock TTL. Разработка проходит
+через конечный автомат `discover → plan → implement → verify → repair`; число
+discovery-only units ограничено, а после достижения покрытия scheduler назначает
+конкретную операцию либо возвращает точный blocker. Lease, checkpoint, receipts,
+phase и SSE-события сохраняются в SQLite и восстанавливаются после рестарта.
 
 Runtime сохраняет подтверждённые tool receipts, диапазоны чтения и следующую
 операцию независимо от добровольного checkpoint модели. До жёсткого graph limit
@@ -204,6 +211,14 @@ AGENT_AUTOPILOT_REPAIR_CYCLES=3
 AGENT_AUTOPILOT_LEASE_SECONDS=900
 AGENT_AUTOPILOT_HEARTBEAT_SECONDS=30
 AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS=900
+AGENT_MODEL_TURN_TIMEOUT_SECONDS=180
+AGENT_AUTOPILOT_TASK_ACTIVE_TIME_SECONDS=14400
+AGENT_AUTOPILOT_MAX_WALL_TIME_SECONDS=86400
+AGENT_DISCOVERY_MAX_UNITS=2
+AGENT_DISCOVERY_MAX_READS=20
+AGENT_DISCOVERY_MAX_UNIQUE_LINES=2000
+AGENT_DISCOVERY_MAX_SEARCHES=8
+AGENT_TARGETED_DISCOVERY_MAX_UNITS=1
 AGENT_AUTOPILOT_UNIT_BATCH_SIZE=2
 AGENT_AUTOPILOT_RECURSION_LIMIT=40
 AGENT_PROJECT_CHECK_TIMEOUT_SECONDS=300

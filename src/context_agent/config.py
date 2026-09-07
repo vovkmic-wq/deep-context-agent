@@ -342,6 +342,7 @@ class AppConfig:
     model_output_tokens: int = 8192
     task_model_attempts: int = 80
     task_timeout_seconds: int = 900
+    model_turn_timeout_seconds: int = 180
     no_progress_limit: int = 8
     repetition_mode: str = "observe"
     semantic_routing_enabled: bool = True
@@ -366,6 +367,13 @@ class AppConfig:
     autopilot_lease_seconds: int = 900
     autopilot_heartbeat_seconds: int = 30
     autopilot_unit_timeout_seconds: int = 900
+    autopilot_task_active_time_seconds: int = 14_400
+    autopilot_max_wall_time_seconds: int = 86_400
+    discovery_max_units: int = 2
+    discovery_max_reads: int = 20
+    discovery_max_unique_lines: int = 2_000
+    discovery_max_searches: int = 8
+    targeted_discovery_max_units: int = 1
     autopilot_unit_batch_size: int = 2
     autopilot_recursion_limit: int = 40
     autopilot_soft_model_calls_per_unit: int = 8
@@ -397,6 +405,7 @@ class AppConfig:
             ("model_output_tokens", 256, 131072),
             ("task_model_attempts", 1, 1000),
             ("task_timeout_seconds", 10, 86400),
+            ("model_turn_timeout_seconds", 10, 7200),
             ("no_progress_limit", 2, 100),
         ):
             if not minimum <= getattr(self, name) <= maximum:
@@ -512,6 +521,38 @@ class AppConfig:
             raise ConfigurationError(
                 "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS must be between 30 and 7200"
             )
+        if not 60 <= self.autopilot_task_active_time_seconds <= 604_800:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_TASK_ACTIVE_TIME_SECONDS must be between 60 and 604800"
+            )
+        if not 60 <= self.autopilot_max_wall_time_seconds <= 2_592_000:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_MAX_WALL_TIME_SECONDS must be between 60 and 2592000"
+            )
+        if self.autopilot_max_wall_time_seconds < self.autopilot_unit_timeout_seconds:
+            raise ConfigurationError(
+                "AGENT_AUTOPILOT_MAX_WALL_TIME_SECONDS must not be shorter than "
+                "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS"
+            )
+        for name, value, minimum, maximum in (
+            ("AGENT_DISCOVERY_MAX_UNITS", self.discovery_max_units, 1, 100),
+            ("AGENT_DISCOVERY_MAX_READS", self.discovery_max_reads, 1, 10_000),
+            (
+                "AGENT_DISCOVERY_MAX_UNIQUE_LINES",
+                self.discovery_max_unique_lines,
+                100,
+                10_000_000,
+            ),
+            ("AGENT_DISCOVERY_MAX_SEARCHES", self.discovery_max_searches, 1, 1_000),
+            (
+                "AGENT_TARGETED_DISCOVERY_MAX_UNITS",
+                self.targeted_discovery_max_units,
+                0,
+                20,
+            ),
+        ):
+            if not minimum <= value <= maximum:
+                raise ConfigurationError(f"{name} must be in {minimum}..{maximum}")
         if not 1 <= self.autopilot_unit_batch_size <= 8:
             raise ConfigurationError(
                 "AGENT_AUTOPILOT_UNIT_BATCH_SIZE must be between 1 and 8"
@@ -638,6 +679,9 @@ class AppConfig:
             task_model_attempts=_int_setting(values, "AGENT_TASK_MODEL_ATTEMPTS", 80),
             task_timeout_seconds=_int_setting(
                 values, "AGENT_TASK_TIMEOUT_SECONDS", 900
+            ),
+            model_turn_timeout_seconds=_int_setting(
+                values, "AGENT_MODEL_TURN_TIMEOUT_SECONDS", 180
             ),
             no_progress_limit=_int_setting(values, "AGENT_NO_PROGRESS_LIMIT", 8),
             repetition_mode=values.get("AGENT_REPETITION_MODE", "observe"),
@@ -784,6 +828,41 @@ class AppConfig:
                 values,
                 "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS",
                 900,
+            ),
+            autopilot_task_active_time_seconds=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_TASK_ACTIVE_TIME_SECONDS",
+                14_400,
+            ),
+            autopilot_max_wall_time_seconds=_int_setting(
+                values,
+                "AGENT_AUTOPILOT_MAX_WALL_TIME_SECONDS",
+                86_400,
+            ),
+            discovery_max_units=_int_setting(
+                values,
+                "AGENT_DISCOVERY_MAX_UNITS",
+                2,
+            ),
+            discovery_max_reads=_int_setting(
+                values,
+                "AGENT_DISCOVERY_MAX_READS",
+                20,
+            ),
+            discovery_max_unique_lines=_int_setting(
+                values,
+                "AGENT_DISCOVERY_MAX_UNIQUE_LINES",
+                2_000,
+            ),
+            discovery_max_searches=_int_setting(
+                values,
+                "AGENT_DISCOVERY_MAX_SEARCHES",
+                8,
+            ),
+            targeted_discovery_max_units=_int_setting(
+                values,
+                "AGENT_TARGETED_DISCOVERY_MAX_UNITS",
+                1,
             ),
             autopilot_unit_batch_size=_int_setting(
                 values,

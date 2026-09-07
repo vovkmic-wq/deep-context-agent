@@ -419,6 +419,18 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"autopilot_lease_seconds={app_config.autopilot_lease_seconds}")
     print(f"autopilot_heartbeat_seconds={app_config.autopilot_heartbeat_seconds}")
     print(f"autopilot_unit_timeout_seconds={app_config.autopilot_unit_timeout_seconds}")
+    print(f"model_turn_timeout_seconds={app_config.model_turn_timeout_seconds}")
+    print(
+        "autopilot_task_active_time_seconds="
+        f"{app_config.autopilot_task_active_time_seconds}"
+    )
+    print(
+        f"autopilot_max_wall_time_seconds={app_config.autopilot_max_wall_time_seconds}"
+    )
+    print(f"discovery_max_units={app_config.discovery_max_units}")
+    print(f"discovery_max_reads={app_config.discovery_max_reads}")
+    print(f"discovery_max_unique_lines={app_config.discovery_max_unique_lines}")
+    print(f"discovery_max_searches={app_config.discovery_max_searches}")
     print(f"autopilot_unit_batch_size={app_config.autopilot_unit_batch_size}")
     print(f"autopilot_recursion_limit={app_config.autopilot_recursion_limit}")
     print("audit_mode_default=read-only")

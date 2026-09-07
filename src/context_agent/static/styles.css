@@ -104,6 +104,10 @@ th { color: var(--muted); font-size: .82rem; }
 .thread-sidebar { min-height: 0; overflow-y: auto; border-right: 1px solid var(--border); padding: 1rem; background: #0e1013; }
 .wide { width: 100%; }
 .thread-list { display: grid; gap: .3rem; margin-top: 1rem; }
+.job-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .3rem; align-items: center; }
+.job-row .thread-item { min-width: 0; }
+.job-control { padding: .35rem .5rem; color: var(--muted); background: transparent; font-size: .72rem; }
+.job-control:hover, .job-control:focus-visible { color: var(--text); border-color: var(--accent); }
 .thread-item { width: 100%; overflow: hidden; color: var(--muted); background: transparent; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .thread-item.active { color: var(--text); background: var(--surface-2); border-color: var(--border); }
 .chat-main { display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
@@ -221,6 +225,7 @@ th { color: var(--muted); font-size: .82rem; }
   .thread-sidebar { display: flex; gap: .5rem; overflow-x: auto; border: 0; border-bottom: 1px solid var(--border); padding: .6rem; }
   .thread-sidebar .wide { width: auto; white-space: nowrap; }
   .thread-list { display: flex; gap: .3rem; margin: 0; }
+  .job-row { flex: 0 0 auto; grid-template-columns: 9rem auto; }
   .thread-item { width: 9rem; }
   .chat-main { min-height: 0; height: calc(100% - 58px); }
   .chat-header { align-items: start; padding: .8rem; }

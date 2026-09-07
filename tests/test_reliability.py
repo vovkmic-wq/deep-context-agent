@@ -244,6 +244,20 @@ def test_deadline_before_model_call(tmp_path):
         assert not model.generation_attempts
 
 
+def test_persistent_budget_ignores_legacy_deadline_but_enforces_unit(tmp_path):
+    model = SequenceChatModel(responses=[AIMessage(content="must not run")])
+    with AgentRuntime(settings(tmp_path), provider(), model=model) as runtime:
+        runtime._persistent_budget = True
+        runtime._reliability.start_budget(persistent=True)
+        assert runtime._reliability.deadline is None
+        runtime._reliability.begin_unit(8, timeout_seconds=30)
+        runtime._reliability.unit_deadline = 0
+        with pytest.raises(AgentError) as caught:
+            runtime.ask("Answer briefly.")
+        assert classify_failure(caught.value) == "unit_deadline"
+        assert not model.generation_attempts
+
+
 def test_configuration_validates_reliability_limits(tmp_path):
     with pytest.raises(AgentError):
         replace(settings(tmp_path), model_output_tokens=-1)

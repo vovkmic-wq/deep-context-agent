@@ -235,7 +235,7 @@ def test_storage_boundary_drops_raw_tool_results_and_physical_paths(
 def test_schema_v1_is_migrated_idempotently(tmp_path: Path) -> None:
     path = tmp_path / "diagnostics.sqlite3"
     with _store(tmp_path) as store:
-        assert store.schema_version == 3
+        assert store.schema_version == 4
     with sqlite3.connect(path) as connection:
         connection.execute("ALTER TABLE request_attempts DROP COLUMN query_preview")
         connection.execute("DROP TABLE provider_attempt_records")
@@ -272,9 +272,38 @@ def test_schema_v1_is_migrated_idempotently(tmp_path: Path) -> None:
             "SELECT provider, outcome FROM provider_attempt_records"
         ).fetchall()
 
-    assert version == 3
+    assert version == 4
     assert "query_preview" in columns
     assert provider_rows == [("zhipu", "active_success")]
+
+
+def test_web_task_events_are_ordered_redacted_and_replayable(tmp_path: Path) -> None:
+    secret = "EVENT_SECRET_72914"
+    with DiagnosticStore(
+        tmp_path / "diagnostics.sqlite3",
+        known_secrets=(secret,),
+    ) as store:
+        store.record_task_start("event-task", "autopilot")
+        first = store.record_task_event(
+            "event-task",
+            "job_progress",
+            {
+                "phase": "discover",
+                "completed_units": 1,
+                "message": secret,
+            },
+        )
+        second = store.record_task_event(
+            "event-task",
+            "job_progress",
+            {"phase": "implement", "changed_files": 1},
+        )
+        replay = store.task_events("event-task", after_sequence=first)
+
+    assert (first, second) == (1, 2)
+    assert [event["sequence"] for event in replay] == [2]
+    assert replay[0]["data"]["phase"] == "implement"
+    assert secret not in json.dumps(replay, ensure_ascii=False)
 
 
 def test_exception_group_preserves_both_safe_error_types() -> None:

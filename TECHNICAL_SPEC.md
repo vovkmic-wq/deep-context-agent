@@ -1,5 +1,32 @@
 # Техническое задание: Deep Context Agent
 
+## Целевое дополнение 0.27: durable scheduler и фазовое исполнение
+
+Нормативные требования: `DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md` S01–S12;
+порядок реализации: `DEEP_CONTEXT_AGENT_0_27_DURABLE_SCHEDULER_PROMPT.md`;
+Web/API/UX: `DEEP_CONTEXT_AGENT_0_27_WEB_DURABLE_SCHEDULER_PROMPT.md`.
+До выполнения A01–A20 это требования, а не описание реализованной версии 0.26.0.
+
+Persistent job не принадлежит одному HTTP request, SSE connection, model turn или
+process. SQLite scheduler хранит очередь, claim/lease/generation, phase, четыре
+временных бюджета, кумулятивные resource counters, evidence и executable next
+operation. Restart/reconnect не повторяет подтверждённые side effects.
+
+Обязательный фазовый автомат: DISCOVER → PLAN → IMPLEMENT → VERIFY → REPAIR →
+COMPLETE. Полное discovery ограничено двумя units по умолчанию; повторные list,
+search, covered range, heartbeat и model prose не считаются прогрессом. После
+ceiling runtime переходит к реализации, допустимой reasoning escalation или
+структурированному blocker. Allow-write не означает запись любой ценой: безопасный
+результат IMPLEMENT — mutation receipt либо точная причина невозможности. В
+read-only/Ask/Plan мутации запрещены.
+
+Раздельные timeout: model turn, unit, суммарное active task time и абсолютный wall
+TTL. Handoff обновляет unit deadline только при новом evidence, но не обнуляет
+active/wall/token/cost/tool/retry budgets и не расширяет права. Legacy
+`AGENT_TASK_TIMEOUT_SECONDS` остаётся для одноходовых операций и не завершает всю
+durable job. UI раздельно показывает yielded/failed/completed и понятную причину
+terminal state вместо одного `units=0/N`.
+
 ## Дополнение 0.26: bounded progress, adaptive resources и observable memory
 
 Нормативный документ: `AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md` (P01–P15),

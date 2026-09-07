@@ -80,6 +80,20 @@ def classify_failure(exc: BaseException) -> str:
         if code in {
             "task_cancelled",
             "task_deadline",
+            "model_turn_timeout",
+            "unit_deadline",
+            "task_active_time_exhausted",
+            "task_wall_time_exhausted",
+            "discovery_budget_exhausted",
+            "discovery_exhausted_without_implementation",
+            "implementation_blocked_missing_information",
+            "implementation_blocked_scope_conflict",
+            "implementation_blocked_permission_denied",
+            "implementation_blocked_unsupported_tool",
+            "implementation_blocked_spec_conflict",
+            "verification_failed",
+            "repair_budget_exhausted",
+            "cancelled_by_operator",
             "model_attempt_budget",
             "no_verified_progress",
             "generation_truncated",
@@ -215,7 +229,7 @@ def _neutral_query_preview(text: str) -> str:
 class DiagnosticStore:
     """Thread-safe SQLite journal deliberately isolated from agent rollback."""
 
-    schema_version = 3
+    schema_version = 4
 
     def __init__(
         self,
@@ -315,6 +329,16 @@ class DiagnosticStore:
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS web_task_events (
+            task_id TEXT NOT NULL REFERENCES web_tasks(task_id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            PRIMARY KEY(task_id, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS web_task_events_task
+        ON web_task_events(task_id, sequence);
         CREATE TABLE IF NOT EXISTS model_generations (
             attempt_id TEXT PRIMARY KEY,
             request_id TEXT NOT NULL REFERENCES request_attempts(request_id)
@@ -879,6 +903,136 @@ class DiagnosticStore:
                     raise DiagnosticStoreError("Persistent Web task is missing")
         except sqlite3.Error as exc:
             raise DiagnosticStoreError("Cannot persist terminal Web event") from exc
+
+    def record_task_event(
+        self,
+        task_id: str,
+        event: str,
+        data: Mapping[str, object],
+    ) -> int:
+        """Append one bounded, redacted SSE event and return its sequence."""
+
+        safe: dict[str, object] = {}
+        names = {
+            "task_id",
+            "request_id",
+            "kind",
+            "status",
+            "phase",
+            "mode",
+            "workflow",
+            "error_type",
+            "provider",
+            "model",
+            "partial_reason",
+            "renewal_reason",
+            "last_progress_kind",
+        }
+        numbers = {
+            "duration_ms",
+            "files_indexed",
+            "files_unchanged",
+            "files_skipped",
+            "files_scanned",
+            "found_files",
+            "matched",
+            "excluded",
+            "chunks_written",
+            "error_count",
+            "completed_units",
+            "yielded_units",
+            "failed_units",
+            "interrupted_units",
+            "attempts",
+            "replans",
+            "phase_attempts",
+            "lease_generation",
+            "checkpoint_revision",
+            "file_reads",
+            "unique_lines_read",
+            "discovery_units",
+            "discovery_searches",
+            "changed_files",
+            "checks_run",
+            "active_time_seconds",
+            "active_time_limit_seconds",
+            "active_time_remaining_seconds",
+            "wall_time_seconds",
+            "wall_time_limit_seconds",
+            "wall_time_remaining_seconds",
+            "last_heartbeat_at",
+            "last_progress_at",
+        }
+        booleans = {"partial", "retryable", "cursor_available", "terminal"}
+        for name in names:
+            if data.get(name) is not None:
+                safe[name] = redact_sensitive_text(
+                    str(data[name]), known_secrets=self.known_secrets
+                )[:500]
+        for name in numbers:
+            value = data.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                safe[name] = value
+        for name in booleans:
+            if name in data:
+                safe[name] = bool(data[name])
+        audit = data.get("audit")
+        if isinstance(audit, Mapping):
+            safe["audit"] = {
+                key: value
+                for key, value in audit.items()
+                if key in {"total", "pending", "reviewed", "partial", "failed"}
+                and isinstance(value, (int, float, bool))
+            }
+        if data.get("message") is not None and event in _TERMINAL_EVENTS:
+            safe["message"] = redact_sensitive_text(
+                str(data["message"]), known_secrets=self.known_secrets
+            )[:2_000]
+        now = utc_now()
+        try:
+            with self._lock, self._connection:
+                row = self._connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM web_task_events "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                sequence = int(row[0])
+                self._connection.execute(
+                    "INSERT INTO web_task_events(task_id, sequence, event, "
+                    "event_json, created_at_utc) VALUES (?, ?, ?, ?, ?)",
+                    (task_id, sequence, event[:100], _json(safe), now),
+                )
+                self._connection.execute(
+                    "UPDATE web_tasks SET updated_at_utc = ? WHERE task_id = ?",
+                    (now, task_id),
+                )
+        except sqlite3.Error as exc:
+            raise DiagnosticStoreError("Cannot persist Web task event") from exc
+        return sequence
+
+    def task_events(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 1_000,
+    ) -> list[dict[str, object]]:
+        """Read a bounded ordered event page for SSE replay."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence, event, event_json FROM web_task_events "
+                "WHERE task_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
+                (task_id, max(0, after_sequence), max(1, min(limit, 10_000))),
+            ).fetchall()
+        return [
+            {
+                "sequence": int(row["sequence"]),
+                "event": str(row["event"]),
+                "data": json.loads(str(row["event_json"])),
+            }
+            for row in rows
+        ]
 
     def task(self, task_id: str) -> dict[str, object] | None:
         """Read one persistent Web task without exposing request contents."""

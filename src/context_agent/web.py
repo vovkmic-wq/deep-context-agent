@@ -40,7 +40,11 @@ from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from context_agent import __version__
-from context_agent.autopilot import AutopilotProgress, AutopilotStore
+from context_agent.autopilot import (
+    AutopilotProgress,
+    AutopilotRevisionError,
+    AutopilotStore,
+)
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore
 from context_agent.diagnostics import (
@@ -142,6 +146,76 @@ _SETTINGS = {
         "minimum": 2,
         "maximum": 12,
     },
+    "model_turn_timeout_seconds": {
+        "environment": "AGENT_MODEL_TURN_TIMEOUT_SECONDS",
+        "label": "Таймаут ответа модели / Model turn timeout",
+        "comment": "Предел одного вызова LLM; не является сроком всей задачи.",
+        "minimum": 10,
+        "maximum": 7_200,
+    },
+    "autopilot_unit_timeout_seconds": {
+        "environment": "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS",
+        "label": "Время одного этапа / Work unit timeout",
+        "comment": (
+            "Предел одной ограниченной work unit; истечение не завершает всю задачу."
+        ),
+        "minimum": 30,
+        "maximum": 7_200,
+    },
+    "autopilot_task_active_time_seconds": {
+        "environment": "AGENT_AUTOPILOT_TASK_ACTIVE_TIME_SECONDS",
+        "label": "Активное время задачи / Active task time",
+        "comment": (
+            "Суммарное время выполнения units; пауза, очередь и downtime его "
+            "не расходуют."
+        ),
+        "minimum": 60,
+        "maximum": 604_800,
+    },
+    "autopilot_max_wall_time_seconds": {
+        "environment": "AGENT_AUTOPILOT_MAX_WALL_TIME_SECONDS",
+        "label": "Срок хранения задачи / Task wall-clock TTL",
+        "comment": "Абсолютный срок задачи, включая паузы и перезапуски процесса.",
+        "minimum": 60,
+        "maximum": 2_592_000,
+    },
+    "discovery_max_units": {
+        "environment": "AGENT_DISCOVERY_MAX_UNITS",
+        "label": "Этапов изучения / Discovery units",
+        "comment": "После этого предела агент обязан перейти к действию или blocker.",
+        "minimum": 1,
+        "maximum": 100,
+    },
+    "discovery_max_reads": {
+        "environment": "AGENT_DISCOVERY_MAX_READS",
+        "label": "Уникальных чтений / Unique discovery reads",
+        "comment": "Повтор одного диапазона не увеличивает этот счётчик.",
+        "minimum": 1,
+        "maximum": 10_000,
+    },
+    "discovery_max_unique_lines": {
+        "environment": "AGENT_DISCOVERY_MAX_UNIQUE_LINES",
+        "label": "Уникальных строк / Unique discovery lines",
+        "comment": (
+            "Максимальное покрытие строк перед обязательным переходом к действию."
+        ),
+        "minimum": 100,
+        "maximum": 10_000_000,
+    },
+    "discovery_max_searches": {
+        "environment": "AGENT_DISCOVERY_MAX_SEARCHES",
+        "label": "Уникальных поисков / Unique discovery searches",
+        "comment": "Дубликаты glob/grep/context search не продлевают изучение.",
+        "minimum": 1,
+        "maximum": 1_000,
+    },
+    "targeted_discovery_max_units": {
+        "environment": "AGENT_TARGETED_DISCOVERY_MAX_UNITS",
+        "label": "Точечное доизучение / Targeted discovery units",
+        "comment": "Допустимый малый бюджет точечного чтения после начала реализации.",
+        "minimum": 0,
+        "maximum": 20,
+    },
 }
 _WORK_MODES = {
     "agent": (
@@ -209,6 +283,10 @@ class JobRequest(BaseModel):
     allow_write: bool = False
     include_patterns: list[str] = Field(default_factory=list, max_length=100)
     exclude_patterns: list[str] = Field(default_factory=list, max_length=100)
+
+
+class JobControlRequest(BaseModel):
+    revision: int | None = Field(default=None, ge=0)
 
 
 class IndexRequest(BaseModel):
@@ -313,6 +391,45 @@ _AGENT_FAILURE_MESSAGES = {
     ),
     "task_cancelled": "Отменено локально; остановка inference не подтверждена.",
     "task_deadline": "Достигнут бюджет времени задачи. Состояние сохранено.",
+    "model_turn_timeout": (
+        "Один вызов модели превысил свой лимит времени. Задача и прогресс сохранены."
+    ),
+    "unit_deadline": (
+        "Текущий ограниченный этап превысил лимит времени. Его можно повторить "
+        "без сброса прогресса всей задачи."
+    ),
+    "task_active_time_exhausted": (
+        "Исчерпан суммарный бюджет активного вычисления задачи. Прогресс сохранён."
+    ),
+    "task_wall_time_exhausted": (
+        "Истёк абсолютный срок жизни задачи, включая паузы и перезапуски."
+    ),
+    "discovery_budget_exhausted": (
+        "Лимит этапа изучения достигнут. Требуется конкретная операция или blocker."
+    ),
+    "discovery_exhausted_without_implementation": (
+        "Изучение завершено, но безопасную операцию реализации определить не удалось."
+    ),
+    "implementation_blocked_missing_information": (
+        "Реализация остановлена: не хватает конкретных подтверждённых данных."
+    ),
+    "implementation_blocked_scope_conflict": (
+        "Реализация остановлена из-за конфликта согласованной области работы."
+    ),
+    "implementation_blocked_permission_denied": (
+        "Реализация требует отсутствующего разрешения на операцию."
+    ),
+    "implementation_blocked_unsupported_tool": (
+        "Реализация требует инструмента, которого нет в безопасном наборе runtime."
+    ),
+    "implementation_blocked_spec_conflict": (
+        "Реализация остановлена из-за противоречия требований технического задания."
+    ),
+    "verification_failed": (
+        "Фактические проверки остаются неуспешными после допустимых исправлений."
+    ),
+    "repair_budget_exhausted": "Исчерпан ограниченный бюджет циклов исправления.",
+    "cancelled_by_operator": "Задача отменена оператором до следующего side effect.",
     "task_authority_lost": "Разрешение выполнения задачи изменено. Worker остановлен.",
     "model_attempt_budget": "Достигнут бюджет вызовов модели. Состояние сохранено.",
     "soft_yield": "Этап безопасно передан следующей единице; прогресс сохранён.",
@@ -363,6 +480,8 @@ _RETRYABLE_AGENT_FAILURES = frozenset(
         "provider_timeout",
         "provider_unavailable",
         "autopilot_lease_lost",
+        "model_turn_timeout",
+        "unit_deadline",
     }
 )
 
@@ -450,7 +569,29 @@ class TaskRegistry:
                     "duration_ms",
                     round((time.monotonic() - submitted_at) * 1_000),
                 )
-            record: dict[str, object] = {"event": event, "data": safe_data}
+            try:
+                sequence = self._diagnostic_store.record_task_event(
+                    task.task_id,
+                    event,
+                    safe_data,
+                )
+            except Exception as exc:
+                sequence = 0
+                self._logger.error(
+                    "Cannot persist Web task event",
+                    extra={
+                        "event_code": "task_event_write_failed",
+                        "safe_fields": {
+                            "task_id": task.task_id,
+                            "exception_type": type(exc).__name__,
+                        },
+                    },
+                )
+            record: dict[str, object] = {
+                "event": event,
+                "data": safe_data,
+                "sequence": sequence,
+            }
             if event in {"completed", "partial", "blocked", "cancelled", "failed"}:
                 task.terminal_event = record
                 self._diagnostic_store.record_task_terminal(task.task_id, record)
@@ -585,13 +726,27 @@ class TaskRegistry:
                         "no_verified_progress",
                         "generation_truncated",
                         "generation_repetition",
+                        "task_active_time_exhausted",
+                        "task_wall_time_exhausted",
+                        "discovery_budget_exhausted",
+                        "discovery_exhausted_without_implementation",
+                        "implementation_blocked_missing_information",
+                        "implementation_blocked_scope_conflict",
+                        "implementation_blocked_permission_denied",
+                        "implementation_blocked_unsupported_tool",
+                        "implementation_blocked_spec_conflict",
+                        "verification_failed",
+                        "repair_budget_exhausted",
                     }
                     else "failed",
                     {
                         "task_id": task.task_id,
                         "request_id": task.request_id or task.task_id,
                         "error_type": error_code,
-                        "message": _AGENT_FAILURE_MESSAGES[error_code],
+                        "message": _AGENT_FAILURE_MESSAGES.get(
+                            error_code,
+                            "Задача остановлена безопасно; изучите диагностику.",
+                        ),
                         "retryable": error_code in _RETRYABLE_AGENT_FAILURES,
                     },
                 )
@@ -1353,6 +1508,10 @@ def create_app(
 
         loop.set_exception_handler(exception_handler)
         try:
+            with AutopilotStore(config.autopilot_database) as store:
+                resumable = store.resumable_jobs(workspace=config.workspace)
+            for persisted_job in resumable:
+                submit_persisted_job(persisted_job)
             yield
         finally:
             loop.set_exception_handler(previous_handler)
@@ -1520,6 +1679,17 @@ def create_app(
                     if routing_settings.enabled and routing_settings.profiles
                     else "configured-chain"
                 ),
+            },
+            durable_scheduler={
+                "model_turn_timeout_seconds": config.model_turn_timeout_seconds,
+                "unit_timeout_seconds": config.autopilot_unit_timeout_seconds,
+                "task_active_time_seconds": (config.autopilot_task_active_time_seconds),
+                "max_wall_time_seconds": config.autopilot_max_wall_time_seconds,
+                "discovery_max_units": config.discovery_max_units,
+                "discovery_max_reads": config.discovery_max_reads,
+                "discovery_max_unique_lines": (config.discovery_max_unique_lines),
+                "discovery_max_searches": config.discovery_max_searches,
+                "targeted_discovery_max_units": (config.targeted_discovery_max_units),
             },
         )
 
@@ -1706,6 +1876,12 @@ def create_app(
             else body.thread_id
         )
         use_autopilot = routing.execution == "persistent"
+        mode_instruction = _WORK_MODES[body.mode]
+        autopilot_objective = (
+            f"Режим работы: {body.mode}. {mode_instruction}\n\n{saved_task.objective}"
+            if saved_task is not None
+            else f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}"
+        )
         logger.info(
             "Chat routing decision",
             extra={
@@ -1734,7 +1910,6 @@ def create_app(
             with _runtime_factory(config, task_providers) as runtime:
                 if cancelled.is_set():
                     raise _TaskCancelledError
-                mode_instruction = _WORK_MODES[body.mode]
                 query = f"Режим работы: {body.mode}. {mode_instruction}\n\n{body.query}"
                 task_controls = getattr(runtime, "set_turn_controls", None)
                 if callable(task_controls):
@@ -1812,12 +1987,7 @@ def create_app(
                         },
                     )
                     job_answer = runtime.run_autopilot_job(
-                        (
-                            f"Режим работы: {body.mode}. {mode_instruction}\n\n"
-                            f"{saved_task.objective}"
-                            if saved_task is not None
-                            else query
-                        ),
+                        autopilot_objective,
                         thread_id=execution_thread_id,
                         allow_write=effective_allow_write,
                         progress_callback=chat_job_progress,
@@ -1991,6 +2161,27 @@ def create_app(
             task_id=task_id,
             request_id=task_id,
         )
+        queued_job_id: str | None = None
+        if use_autopilot:
+            with AutopilotStore(config.autopilot_database) as autopilot_store:
+                queued_job_id = autopilot_store.enqueue(
+                    thread_id=execution_thread_id,
+                    objective=autopilot_objective,
+                    workspace=config.workspace,
+                    allow_write=effective_allow_write,
+                    batch_size=min(
+                        config.audit_batch_size,
+                        config.autopilot_unit_batch_size,
+                    ),
+                    workflow=routing.workflow,
+                    task_identity=saved_task.id if saved_task else None,
+                    model_turn_timeout_seconds=config.model_turn_timeout_seconds,
+                    unit_timeout_seconds=config.autopilot_unit_timeout_seconds,
+                    active_time_limit_seconds=(
+                        config.autopilot_task_active_time_seconds
+                    ),
+                    wall_time_limit_seconds=config.autopilot_max_wall_time_seconds,
+                )
         tasks.submit(
             (
                 f"chat_multitask_{'autopilot' if use_autopilot else 'turn'}"
@@ -2006,6 +2197,7 @@ def create_app(
         return _request_payload(
             request,
             task_id=task_id,
+            job_id=queued_job_id,
             work_mode=body.mode,
             worker_thread_id=execution_thread_id,
             requested_provider=task_providers[0].name,
@@ -2025,23 +2217,45 @@ def create_app(
         return _request_payload(request, task_id=task_id, status="cancelling")
 
     @app.get("/api/events/{task_id}")
-    def task_events(request: Request, task_id: str):
+    def task_events(
+        request: Request,
+        task_id: str,
+        after: int = Query(0, ge=0),
+    ):
         try:
             task = tasks.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "Task not found") from exc
 
         def stream() -> Iterator[str]:
-            if (
-                task.done.is_set()
-                and task.terminal_event is not None
-                and task.events.empty()
-            ):
-                terminal = task.terminal_event
-                event_name = str(terminal["event"])
-                data = json.dumps(terminal["data"], ensure_ascii=False)
-                yield f"event: {event_name}\ndata: {data}\n\n"
-                return
+            header = request.headers.get("last-event-id", "").strip()
+            try:
+                last_sequence = max(after, int(header) if header else 0)
+            except ValueError:
+                last_sequence = after
+            replay = (
+                diagnostics.task_events(
+                    task_id,
+                    after_sequence=last_sequence,
+                )
+                if last_sequence > 0 or task.events.empty()
+                else []
+            )
+            for persisted in replay:
+                raw_sequence = persisted["sequence"]
+                sequence = raw_sequence if isinstance(raw_sequence, int) else 0
+                event_name = str(persisted["event"])
+                data = json.dumps(persisted["data"], ensure_ascii=False)
+                yield f"id: {sequence}\nevent: {event_name}\ndata: {data}\n\n"
+                last_sequence = sequence
+                if event_name in {
+                    "completed",
+                    "partial",
+                    "blocked",
+                    "cancelled",
+                    "failed",
+                }:
+                    return
             while True:
                 try:
                     event = task.events.get(timeout=10)
@@ -2051,13 +2265,26 @@ def create_app(
                             event = task.terminal_event
                             event_name = str(event["event"])
                             data = json.dumps(event["data"], ensure_ascii=False)
-                            yield f"event: {event_name}\ndata: {data}\n\n"
+                            raw_sequence = event.get("sequence")
+                            sequence = (
+                                raw_sequence if isinstance(raw_sequence, int) else 0
+                            )
+                            if sequence and sequence <= last_sequence:
+                                break
+                            prefix = f"id: {sequence}\n" if sequence else ""
+                            yield f"{prefix}event: {event_name}\ndata: {data}\n\n"
                         break
                     yield ": heartbeat\n\n"
                     continue
                 event_name = str(event["event"])
+                raw_sequence = event.get("sequence")
+                sequence = raw_sequence if isinstance(raw_sequence, int) else 0
+                if sequence and sequence <= last_sequence:
+                    continue
                 data = json.dumps(event["data"], ensure_ascii=False)
-                yield f"event: {event_name}\ndata: {data}\n\n"
+                prefix = f"id: {sequence}\n" if sequence else ""
+                yield f"{prefix}event: {event_name}\ndata: {data}\n\n"
+                last_sequence = max(last_sequence, sequence)
                 if event_name in {
                     "completed",
                     "partial",
@@ -2278,18 +2505,140 @@ def create_app(
             ],
         )
 
+    def submit_persisted_job(details: Mapping[str, object]) -> str:
+        """Reconcile one queued/crash-interrupted job into the worker pool."""
+
+        task_id = uuid4().hex
+        try:
+            include = tuple(json.loads(str(details.get("include_patterns") or "[]")))
+            exclude = tuple(json.loads(str(details.get("exclude_patterns") or "[]")))
+        except (json.JSONDecodeError, TypeError):
+            include, exclude = (), ()
+        objective = str(details.get("objective") or "").strip()
+        thread_id = str(details.get("thread_id") or "web-recovered").strip()
+        workflow = str(details.get("workflow") or "project-audit")
+        allow_write = str(details.get("mode")) == "allow-write"
+        parent_request_id = diagnostics.start_request(
+            query=objective,
+            thread_id=thread_id,
+            operation_kind="web_scheduler_recovery",
+            source="web",
+            app_version=__version__,
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            task_id=task_id,
+            request_id=task_id,
+        )
+
+        def operation(
+            emit: Callable[[str, Mapping[str, object]], None],
+            cancelled: threading.Event,
+        ) -> object:
+            def progress_callback(
+                progress: AutopilotProgress,
+                audit: AuditProgress | None,
+                event: str,
+            ) -> None:
+                payload: dict[str, object] = progress.as_dict()
+                if audit is not None:
+                    payload["audit"] = audit.as_dict()
+                emit(
+                    {
+                        "replanned": "job_replanned",
+                        "verification": "job_verification",
+                        "heartbeat": "job_heartbeat",
+                        "unit_deadline": "job_deadline",
+                    }.get(event, "job_progress"),
+                    payload,
+                )
+                if cancelled.is_set() and not progress.terminal:
+                    with AutopilotStore(config.autopilot_database) as store:
+                        store.set_control_status(progress.job_id, "cancelled")
+
+            task_identity = (
+                str(details["task_identity"]) if details.get("task_identity") else None
+            )
+            saved_task = None
+            if task_identity is not None:
+                with TaskStateStore(config.context_database) as state:
+                    saved_task = state.recover_claim(
+                        task_identity,
+                        thread_id,
+                        config.workspace,
+                        task_id,
+                        config.autopilot_lease_seconds + 60,
+                    )
+            outcome = "blocked"
+            try:
+                with _runtime_factory(config, provider_registry.snapshot()) as runtime:
+                    controls = getattr(runtime, "set_turn_controls", None)
+                    if callable(controls):
+                        controls(cancelled=cancelled, task=saved_task)
+                    result = runtime.run_autopilot_job(
+                        objective,
+                        thread_id=thread_id,
+                        allow_write=allow_write,
+                        include_patterns=include,
+                        exclude_patterns=exclude,
+                        progress_callback=progress_callback,
+                        diagnostic_source="web",
+                        diagnostic_task_id=task_id,
+                        workflow=workflow,
+                        task_identity=task_identity,
+                    )
+                    with AutopilotStore(config.autopilot_database) as store:
+                        progress = store.progress(str(details["id"]))
+                    outcome = {
+                        "complete": "completed",
+                        "blocked": "blocked",
+                        "cancelled": "cancelled",
+                    }.get(progress.status, "partial")
+                    return {
+                        "answer": result,
+                        "job_id": progress.job_id,
+                        "task_status": outcome,
+                        "runtime": (
+                            runtime._provider_failover_middleware.runtime_metadata()
+                        ),
+                    }
+            finally:
+                if saved_task is not None:
+                    with TaskStateStore(config.context_database) as state:
+                        state.finish(
+                            saved_task,
+                            "cancelled" if cancelled.is_set() else outcome,
+                            f"recovered_request:{task_id}; outcome:{outcome}",
+                        )
+
+        tasks.submit(
+            "autopilot_recovery",
+            operation,
+            task_id=task_id,
+            request_id=parent_request_id,
+        )
+        return task_id
+
     def submit_job(body: JobRequest) -> tuple[str, str]:
         task_id = uuid4().hex
         include = tuple(body.include_patterns)
         exclude = tuple(body.exclude_patterns)
-        job_id = AutopilotStore.job_id_for(
-            thread_id=body.thread_id,
-            objective=body.objective,
-            workspace=config.workspace,
-            allow_write=body.allow_write,
-            include_patterns=include,
-            exclude_patterns=exclude,
-        )
+        with AutopilotStore(config.autopilot_database) as store:
+            job_id = store.enqueue(
+                thread_id=body.thread_id,
+                objective=body.objective,
+                workspace=config.workspace,
+                allow_write=body.allow_write,
+                batch_size=min(
+                    config.audit_batch_size,
+                    config.autopilot_unit_batch_size,
+                ),
+                include_patterns=include,
+                exclude_patterns=exclude,
+                model_turn_timeout_seconds=config.model_turn_timeout_seconds,
+                unit_timeout_seconds=config.autopilot_unit_timeout_seconds,
+                active_time_limit_seconds=(config.autopilot_task_active_time_seconds),
+                wall_time_limit_seconds=config.autopilot_max_wall_time_seconds,
+            )
 
         def operation(
             emit: Callable[[str, Mapping[str, object]], None],
@@ -2380,49 +2729,81 @@ def create_app(
         return _request_payload(request, job=details)
 
     @app.post("/api/jobs/{job_id}/pause")
-    def pause_job(request: Request, job_id: str):
+    def pause_job(
+        request: Request,
+        job_id: str,
+        body: JobControlRequest | None = None,
+    ):
         with AutopilotStore(config.autopilot_database) as store:
             try:
-                progress = store.set_control_status(job_id, "paused")
+                progress = store.set_control_status(
+                    job_id,
+                    "paused",
+                    expected_revision=body.revision if body else None,
+                )
             except ValueError as exc:
                 raise HTTPException(404, "Autopilot job not found") from exc
+            except AutopilotRevisionError as exc:
+                raise HTTPException(409, str(exc)) from exc
         return _request_payload(request, progress=progress.as_dict())
 
     @app.post("/api/jobs/{job_id}/cancel")
-    def cancel_job(request: Request, job_id: str):
+    def cancel_job(
+        request: Request,
+        job_id: str,
+        body: JobControlRequest | None = None,
+    ):
         with AutopilotStore(config.autopilot_database) as store:
             try:
-                progress = store.set_control_status(job_id, "cancelled")
+                progress = store.set_control_status(
+                    job_id,
+                    "cancelled",
+                    expected_revision=body.revision if body else None,
+                )
             except ValueError as exc:
                 raise HTTPException(404, "Autopilot job not found") from exc
+            except AutopilotRevisionError as exc:
+                raise HTTPException(409, str(exc)) from exc
         return _request_payload(request, progress=progress.as_dict())
 
     @app.post("/api/jobs/{job_id}/resume", status_code=202)
-    def resume_job(request: Request, job_id: str):
+    def resume_job(
+        request: Request,
+        job_id: str,
+        body: JobControlRequest | None = None,
+    ):
         with AutopilotStore(config.autopilot_database) as store:
             try:
                 details = store.details(job_id)
             except ValueError as exc:
                 raise HTTPException(404, "Autopilot job not found") from exc
-        raw_include = details.get("include_patterns")
-        raw_exclude = details.get("exclude_patterns")
-        body = JobRequest(
-            objective=str(details["objective"]),
-            thread_id=str(details["thread_id"]),
-            allow_write=details["mode"] == "allow-write",
-            include_patterns=(
-                [str(item) for item in raw_include]
-                if isinstance(raw_include, list)
-                else []
-            ),
-            exclude_patterns=(
-                [str(item) for item in raw_exclude]
-                if isinstance(raw_exclude, list)
-                else []
-            ),
+            if (
+                body is not None
+                and body.revision is not None
+                and (
+                    details.get("checkpoint_revision")
+                    if isinstance(details.get("checkpoint_revision"), int)
+                    else 0
+                )
+                != body.revision
+            ):
+                raise HTTPException(409, "Autopilot job revision is stale")
+            try:
+                progress = store.set_control_status(
+                    job_id,
+                    "running",
+                    expected_revision=body.revision if body else None,
+                )
+            except AutopilotRevisionError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            details = store.details(job_id)
+        task_id = submit_persisted_job(details)
+        return _request_payload(
+            request,
+            job_id=job_id,
+            task_id=task_id,
+            revision=progress.checkpoint_revision,
         )
-        resumed_job_id, task_id = submit_job(body)
-        return _request_payload(request, job_id=resumed_job_id, task_id=task_id)
 
     @app.get("/api/jobs/{job_id}/report")
     def job_report(request: Request, job_id: str):

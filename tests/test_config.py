@@ -282,6 +282,14 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_AUTOPILOT_LEASE_SECONDS": "1200",
             "AGENT_AUTOPILOT_HEARTBEAT_SECONDS": "20",
             "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS": "1500",
+            "AGENT_MODEL_TURN_TIMEOUT_SECONDS": "240",
+            "AGENT_AUTOPILOT_TASK_ACTIVE_TIME_SECONDS": "20000",
+            "AGENT_AUTOPILOT_MAX_WALL_TIME_SECONDS": "90000",
+            "AGENT_DISCOVERY_MAX_UNITS": "3",
+            "AGENT_DISCOVERY_MAX_READS": "24",
+            "AGENT_DISCOVERY_MAX_UNIQUE_LINES": "2500",
+            "AGENT_DISCOVERY_MAX_SEARCHES": "9",
+            "AGENT_TARGETED_DISCOVERY_MAX_UNITS": "2",
             "AGENT_AUTOPILOT_UNIT_BATCH_SIZE": "3",
             "AGENT_AUTOPILOT_RECURSION_LIMIT": "50",
             "AGENT_FAILURE_LOG_MODE": "metadata",
@@ -318,6 +326,14 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.autopilot_lease_seconds == 1_200
     assert config.autopilot_heartbeat_seconds == 20
     assert config.autopilot_unit_timeout_seconds == 1_500
+    assert config.model_turn_timeout_seconds == 240
+    assert config.autopilot_task_active_time_seconds == 20_000
+    assert config.autopilot_max_wall_time_seconds == 90_000
+    assert config.discovery_max_units == 3
+    assert config.discovery_max_reads == 24
+    assert config.discovery_max_unique_lines == 2_500
+    assert config.discovery_max_searches == 9
+    assert config.targeted_discovery_max_units == 2
     assert config.autopilot_unit_batch_size == 3
     assert config.autopilot_recursion_limit == 50
     assert config.failure_log_mode == "metadata"

@@ -1,4 +1,4 @@
-"""Opt-in 0.26 live test for runtime-owned soft yield and durable receipts."""
+"""Opt-in 0.27 live test for durable work units, restart, and exact-once receipts."""
 
 # ruff: noqa: RUF001 -- exact Russian live acceptance instructions
 

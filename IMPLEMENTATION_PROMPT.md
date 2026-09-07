@@ -1,5 +1,36 @@
 # Управляющий промпт реализации
 
+## Целевой этап 0.27: durable scheduler и evidence-driven execution
+
+Выполняй `DEEP_CONTEXT_AGENT_0_27_DURABLE_SCHEDULER_PROMPT.md` строго по
+`DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md` (S01–S12, A01–A20), а Web-часть —
+по `DEEP_CONTEXT_AGENT_0_27_WEB_DURABLE_SCHEDULER_PROMPT.md`. Это целевой этап:
+до изменения кода и повторной приёмки не называй его реализованным.
+
+Корневая проблема подтверждена diagnostic
+`83bbc5d39bf7410b87462378c5259487`: persistent project-change после семи
+успешных soft yields остановился общим 900-second `task_deadline`, имея 960
+прочитанных строк, но 0 changed files и 0 checks. Нельзя исправлять это только
+увеличением timeout.
+
+Production-основа: отдельный durable scheduler, фазовый автомат
+DISCOVER→PLAN→IMPLEMENT→VERIFY→REPAIR, evidence-driven renewal и четыре независимых
+временных бюджета. Handoff выдаёт новый unit deadline только при новом durable
+evidence, но не сбрасывает active/wall/token/cost/tool budgets или права. Discovery
+ограничен; после ceiling обязателен executable transition, допустимая reasoning
+escalation либо точный structured blocker. В allow-write IMPLEMENT требуется
+реальная mutation receipt или blocker, а не фиктивная запись. Ask/Plan/read-only
+никогда не принуждаются к мутации.
+
+Web/CLI используют один runtime. HTTP/SSE disconnect не владеет job; restart
+восстанавливает queue/lease/phase без replay side effects. UI показывает
+completed/yielded/failed отдельно, четыре таймера, discovery counters, last verified
+progress и next executable operation. Не проси пользователя выбирать batch size.
+
+Перед повышением версии обязательны A01–A20, полный regression suite и минимум два
+изолированных live-прогона исходного service-layer сценария с disconnect/reconnect,
+restart, mutation, check и terminal. Подготовка этих документов не является PASS.
+
 ## Этап 0.26: bounded progress, adaptive routing и observable memory
 
 При реализации этого этапа выполняй
