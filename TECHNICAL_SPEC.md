@@ -1,5 +1,24 @@
 # Техническое задание: Deep Context Agent
 
+## Целевое дополнение 0.28: production orchestration
+
+Нормативный документ: `PRODUCTION_ORCHESTRATION_TECHNICAL_SPEC.md`; порядок:
+`DEEP_CONTEXT_AGENT_0_28_PRODUCTION_ORCHESTRATION_PROMPT.md`. Обязательны R01–R07
+и A01–A14.
+
+Межмодульная реализация с service/CLI/API/UI/tests всегда является persistent
+`project-change`; команды в логах не маршрутизируют runtime. Точечное чтение,
+массовое discovery, запись и checks — независимые capabilities. Сеть и destructive
+operations сохраняют отдельные существующие tool/path gates. Проверки не требуют
+разрешения на аудит.
+
+После mutation receipt verification запускается scheduler-ом через фиксированный
+allowlist; только PASS runtime даёт COMPLETE. Work units изолированы и компактны,
+полная durable-цель не replay-ится. Перед IMPLEMENT используется ограниченный
+schema-first snapshot. Provider timeout открывает circuit и быстро передаёт вызов
+разрешённому fallback. Parent diagnostics агрегирует фактические дочерние model/tool
+evidence и side effects с сохранением redaction.
+
 ## Целевое дополнение 0.27: durable scheduler и фазовое исполнение
 
 Нормативные требования: `DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md` S01–S12;

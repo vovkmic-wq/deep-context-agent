@@ -1,5 +1,24 @@
 # Техническое задание: веб-интерфейс Deep Context Agent
 
+## Целевое дополнение 0.28: orchestration и агрегированная диагностика
+
+Web API использует тот же structured router и runtime, что CLI. В accepted/SSE
+metadata показываются workflow, execution и независимые `project_discovery` /
+`project_checks` / `write`; UI не трактует checks как полный аудит. Межмодульная
+разработка выполняется persistent units, а анализ вставленного лога остаётся
+одноходовым без workspace scan.
+
+Прогресс VERIFY создаёт runtime, а не текст модели. COMPLETE отображается только
+после фактического PASS allowlisted checks; иначе UI показывает partial/blocked,
+неуспешную проверку и diagnostic ID. Настройки содержат русско-английские поля
+порога и cooldown provider circuit breaker. Provider metadata показывает
+closed/open и retry-after без ключей и raw ошибок.
+
+Диагностика родительской Web-задачи показывает агрегированные числа child model
+generations, provider attempts, tool operations и filesystem side effects. Детали
+остаются bounded/redacted. Schema-first snapshot и полный objective не выводятся в
+чат; пользователь видит фазу, bounded next operation и факт усечения с SHA-256.
+
 ## Целевое дополнение 0.27: durable task lifecycle
 
 Реализовывать по `DEEP_CONTEXT_AGENT_0_27_WEB_DURABLE_SCHEDULER_PROMPT.md` и

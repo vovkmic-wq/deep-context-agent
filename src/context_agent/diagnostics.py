@@ -632,7 +632,7 @@ class DiagnosticStore:
         duration_ms: int,
         error_code: str | None = None,
     ) -> None:
-        """Finish an accepted async parent without inventing child evidence."""
+        """Finish a parent and aggregate only persisted descendant evidence."""
 
         if request_id is None or status not in {
             "completed",
@@ -642,21 +642,91 @@ class DiagnosticStore:
             "failed",
         }:
             return
-        with self._lock, self._connection:
-            self._connection.execute(
+        with self._lock:
+            parent = self._connection.execute(
+                "SELECT status, error_code, exception_chain_json, retryable, "
+                "provider_attempts_json, tool_audit_json, rollback_attempted, "
+                "rollback_success, rollback_checkpoint_rows, rollback_write_rows, "
+                "filesystem_side_effects FROM request_attempts WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if parent is None:
+                return
+            if str(parent["status"]) != "in_progress":
+                return
+            descendants = self._connection.execute(
                 """
-                UPDATE request_attempts
-                SET status = ?, finished_at_utc = ?, duration_ms = ?, error_code = ?
-                WHERE request_id = ? AND status = 'in_progress'
+                WITH RECURSIVE descendants(request_id) AS (
+                    SELECT request_id FROM request_attempts
+                    WHERE parent_request_id = ?
+                    UNION ALL
+                    SELECT child.request_id FROM request_attempts AS child
+                    JOIN descendants AS parent
+                      ON child.parent_request_id = parent.request_id
+                )
+                SELECT provider_attempts_json, tool_audit_json,
+                       rollback_attempted, rollback_success,
+                       rollback_checkpoint_rows, rollback_write_rows,
+                       filesystem_side_effects
+                FROM request_attempts
+                WHERE request_id IN (SELECT request_id FROM descendants)
+                ORDER BY created_at_utc, rowid
+                LIMIT 1000
                 """,
-                (
-                    status,
-                    utc_now(),
-                    max(0, duration_ms),
-                    error_code[:100] if error_code else None,
-                    request_id,
-                ),
+                (request_id,),
+            ).fetchall()
+        provider_attempts: list[dict[str, object]] = json.loads(
+            str(parent["provider_attempts_json"])
+        )
+        tool_audit: list[dict[str, object]] = json.loads(str(parent["tool_audit_json"]))
+        rollback_attempted = bool(parent["rollback_attempted"])
+        rollback_success = (
+            None
+            if parent["rollback_success"] is None
+            else bool(parent["rollback_success"])
+        )
+        checkpoint_rows = int(parent["rollback_checkpoint_rows"])
+        write_rows = int(parent["rollback_write_rows"])
+        filesystem_side_effects = bool(parent["filesystem_side_effects"])
+        for row in descendants:
+            provider_attempts.extend(json.loads(str(row["provider_attempts_json"])))
+            tool_audit.extend(json.loads(str(row["tool_audit_json"])))
+            rollback_attempted = rollback_attempted or bool(row["rollback_attempted"])
+            if row["rollback_success"] is not None:
+                child_success = bool(row["rollback_success"])
+                rollback_success = (
+                    child_success
+                    if rollback_success is None
+                    else rollback_success and child_success
+                )
+            checkpoint_rows += int(row["rollback_checkpoint_rows"])
+            write_rows += int(row["rollback_write_rows"])
+            filesystem_side_effects = filesystem_side_effects or bool(
+                row["filesystem_side_effects"]
             )
+        for ordinal, attempt in enumerate(provider_attempts, start=1):
+            attempt["ordinal"] = ordinal
+        self._finish_request(
+            request_id,
+            status=status,
+            provider_attempts=provider_attempts,
+            tool_audit=tool_audit,
+            duration_ms=duration_ms,
+            rollback_attempted=rollback_attempted,
+            rollback_success=rollback_success,
+            rollback_checkpoint_rows=checkpoint_rows,
+            rollback_write_rows=write_rows,
+            filesystem_side_effects=filesystem_side_effects,
+            error_code=(
+                str(parent["error_code"])
+                if parent["error_code"]
+                else error_code[:100]
+                if error_code
+                else None
+            ),
+            exception_chain=json.loads(str(parent["exception_chain_json"])),
+            retryable=bool(parent["retryable"]),
+        )
 
     def _finish_request(
         self,
@@ -1179,6 +1249,29 @@ class DiagnosticStore:
                 (request_id,),
             ).fetchall()
         result["children"] = [self._summary(child) for child in children]
+        child_generations: list[dict[str, object]] = []
+        for child in children:
+            child_generations.extend(self.model_attempts(str(child["request_id"])))
+        parent_generations = result.get("model_generations")
+        combined_generations = (
+            list(parent_generations) if isinstance(parent_generations, list) else []
+        )
+        if child_generations:
+            combined_generations.extend(child_generations)
+            result["model_generations"] = combined_generations[:1000]
+        provider_attempts = result.get("provider_attempts")
+        tool_audit = result.get("tool_audit")
+        result["aggregate"] = {
+            "child_count": len(children),
+            "provider_attempt_count": (
+                len(provider_attempts) if isinstance(provider_attempts, list) else 0
+            ),
+            "tool_operation_count": (
+                len(tool_audit) if isinstance(tool_audit, list) else 0
+            ),
+            "model_generation_count": len(combined_generations),
+            "filesystem_side_effects": result["filesystem_side_effects"],
+        }
         if include_query:
             result["query"] = row["query_text"]
             result["query_available"] = row["query_text"] is not None

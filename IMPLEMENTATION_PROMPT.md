@@ -1,5 +1,23 @@
 # Управляющий промпт реализации
 
+## Целевой этап 0.28: production orchestration
+
+Выполняй `DEEP_CONTEXT_AGENT_0_28_PRODUCTION_ORCHESTRATION_PROMPT.md` строго по
+`PRODUCTION_ORCHESTRATION_TECHNICAL_SPEC.md` (R01–R07, A01–A14). Маршрутизация
+учитывает межмодульный footprint до точных путей; quoted logs остаются данными.
+Targeted read, project discovery, write и project checks являются независимыми
+capabilities. `run_project_checks` не является discovery.
+
+VERIFY принадлежит runtime: mutation receipt запускает allowlisted checks, а
+модель не устанавливает PASS/COMPLETE. Каждая unit получает новый worker thread,
+одну операцию, objective/contract по 12 000 символов и не replay-ит полную историю.
+Перед IMPLEMENT runtime строит schema-first snapshot names/signatures/fields.
+Транспортный сбой открывает быстрый provider circuit и немедленно допускает
+разрешённый fallback. Terminal parent агрегирует durable child diagnostics.
+
+Нельзя лечить эти дефекты увеличением timeout или текста системного промпта.
+До A01–A14 и записи реальных результатов этап не считается production PASS.
+
 ## Целевой этап 0.27: durable scheduler и evidence-driven execution
 
 Выполняй `DEEP_CONTEXT_AGENT_0_27_DURABLE_SCHEDULER_PROMPT.md` строго по

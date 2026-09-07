@@ -214,6 +214,7 @@ class TaskStateStore:
                 route,
                 mutation_requested=False,
                 allow_project_scan=False,
+                allow_project_checks=False,
                 execution="persistent" if execution == "autopilot" else "single-turn",
                 workflow="log-analysis"
                 if route.workflow == "log-analysis"
@@ -470,6 +471,12 @@ def resume_route(
         ),
         scope=saved["scope"],
         allow_project_scan=bool(saved["allow_project_scan"]),
+        allow_project_checks=bool(
+            saved.get(
+                "allow_project_checks",
+                saved.get("workflow") in {"project-change", "project-test"},
+            )
+        ),
         mutation_requested=(
             task.allow_write
             and mode not in {"ask", "plan"}

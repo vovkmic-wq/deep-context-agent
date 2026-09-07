@@ -5,6 +5,16 @@ CLI-агент на Python и Deep Agents с долговременным SQLite
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
 Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
+## Production orchestration — 0.28.0
+
+Маршрутизатор различает точечную правку и межмодульную разработку; чтение,
+project discovery, запись и project checks разрешаются независимо. Проверки после
+изменений запускает runtime, а не модель, и только их PASS завершает задачу.
+Ограниченные work units получают schema-first contract и не повторяют миллионный
+prompt. После транспортного сбоя provider circuit быстро переключает вызов на
+разрешённый fallback. Родительская Web-диагностика агрегирует дочерние model/tool
+evidence и реальные файловые side effects.
+
 ## Durable scheduler и наблюдаемые ресурсы — 0.27.0
 
 Persistent-задача теперь отделена от одного model turn: используются независимые
@@ -194,6 +204,8 @@ AGENT_EXTERNAL_EMBEDDING_FALLBACK=false
 AGENT_MODEL_CALL_RETRIES=3
 AGENT_MODEL_RETRY_INITIAL_DELAY=1
 AGENT_MODEL_RETRY_MAX_DELAY=15
+AGENT_PROVIDER_CIRCUIT_FAILURE_THRESHOLD=1
+AGENT_PROVIDER_CIRCUIT_COOLDOWN_SECONDS=300
 AGENT_WEB_RETRY_ATTEMPTS=3
 AGENT_RECURSION_LIMIT=100
 AGENT_AUDIT_BATCH_SIZE=8

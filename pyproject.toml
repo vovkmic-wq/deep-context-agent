@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deep-context-agent"
-version = "0.27.0"
+version = "0.28.0"
 description = "A persistent, searchable Deep Agents CLI and secure local web UI."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
@@ -53,8 +53,10 @@ include = [
   "/DEEP_CONTEXT_AGENT_0_26_BOUNDED_PROGRESS_RECOVERY_PROMPT.md",
   "/DEEP_CONTEXT_AGENT_0_27_DURABLE_SCHEDULER_PROMPT.md",
   "/DEEP_CONTEXT_AGENT_0_27_WEB_DURABLE_SCHEDULER_PROMPT.md",
+  "/DEEP_CONTEXT_AGENT_0_28_PRODUCTION_ORCHESTRATION_PROMPT.md",
   "/AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md",
   "/DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md",
+  "/PRODUCTION_ORCHESTRATION_TECHNICAL_SPEC.md",
   "/TASK_RESUME_MODEL_ROUTING_SPEC.md",
 ]
 

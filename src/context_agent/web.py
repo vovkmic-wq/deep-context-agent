@@ -153,6 +153,20 @@ _SETTINGS = {
         "minimum": 10,
         "maximum": 7_200,
     },
+    "provider_circuit_failure_threshold": {
+        "environment": "AGENT_PROVIDER_CIRCUIT_FAILURE_THRESHOLD",
+        "label": "Порог circuit breaker / Circuit failure threshold",
+        "comment": "Число транспортных сбоев до быстрого перехода к fallback.",
+        "minimum": 1,
+        "maximum": 10,
+    },
+    "provider_circuit_cooldown_seconds": {
+        "environment": "AGENT_PROVIDER_CIRCUIT_COOLDOWN_SECONDS",
+        "label": "Пауза circuit breaker / Circuit cooldown",
+        "comment": "Сколько секунд не вызывать временно недоступную модель.",
+        "minimum": 1,
+        "maximum": 86_400,
+    },
     "autopilot_unit_timeout_seconds": {
         "environment": "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS",
         "label": "Время одного этапа / Work unit timeout",
@@ -1894,6 +1908,7 @@ def create_app(
                     "workflow": routing.workflow,
                     "scope": routing.scope,
                     "allow_project_scan": routing.allow_project_scan,
+                    "allow_project_checks": routing.allow_project_checks,
                     "mutation_requested": routing.mutation_requested,
                     "confidence": routing.confidence,
                     "reason_codes": ",".join(routing.reason_codes),
@@ -1937,6 +1952,7 @@ def create_app(
                             or routing.workflow in {"plan", "debug"}
                         ),
                         project_scan_allowed=routing.allow_project_scan,
+                        project_checks_allowed=routing.allow_project_checks,
                     )
 
                 def chat_job_progress(

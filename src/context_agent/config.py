@@ -353,6 +353,8 @@ class AppConfig:
     model_local_only: bool = False
     model_retry_initial_delay: float = 1.0
     model_retry_max_delay: float = 15.0
+    provider_circuit_failure_threshold: int = 1
+    provider_circuit_cooldown_seconds: int = 300
     web_retry_attempts: int = 3
     recursion_limit: int = 100
     audit_batch_size: int = 8
@@ -582,6 +584,14 @@ class AppConfig:
             raise ConfigurationError(
                 "AGENT_EXECUTION_ESCALATION_MAX_EVENTS must be between 0 and 10"
             )
+        if not 1 <= self.provider_circuit_failure_threshold <= 10:
+            raise ConfigurationError(
+                "AGENT_PROVIDER_CIRCUIT_FAILURE_THRESHOLD must be between 1 and 10"
+            )
+        if not 1 <= self.provider_circuit_cooldown_seconds <= 86_400:
+            raise ConfigurationError(
+                "AGENT_PROVIDER_CIRCUIT_COOLDOWN_SECONDS must be between 1 and 86400"
+            )
         if not 10 <= self.project_check_timeout_seconds <= 3_600:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS must be between 10 and 3600"
@@ -766,6 +776,16 @@ class AppConfig:
                 values,
                 "AGENT_MODEL_RETRY_MAX_DELAY",
                 15.0,
+            ),
+            provider_circuit_failure_threshold=_int_setting(
+                values,
+                "AGENT_PROVIDER_CIRCUIT_FAILURE_THRESHOLD",
+                1,
+            ),
+            provider_circuit_cooldown_seconds=_int_setting(
+                values,
+                "AGENT_PROVIDER_CIRCUIT_COOLDOWN_SECONDS",
+                300,
             ),
             web_retry_attempts=_int_setting(
                 values,

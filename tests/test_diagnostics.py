@@ -395,11 +395,26 @@ def test_parent_request_resolves_children_and_task_reference(tmp_path: Path) -> 
         assert parent and child
         store.complete_request(
             child,
-            provider_attempts=[],
-            tool_audit=[],
+            provider_attempts=[
+                {
+                    "provider": "zhipu",
+                    "model": "glm-test",
+                    "status": "success",
+                    "duration_ms": 2,
+                    "outcome": "completed",
+                }
+            ],
+            tool_audit=[
+                {
+                    "name": "write_file",
+                    "path": "/workspace/result.py",
+                    "status": "success",
+                }
+            ],
             duration_ms=3,
         )
         store.finish_parent(parent, status="partial", duration_ms=5)
+        store.finish_parent(parent, status="partial", duration_ms=6)
 
         by_parent = store.resolve_request(parent)
         by_task = store.resolve_request("web-task-parent")
@@ -413,6 +428,12 @@ def test_parent_request_resolves_children_and_task_reference(tmp_path: Path) -> 
     assert children[0]["task_id"] == "autopilot-job"
     assert children[0]["status"] == "completed"
     assert by_task["request_id"] == "request-parent"
+    assert by_parent["aggregate"]["child_count"] == 1
+    assert by_parent["aggregate"]["provider_attempt_count"] == 1
+    assert by_parent["aggregate"]["tool_operation_count"] == 1
+    assert by_parent["provider_attempts"][0]["provider"] == "zhipu"
+    assert by_parent["tool_audit"][0]["name"] == "write_file"
+    assert len(by_parent["provider_attempts"]) == 1
 
 
 def test_crash_recovery_marks_in_progress_request_and_task(tmp_path: Path) -> None:

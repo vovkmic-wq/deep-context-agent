@@ -272,6 +272,8 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_MODEL_CALL_RETRIES": "4",
             "AGENT_MODEL_RETRY_INITIAL_DELAY": "0.5",
             "AGENT_MODEL_RETRY_MAX_DELAY": "5",
+            "AGENT_PROVIDER_CIRCUIT_FAILURE_THRESHOLD": "2",
+            "AGENT_PROVIDER_CIRCUIT_COOLDOWN_SECONDS": "90",
             "AGENT_WEB_RETRY_ATTEMPTS": "2",
             "AGENT_RECURSION_LIMIT": "140",
             "AGENT_AUDIT_BATCH_SIZE": "6",
@@ -316,6 +318,8 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.model_call_retries == 4
     assert config.model_retry_initial_delay == 0.5
     assert config.model_retry_max_delay == 5
+    assert config.provider_circuit_failure_threshold == 2
+    assert config.provider_circuit_cooldown_seconds == 90
     assert config.web_retry_attempts == 2
     assert config.recursion_limit == 140
     assert config.audit_batch_size == 6

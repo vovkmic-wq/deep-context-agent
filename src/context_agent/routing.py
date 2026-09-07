@@ -89,6 +89,16 @@ _TEST_PATTERN = re.compile(
     r"(?iu)(?:\b(?:test|tests|testing|pytest|ruff|mypy)\b|"
     r"тест|провер\w*\s+(?:код|проект|сборк))"
 )
+_CROSS_MODULE_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:api|cli|ui|web|service|schema|model|database|migration)\b|"
+    r"интерфейс|сервис|схем|модел|баз\w*\s+дан|миграц|нескольк\w*\s+модул)"
+)
+_FULL_VERIFICATION_PATTERN = re.compile(
+    r"(?iu)(?:\b(?:full|complete|production)\s+(?:verification|checks?|test)|"
+    r"(?:run|perform)\s+(?:ruff|pytest|mypy)|"
+    r"пол\w*\s+проверк|провед\w*\s+(?:все\s+)?тест|"
+    r"запуст\w*\s+(?:ruff|pytest|mypy)|продакшн)"
+)
 _PLAN_PATTERN = re.compile(r"(?iu)(?:\bplan\b|план|спланир|уточняющ)")
 _PATH_PATTERN = re.compile(
     r"(?iu)(?:[a-z]:[\\/][^\s\"'<>|]+|/(?:workspace|[a-z0-9_.-]+)(?:/[^\s]+)*)"
@@ -119,6 +129,7 @@ class RoutingDecision:
     workflow: Workflow
     scope: Scope
     allow_project_scan: bool
+    allow_project_checks: bool
     confidence: float
     reason_codes: tuple[str, ...]
     instruction_chars: int
@@ -196,6 +207,8 @@ def route_chat_request(
     audit = bool(_AUDIT_PATTERN.search(instruction))
     broad = bool(_BROAD_SCOPE_PATTERN.search(instruction))
     testing = bool(_TEST_PATTERN.search(instruction))
+    cross_module = len(_CROSS_MODULE_PATTERN.findall(instruction)) >= 2
+    full_verification = bool(_FULL_VERIFICATION_PATTERN.search(instruction))
     paths = tuple(
         match.group(0).rstrip(".,;:!?") for match in _PATH_PATTERN.finditer(instruction)
     )
@@ -204,7 +217,9 @@ def route_chat_request(
     )
 
     scope: Scope
-    if exact_file_path:
+    if exact_file_path and not (
+        mutation_requested and (cross_module or (full_verification and broad))
+    ):
         scope = "file"
     elif project_scope or (mutation_requested and project_artifact):
         scope = "project"
@@ -237,11 +252,24 @@ def route_chat_request(
     allow_project_scan = project_workflow or (
         scope == "project" and workflow in {"plan", "debug"}
     )
+    allow_project_checks = (
+        testing
+        or full_verification
+        or workflow
+        in {
+            "project-change",
+            "project-test",
+        }
+    )
     reasons: list[str] = [f"WORKFLOW_{workflow.upper().replace('-', '_')}"]
     if direct.excluded_data_chars:
         reasons.append("QUOTED_DATA_EXCLUDED")
     if read_only:
         reasons.append("READ_ONLY_INTENT")
+    if cross_module:
+        reasons.append("CROSS_MODULE_CHANGE")
+    if full_verification:
+        reasons.append("FULL_VERIFICATION_REQUESTED")
 
     if work_mode in {"ask", "plan", "debug"}:
         execution: ExecutionMode = "single-turn"
@@ -275,6 +303,7 @@ def route_chat_request(
         workflow=workflow,
         scope=scope,
         allow_project_scan=allow_project_scan,
+        allow_project_checks=allow_project_checks,
         confidence=confidence,
         reason_codes=tuple(reasons),
         instruction_chars=len(instruction),

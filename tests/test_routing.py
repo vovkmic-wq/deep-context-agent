@@ -132,3 +132,26 @@ def test_read_only_phrase_neutralizes_mutation_word() -> None:
 
     assert decision.workflow == "project-audit"
     assert decision.mutation_requested is False
+
+
+def test_cross_module_change_with_exact_paths_is_project_change() -> None:
+    decision = route_chat_request(
+        "Исправь API, CLI, web UI и tests в /workspace/src/app.py, затем "
+        "проведи все тесты и доведи код до продакшн."
+    )
+
+    assert decision.scope == "project"
+    assert decision.workflow == "project-change"
+    assert decision.execution == "persistent"
+    assert decision.allow_project_checks is True
+    assert "CROSS_MODULE_CHANGE" in decision.reason_codes
+    assert "FULL_VERIFICATION_REQUESTED" in decision.reason_codes
+
+
+def test_targeted_check_permission_is_independent_from_discovery() -> None:
+    decision = route_chat_request(
+        "Исправь /workspace/src/app.py и запусти pytest для проверки."
+    )
+
+    assert decision.allow_project_scan is False
+    assert decision.allow_project_checks is True

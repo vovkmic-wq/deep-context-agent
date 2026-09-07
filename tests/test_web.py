@@ -616,7 +616,11 @@ def test_auto_log_analysis_does_not_start_project_autopilot(
     assert started.json()["routing"]["execution"] == "single-turn"
     assert (
         "scope",
-        {"workspace_reads_allowed": False, "project_scan_allowed": False},
+        {
+            "workspace_reads_allowed": False,
+            "project_scan_allowed": False,
+            "project_checks_allowed": False,
+        },
     ) in calls
     assert ("write", False) in calls
     assert ("ask", True) in calls

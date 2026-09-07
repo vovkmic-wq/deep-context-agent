@@ -5,6 +5,35 @@
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-09-07
+
+### Добавлено
+
+- Schema-first snapshot публичных Python contracts перед implementation units.
+- Быстрый provider circuit breaker с настраиваемыми threshold/cooldown и безопасной
+  runtime-телеметрией.
+- Aggregate counts и дочерние provider/tool evidence в parent Web diagnostics.
+- Независимая capability `project_checks`, не требующая project discovery.
+
+### Исправлено
+
+- Межмодульная production-разработка с точными путями больше не ошибочно попадает
+  в одноходовый `targeted-change`.
+- Точечная правка с pytest больше не получает ложный `project_discovery=false`
+  для `run_project_checks`.
+- Work units не получают миллионный objective: bounded-копия содержит SHA-256
+  полной durable-версии и отдельный bounded schema contract.
+- Parent terminal больше не выглядит пустым при наличии дочерних model/tool calls.
+- Повторный запрос к единственному provider после нового пользовательского хода не
+  блокируется circuit предыдущего хода, когда fallback отсутствует.
+
+### Проверено
+
+- Ruff, mypy, 389 pytest-тестов, compileall, pip check, frontend checks и package
+  build проходят; один Windows symlink-тест пропущен по возможностям ОС.
+- Live GLM-5.3 и Web HTTP smoke проходят. Forced failover дошёл до OpenAI, который
+  вернул внешний 429; успешный fallback подтверждён детерминированным regression.
+
 ## [0.27.0] — 2026-09-07
 
 ### Добавлено

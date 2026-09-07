@@ -1,5 +1,33 @@
 # Статус реализации
 
+## Production orchestration 0.28.0 — реализовано, 2026-09-07
+
+Выполнены R01–R07 и A01–A14 из
+`PRODUCTION_ORCHESTRATION_TECHNICAL_SPEC.md`. Межмодульные запросы теперь
+маршрутизируются как persistent `project-change`, а точный файл с pytest сохраняет
+узкую область и получает независимое разрешение checks. `run_project_checks`
+удалён из project-discovery gate; актуальные права передаются модели раздельно.
+
+Runtime-owned VERIFY уже не зависит от добровольного tool call модели и только
+PASS фиксированного ProjectCheckRunner допускает COMPLETE. Work-unit objective
+ограничен 12 000 символами с SHA-256 полной durable-цели. Добавлен локальный
+schema-first snapshot Python contracts (до 200 файлов/500 symbols/12 000 символов)
+без тел файлов. Provider circuit открывается после одного транспортного сбоя на
+300 секунд и показывает безопасный state/retry-after. Terminal parent агрегирует
+persisted descendant provider/tool/rollback/filesystem evidence.
+
+Автоматическая приёмка: Ruff check/format — PASS; `mypy src` — PASS;
+`pytest -ra` — **389 passed, 1 skipped** за 40.43 s; skip относится только к
+недоступному Windows symlink. `compileall`, `pip check`, TypeScript noEmit,
+bundle/model tests и сборка wheel/sdist 0.28.0 — PASS.
+
+Изолированный live `doctor --live`: `zhipu/glm-5.3`, ответ `OK`, circuit threshold
+1/cooldown 300. Web smoke на `127.0.0.1:8878`: `/api/health` и `/` — HTTP 200,
+версия 0.28.0; сервер штатно остановлен, порт 8765 не затронут. Forced transport
+failure Zhipu подтвердил немедленную попытку OpenAI fallback; OpenAI вернул внешний
+`429 OpenAIRateLimitError`, поэтому успешный live fallback не заявляется. Локальный
+детерминированный circuit regression подтверждает skip открытого primary.
+
 ## Durable scheduler 0.27.0 — реализован, 2026-09-07
 
 По diagnostic `83bbc5d39bf7410b87462378c5259487` зафиксирован новый инцидент:

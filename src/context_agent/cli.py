@@ -421,6 +421,14 @@ def _run_doctor(args: argparse.Namespace, base_dir: Path) -> int:
     print(f"autopilot_unit_timeout_seconds={app_config.autopilot_unit_timeout_seconds}")
     print(f"model_turn_timeout_seconds={app_config.model_turn_timeout_seconds}")
     print(
+        "provider_circuit_failure_threshold="
+        f"{app_config.provider_circuit_failure_threshold}"
+    )
+    print(
+        "provider_circuit_cooldown_seconds="
+        f"{app_config.provider_circuit_cooldown_seconds}"
+    )
+    print(
         "autopilot_task_active_time_seconds="
         f"{app_config.autopilot_task_active_time_seconds}"
     )
