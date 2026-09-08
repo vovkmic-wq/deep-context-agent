@@ -68,9 +68,14 @@ from context_agent.project_audit import (
     AuditSelectionRules,
     ProjectAuditStore,
 )
-from context_agent.project_checks import ProjectCheckRunner
+from context_agent.project_checks import (
+    ProjectCheckRunner,
+    ProjectRootResolutionError,
+    resolve_project_root,
+)
 from context_agent.providers import create_chat_model
 from context_agent.reliability import ExecutionStopped, ReliabilityMiddleware
+from context_agent.repair import RepairConflictError, VerificationRepairStore
 from context_agent.routing import AUDIT_WORKFLOWS, PROJECT_WORKFLOWS, route_chat_request
 from context_agent.schema_contract import build_schema_contract
 from context_agent.semantic_routing import semantic_classifier
@@ -4664,15 +4669,16 @@ class AgentRuntime:
 
         targeted = workflow in {"targeted-review", "targeted-change"}
         development = workflow in {"project-change", "project-test"}
+        verification_only = workflow == "verification-only"
         phase_machine = allow_write and workflow in {
             "targeted-change",
             "project-change",
             "project-test",
         }
         self._tool_call_policy_middleware.set_routing_scope(
-            workspace_reads_allowed=targeted or development,
+            workspace_reads_allowed=targeted or development or verification_only,
             project_scan_allowed=development,
-            project_checks_allowed=development,
+            project_checks_allowed=development or verification_only,
         )
         self._tool_call_policy_middleware.set_mutations_allowed(
             allow_write and workflow in {"targeted-change", "project-change"}
@@ -4700,6 +4706,59 @@ class AgentRuntime:
                 return state.checkpoint_by_id(durable_task_identity)
 
         self._emit_autopilot_progress(progress_callback, progress, None, "started")
+        if verification_only:
+            self._tool_call_policy_middleware.set_mutations_allowed(allow_write)
+            try:
+                project_root = resolve_project_root(
+                    self.app_config.workspace,
+                    seed_paths=self._verification_seed_paths(objective),
+                )
+            except ProjectRootResolutionError as exc:
+                return self._block_autopilot(
+                    lease,
+                    None,
+                    error_code=exc.error_code,
+                    safe_message=str(exc),
+                    callback=progress_callback,
+                    blocker=self._verification_root_blocker(exc, objective),
+                )
+            self.autopilot_store.set_next_operation(
+                lease,
+                NextOperation(
+                    phase="verify",
+                    operation="run_checks",
+                    target=self._virtual_workspace_path(project_root),
+                    objective="Run allowlisted checks from the resolved project root.",
+                    expected_effect="Authoritative project-check results.",
+                    verification_commands=("run_project_checks",),
+                    component=project_root.name,
+                ),
+            )
+            verification = self._run_autopilot_verification(
+                lease=lease,
+                objective=objective,
+                callback=progress_callback,
+                audit_progress=None,
+                diagnostic_source=diagnostic_source,
+                diagnostic_task_id=diagnostic_task_id,
+                project_root=project_root,
+                verification_only=True,
+                repair_allowed=allow_write,
+            )
+            if verification is not None:
+                return verification
+            report = (
+                "Verification-only task completed: all configured checks passed "
+                f"in {self._virtual_workspace_path(project_root)}."
+            )
+            progress = self.autopilot_store.mark_complete(lease, report)
+            self._emit_autopilot_progress(
+                progress_callback,
+                progress,
+                None,
+                "complete",
+            )
+            return self._format_autopilot_response(progress, message=report)
         # This method is entered only for an explicitly persistent workflow.
         # A targeted task can legitimately cross many successful soft-yield
         # boundaries; retry_attempts limits failures, not useful work units.
@@ -4802,6 +4861,27 @@ class AgentRuntime:
                         reason="reconciled-existing-mutation-receipt",
                     )
                 if phase == "verify":
+                    try:
+                        with VerificationRepairStore(
+                            self.app_config.autopilot_database,
+                            workspace=self.app_config.workspace,
+                        ) as repair_store:
+                            repair_store.assert_verification_state(lease.job_id)
+                    except RepairConflictError as exc:
+                        return self._block_autopilot(
+                            lease,
+                            None,
+                            error_code="stale_evidence",
+                            safe_message=str(exc),
+                            callback=progress_callback,
+                            blocker={
+                                "category": "stale_evidence",
+                                "required_action": (
+                                    "Run a fresh read-only verification and request "
+                                    "a new approval."
+                                ),
+                            },
+                        )
                     verification = self._run_autopilot_verification(
                         lease=lease,
                         objective=objective,
@@ -4927,9 +5007,17 @@ class AgentRuntime:
             )
             try:
                 with heartbeat:
-                    self._tool_call_policy_middleware.set_mutation_guard(
-                        lambda: self.autopilot_store.assert_lease(lease)
-                    )
+                    repair_target = validated_operation.target
+
+                    def mutation_guard(target: str = repair_target) -> None:
+                        self.autopilot_store.assert_lease(lease)
+                        with VerificationRepairStore(
+                            self.app_config.autopilot_database,
+                            workspace=self.app_config.workspace,
+                        ) as repair_store:
+                            repair_store.assert_write(lease.job_id, target)
+
+                    self._tool_call_policy_middleware.set_mutation_guard(mutation_guard)
                     try:
                         answer = self.ask(
                             request,
@@ -5257,6 +5345,36 @@ class AgentRuntime:
                     reason="implementation-receipt",
                 )
                 continue
+            if phase_machine and phase == "repair":
+                mutation_completed = (
+                    self.autopilot_store.verified_mutation_count(lease.job_id)
+                    > before_mutations
+                )
+                if not mutation_completed:
+                    return self._block_autopilot(
+                        lease,
+                        None,
+                        error_code="repair_no_mutation",
+                        safe_message=(
+                            "Repair completed without a verified mutation receipt."
+                        ),
+                        callback=progress_callback,
+                        blocker=self._no_mutation_blocker(
+                            validated_operation.as_dict()
+                        ),
+                    )
+                self.autopilot_store.transition_phase(
+                    lease,
+                    "verify",
+                    reason="approved-repair-receipt",
+                )
+                self._emit_autopilot_progress(
+                    progress_callback,
+                    self.autopilot_store.progress(lease.job_id),
+                    None,
+                    "phase_transition",
+                )
+                continue
             if phase_machine and phase == "targeted-discovery":
                 information_delta = (
                     completed_progress.file_reads > before_progress.file_reads
@@ -5452,9 +5570,87 @@ class AgentRuntime:
             # Tool receipts and content hashes still prevent duplicate effects.
             return candidates[0]
         return next(
-            iter(self.autopilot_store.recent_read_targets(job_id, limit=20)),
+            (
+                target
+                for target in self.autopilot_store.recent_read_targets(
+                    job_id,
+                    limit=20,
+                )
+                if not self._protected_inferred_mutation_target(target)
+            ),
             "",
         )
+
+    @staticmethod
+    def _protected_inferred_mutation_target(target: str) -> bool:
+        """Reject config/manifests that are known only from a read receipt."""
+
+        normalized = target.replace("\\", "/").casefold()
+        name = normalized.rsplit("/", 1)[-1]
+        return (
+            name
+            in {
+                "pyproject.toml",
+                "setup.cfg",
+                "setup.py",
+                "package.json",
+                "package-lock.json",
+                "poetry.lock",
+                "uv.lock",
+            }
+            or "/.github/workflows/" in normalized
+        )
+
+    def _verification_seed_paths(self, objective: str) -> tuple[str, ...]:
+        """Extract only explicit workspace paths from the direct objective."""
+
+        seeds: list[str] = []
+        normalized = objective.replace("\\", "/")
+        quoted = re.findall(r"[\"'](/workspace/[^\"']+)[\"']", normalized)
+        unquoted = re.findall(r"/workspace/[^\s\"'<>|]+", normalized)
+        for match in (*quoted, *unquoted):
+            candidate = match.rstrip(".,;:!?)]}")
+            try:
+                resolve_inside(self.app_config.workspace, candidate)
+            except PathSecurityError:
+                continue
+            if candidate not in seeds:
+                seeds.append(candidate)
+        return tuple(seeds[:20])
+
+    def _virtual_workspace_path(self, path: Path) -> str:
+        relative = path.resolve().relative_to(self.app_config.workspace.resolve())
+        return "/workspace" + (f"/{relative.as_posix()}" if relative.parts else "")
+
+    def _verification_root_blocker(
+        self,
+        error: ProjectRootResolutionError,
+        objective: str,
+    ) -> dict[str, object]:
+        return {
+            "blocker_version": 1,
+            "error_code": error.error_code,
+            "category": "verification_prerequisite",
+            "summary": str(error)[:1_000],
+            "missing_prerequisites": [
+                {
+                    "kind": "project_root",
+                    "name": "pyproject.toml",
+                    "reason": str(error)[:500],
+                    "source": "project_root_resolver",
+                }
+            ],
+            "attempted_operation": {
+                "operation": "run_checks",
+                "phase": "verify",
+                "target": "",
+            },
+            "candidate_targets": list(self._verification_seed_paths(objective)),
+            "evidence_ids": [],
+            "required_action": "Name one project directory containing pyproject.toml.",
+            "retryable": True,
+            "source": "project_root_resolver",
+        }
 
     def _operation_blocker(
         self,
@@ -5607,10 +5803,32 @@ class AgentRuntime:
         audit_progress: AuditProgress | None,
         diagnostic_source: str,
         diagnostic_task_id: str | None,
+        project_root: Path | None = None,
+        verification_only: bool = False,
+        repair_allowed: bool = True,
     ) -> str | None:
         """Run allowlisted checks and bounded repair turns until they pass."""
 
-        for repair_cycle in range(self.app_config.autopilot_repair_cycles + 1):
+        repair_cycles = min(
+            self.app_config.autopilot_repair_cycles,
+            self.app_config.verification_max_repair_cycles
+            if verification_only
+            else self.app_config.autopilot_repair_cycles,
+        )
+        previous_failure_fingerprint = ""
+        identical_failures = 0
+        provider_timeouts = 0
+        approved_repair_target = ""
+        with VerificationRepairStore(
+            self.app_config.autopilot_database,
+            workspace=self.app_config.workspace,
+        ) as repair_store:
+            repair_relation = repair_store.relation_for_repair(lease.job_id)
+        if repair_relation is not None:
+            allowed_paths = repair_relation.get("allowed_paths", [])
+            if isinstance(allowed_paths, list) and len(allowed_paths) == 1:
+                approved_repair_target = str(allowed_paths[0])
+        for repair_cycle in range(repair_cycles + 1):
             current = self.autopilot_store.progress(lease.job_id)
             unit_id, _, _ = self.autopilot_store.begin_unit(
                 lease,
@@ -5626,18 +5844,43 @@ class AgentRuntime:
             )
             try:
                 with verification_heartbeat:
-                    results = self.project_check_runner.run()
+                    results = (
+                        self.project_check_runner.run(project_root=project_root)
+                        if project_root is not None
+                        else self.project_check_runner.run()
+                    )
                     verification_heartbeat.ensure_owned()
             except AutopilotLeaseError as exc:
                 raise AgentError(
                     "Autopilot lease ownership was lost; stale verifier stopped"
                 ) from exc
+            verification_root = (project_root or self.app_config.workspace).resolve()
+            virtual_root = str(verification_root).replace(
+                str(self.app_config.workspace), "/workspace"
+            )
             serialized: list[dict[str, object]] = [
                 {
                     "check": result.check,
+                    "command": [
+                        part.replace(str(self.app_config.workspace), "/workspace")
+                        for part in result.command
+                    ],
                     "status": result.status,
                     "return_code": result.return_code,
                     "duration_seconds": round(result.duration_seconds, 3),
+                    "cwd": virtual_root,
+                    "python_executable": (
+                        result.command[0].replace(
+                            str(self.app_config.workspace), "/workspace"
+                        )
+                        if result.command
+                        else ""
+                    ),
+                    "runner_correlation_id": f"{lease.job_id}:{unit_id}",
+                    "full_output_sha256": hashlib.sha256(
+                        result.output.encode("utf-8")
+                    ).hexdigest(),
+                    "output_truncated": len(result.output) > 4_000,
                     "output": result.output.replace(
                         str(self.app_config.workspace),
                         "/workspace",
@@ -5653,7 +5896,11 @@ class AgentRuntime:
                 unit_id,
                 {
                     "name": "run_project_checks",
-                    "path": "/workspace",
+                    "path": (
+                        self._virtual_workspace_path(project_root)
+                        if project_root is not None
+                        else "/workspace"
+                    ),
                     "status": "success" if results else "not_run",
                     "result_count": len(results),
                 },
@@ -5697,7 +5944,24 @@ class AgentRuntime:
                     audit_progress,
                     "No allowlisted project checks are configured.",
                 )
-            if repair_cycle >= self.app_config.autopilot_repair_cycles:
+            failure_fingerprint = hashlib.sha256(
+                json.dumps(serialized, ensure_ascii=False, sort_keys=True).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            identical_failures = (
+                identical_failures + 1
+                if failure_fingerprint == previous_failure_fingerprint
+                else 1
+            )
+            previous_failure_fingerprint = failure_fingerprint
+            if (
+                not repair_allowed
+                or self.app_config.verification_max_model_generations == 0
+                or repair_cycle >= repair_cycles
+                or identical_failures
+                >= self.app_config.verification_max_identical_failures
+            ):
                 return self._block_autopilot(
                     lease,
                     audit_progress,
@@ -5707,19 +5971,78 @@ class AgentRuntime:
                         "repair cycles; подробности сохранены в job."
                     ),
                     callback=callback,
+                    blocker=self._verification_failure_blocker(
+                        serialized,
+                        project_root,
+                    ),
                 )
 
+            repair_target = (
+                self._verification_repair_target(serialized, project_root)
+                if verification_only
+                else approved_repair_target
+            )
+            if verification_only and not repair_target:
+                blocker = self._verification_failure_blocker(
+                    serialized,
+                    project_root,
+                )
+                blocker["error_code"] = "verification_repair_target_unresolved"
+                blocker["required_action"] = (
+                    "The failed check must identify one existing workspace file."
+                )
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code="verification_repair_target_unresolved",
+                    safe_message=(
+                        "A check failed, but no single safe repair target was found."
+                    ),
+                    callback=callback,
+                    blocker=blocker,
+                )
+            repair_request = self._build_autopilot_repair_request(
+                objective,
+                serialized,
+                repair_cycle + 1,
+                target=repair_target,
+            )
+            if (
+                estimate_input_tokens(repair_request).tokens
+                > self.app_config.verification_max_input_tokens
+            ):
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code="verification_context_limit",
+                    safe_message=(
+                        "Verification repair context exceeded its bounded token limit."
+                    ),
+                    callback=callback,
+                    blocker=self._verification_failure_blocker(
+                        serialized,
+                        project_root,
+                    ),
+                )
             repair_id, sequence, repair_thread = self.autopilot_store.begin_unit(
                 lease,
                 phase="repair",
                 batch_size=job_progress.batch_size,
                 deadline_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
-            repair_request = self._build_autopilot_repair_request(
-                objective,
-                serialized,
-                repair_cycle + 1,
-            )
+            if repair_target:
+                self.autopilot_store.set_next_operation(
+                    lease,
+                    NextOperation(
+                        phase="repair",
+                        operation="edit_file",
+                        target=repair_target,
+                        objective="Repair the concrete failed-check target.",
+                        expected_effect="The failed allowlisted check can pass.",
+                        verification_commands=("run_project_checks",),
+                        component=Path(repair_target).name,
+                    ),
+                )
             repair_heartbeat = self._autopilot_heartbeat(
                 lease,
                 unit_id=repair_id,
@@ -5727,14 +6050,32 @@ class AgentRuntime:
                 callback=callback,
             )
             self._reliability.begin_unit(
-                self.app_config.autopilot_soft_model_calls_per_unit,
+                min(
+                    self.app_config.autopilot_soft_model_calls_per_unit,
+                    self.app_config.verification_max_model_calls_per_repair,
+                    self.app_config.verification_max_model_generations,
+                ),
                 timeout_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             self._active_autopilot_receipt_context = (lease, repair_id)
             try:
                 with repair_heartbeat:
+
+                    def repair_mutation_guard(
+                        target: str = repair_target,
+                    ) -> None:
+                        self.autopilot_store.assert_lease(lease)
+                        with VerificationRepairStore(
+                            self.app_config.autopilot_database,
+                            workspace=self.app_config.workspace,
+                        ) as repair_store:
+                            repair_store.assert_write(lease.job_id, target)
+
                     self._tool_call_policy_middleware.set_mutation_guard(
-                        lambda: self.autopilot_store.assert_lease(lease)
+                        repair_mutation_guard
+                    )
+                    self._tool_call_policy_middleware.set_mutation_target(
+                        repair_target or None
                     )
                     try:
                         answer = self.ask(
@@ -5751,6 +6092,7 @@ class AgentRuntime:
                             recursion_limit=(self.app_config.autopilot_recursion_limit),
                         )
                     finally:
+                        self._tool_call_policy_middleware.set_mutation_target(None)
                         self._tool_call_policy_middleware.set_mutation_guard(None)
                     repair_heartbeat.ensure_owned()
             except AgentError as exc:
@@ -5763,6 +6105,8 @@ class AgentRuntime:
                         "Autopilot lease ownership was lost; stale repair stopped"
                     ) from lease_exc
                 code = classify_failure(exc)
+                if code == "provider_timeout":
+                    provider_timeouts += 1
                 if code == "soft_yield":
                     self.autopilot_store.yield_unit(
                         lease,
@@ -5782,7 +6126,11 @@ class AgentRuntime:
                     error_code=code,
                     summary=f"Repair unit {sequence} failed safely.",
                 )
-                if code not in {
+                if (
+                    code == "provider_timeout"
+                    and provider_timeouts
+                    >= self.app_config.verification_max_provider_timeouts
+                ) or code not in {
                     "agent_step_limit",
                     "context_window_exceeded",
                     "provider_timeout",
@@ -5815,22 +6163,95 @@ class AgentRuntime:
             )
         return None
 
+    def _verification_repair_target(
+        self,
+        results: Sequence[Mapping[str, object]],
+        project_root: Path | None,
+    ) -> str:
+        """Resolve exactly one existing file named by failed-check evidence."""
+
+        if project_root is None:
+            return ""
+        candidates: list[str] = []
+        pattern = re.compile(
+            r"(?m)(?<![\w./-])((?:src|tests)/[\w./-]+\."
+            r"(?:py|pyi|js|jsx|ts|tsx|toml|ya?ml|json))(?=[:\s])",
+            re.IGNORECASE,
+        )
+        for result in results:
+            if str(result.get("status") or "") == "passed":
+                continue
+            for relative in pattern.findall(str(result.get("output") or "")):
+                local = (project_root / relative).resolve(strict=False)
+                if (
+                    local.is_file()
+                    and local.is_relative_to(project_root)
+                    and local.is_relative_to(self.app_config.workspace.resolve())
+                ):
+                    target = self._virtual_workspace_path(local)
+                    if target not in candidates:
+                        candidates.append(target)
+        return candidates[0] if len(candidates) == 1 else ""
+
+    def _verification_failure_blocker(
+        self,
+        results: Sequence[Mapping[str, object]],
+        project_root: Path | None,
+    ) -> dict[str, object]:
+        failed = [
+            str(item.get("check") or "unknown")
+            for item in results
+            if str(item.get("status") or "") != "passed"
+        ]
+        return {
+            "blocker_version": 1,
+            "error_code": "verification_failed",
+            "category": "verification_failure",
+            "summary": "Allowlisted project checks did not pass.",
+            "missing_prerequisites": [
+                {
+                    "kind": "passing_check",
+                    "name": check,
+                    "reason": "The authoritative check result is not passed.",
+                    "source": "project_check_runner",
+                }
+                for check in failed[:10]
+            ],
+            "attempted_operation": {
+                "operation": "run_checks",
+                "phase": "verify",
+                "target": (
+                    self._virtual_workspace_path(project_root)
+                    if project_root is not None
+                    else "/workspace"
+                ),
+            },
+            "candidate_targets": [],
+            "evidence_ids": failed[:10],
+            "required_action": "Repair only the concrete failures shown above.",
+            "retryable": True,
+            "source": "project_check_runner",
+        }
+
     @staticmethod
     def _build_autopilot_repair_request(
         objective: str,
         results: Sequence[Mapping[str, object]],
         cycle: int,
+        *,
+        target: str = "",
     ) -> str:
         bounded = json.dumps(results, ensure_ascii=False, sort_keys=True)[:12_000]
         return (
             f"{_AUTOPILOT_WORK_UNIT_MARKER}\n"
             f'{{"phase":"repair","cycle":{cycle},'
-            f'"mutation_authorized":true}}\n'
+            f'"mutation_authorized":true,"target":{json.dumps(target)}}}\n'
             "</autopilot_work_unit>\n\n"
             "Это ограниченная repair unit доверенного persistent controller. "
             "Исправь только подтверждённые текущими проверками причины внутри "
             "/workspace/. Сначала прочитай каждый изменяемый файл; не удаляй "
-            "данные, секреты или корень. Не запускай произвольный shell.\n\n"  # noqa: RUF001
+            "данные, секреты или корень. Изменяй только target из control JSON. "
+            "Не запускай произвольный shell.\n\n"  # noqa: RUF001
             f"Исходная цель:\n{objective[:4_000]}\n\n"
             f"Текущие результаты allowlisted checks:\n{bounded}"
         )
@@ -5851,12 +6272,33 @@ class AgentRuntime:
                 audit_progress.run_id,
                 "text",
             ).replace(str(self.app_config.workspace), "/workspace")
+        effective_blocker = dict(blocker or {})
+        if not effective_blocker:
+            effective_blocker = {
+                "blocker_version": 1,
+                "error_code": error_code or "internal_runtime_error",
+                "category": "runtime_blocker",
+                "summary": safe_message[:1_000],
+                "missing_prerequisites": [],
+                "attempted_operation": {
+                    "operation": "",
+                    "phase": self.autopilot_store.progress(lease.job_id).phase,
+                    "target": "",
+                },
+                "candidate_targets": [],
+                "evidence_ids": [],
+                "required_action": (
+                    "Inspect the preserved diagnostic and resume safely."
+                ),
+                "retryable": False,
+                "source": "runtime_fallback",
+            }
         progress = self.autopilot_store.mark_blocked(
             lease,
             error_code=error_code,
             safe_message=safe_message,
             report=report,
-            blocker=blocker,
+            blocker=effective_blocker,
         )
         self._emit_autopilot_progress(
             callback,

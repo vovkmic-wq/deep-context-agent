@@ -65,6 +65,49 @@ def test_background_failure_keeps_redacted_exception_in_parent_journal(
     assert secret not in serialized
 
 
+def test_background_blocked_result_propagates_error_to_parent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "diagnostics.sqlite3"
+    with DiagnosticStore(database) as journal:
+        request_id = journal.start_request(
+            query="verify project",
+            thread_id="web",
+            operation_kind="web_chat_parent",
+            source="web",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            request_id="parent-blocked",
+        )
+        registry = TaskRegistry(journal, logging.getLogger("test-web-blocked"))
+
+        def block(_emit, _cancel):
+            return {
+                "task_status": "blocked",
+                "error_type": "verification_failed",
+                "blocker": {"category": "verification_failure"},
+            }
+
+        task_id = registry.submit(
+            "test",
+            block,
+            task_id="task-blocked",
+            request_id=request_id,
+        )
+        task = registry.get(task_id)
+        assert task.done.wait(timeout=5)
+        registry.close()
+        record = journal.request("parent-blocked")
+
+    assert record["status"] == "blocked"
+    assert record["error_code"] == "verification_failed"
+    assert task.terminal_event is not None
+    assert task.terminal_event["data"]["blocker"]["category"] == (
+        "verification_failure"
+    )
+
+
 def _config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         project_root=tmp_path,
@@ -177,6 +220,121 @@ def test_autopilot_job_api_returns_identity_and_persistent_details(
     assert details.json()["job"]["progress"]["status"] == "complete"
     assert report.text == "persistent report /workspace"
     assert str(config.workspace) not in details.text + report.text
+
+
+def test_web_creates_confirmed_repair_as_a_separate_allow_write_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, csrf, config = _client(tmp_path)
+    config.prepare_directories()
+    project = config.workspace / "ozon_market_analytics"
+    target = project / "src" / "app.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("value=1\n", encoding="utf-8")
+    (project / "pyproject.toml").write_text(
+        "[project]\nname='sample'\n", encoding="utf-8"
+    )
+    with AutopilotStore(config.autopilot_database) as store:
+        source, lease = store.start_or_resume(
+            thread_id="repair-web",
+            objective="Verify the Ozon project.",
+            workspace=config.workspace,
+            allow_write=False,
+            batch_size=1,
+            workflow="verification-only",
+        )
+        store.record_verification(
+            lease,
+            status="failed",
+            results=[
+                {
+                    "check": "ruff_check",
+                    "command": ["python", "-m", "ruff", "check", "."],
+                    "return_code": 1,
+                    "status": "failed",
+                    "output": "src/app.py:1:6: E225 missing whitespace",
+                }
+            ],
+        )
+        source = store.mark_blocked(
+            lease,
+            error_code="verification_failed",
+            safe_message="Ruff failed.",
+            blocker={
+                "category": "verification_failure",
+                "attempted_operation": {
+                    "target": "/workspace/ozon_market_analytics/src/app.py"
+                },
+            },
+        )
+
+    def fake_job(self: AgentRuntime, objective: str, **kwargs: object) -> str:
+        del self, objective, kwargs
+        return "Repair worker accepted the approved operation."
+
+    monkeypatch.setattr(AgentRuntime, "run_autopilot_job", fake_job)
+    with client:
+        proposed = client.post(
+            f"/api/jobs/{source.job_id}/repair-proposals",
+            headers={"x-csrf-token": csrf},
+        )
+        assert proposed.status_code == 200
+        proposal = proposed.json()["items"][0]
+        denied = client.post(
+            f"/api/jobs/{source.job_id}/repair-task",
+            headers={"x-csrf-token": csrf},
+            json={
+                "confirmed": False,
+                "proposal_id": proposal["proposal_id"],
+                "expected_checkpoint_revision": source.checkpoint_revision,
+                "plan_sha256": proposal["plan_sha256"],
+                "evidence_snapshot_sha256": proposal["evidence_sha256"],
+                "idempotency_key": "repair-web-not-confirmed",
+                "evidence_ids": [],
+            },
+        )
+        assert denied.status_code == 409
+        created = client.post(
+            f"/api/jobs/{source.job_id}/repair-task",
+            headers={"x-csrf-token": csrf},
+            json={
+                "confirmed": True,
+                "proposal_id": proposal["proposal_id"],
+                "expected_checkpoint_revision": source.checkpoint_revision,
+                "plan_sha256": proposal["plan_sha256"],
+                "evidence_snapshot_sha256": proposal["evidence_sha256"],
+                "idempotency_key": "repair-web-confirmed-once",
+                "evidence_ids": [proposal["evidence"][0]["evidence_id"]],
+            },
+        )
+        repeated = client.post(
+            f"/api/jobs/{source.job_id}/repair-task",
+            headers={"x-csrf-token": csrf},
+            json={
+                "confirmed": True,
+                "proposal_id": proposal["proposal_id"],
+                "expected_checkpoint_revision": source.checkpoint_revision,
+                "plan_sha256": proposal["plan_sha256"],
+                "evidence_snapshot_sha256": proposal["evidence_sha256"],
+                "idempotency_key": "repair-web-confirmed-once",
+                "evidence_ids": [proposal["evidence"][0]["evidence_id"]],
+            },
+        )
+
+    assert created.status_code == 202
+    payload = created.json()
+    assert payload["source_job_id"] == source.job_id
+    assert repeated.status_code == 202
+    assert repeated.json()["repair_job_id"] == payload["repair_job_id"]
+    assert repeated.json()["reused"] is True
+    with AutopilotStore(config.autopilot_database) as store:
+        original = store.details(source.job_id)
+        repair = store.details(payload["repair_job_id"])
+    assert original["mode"] == "read-only"
+    assert original["status"] == "blocked"
+    assert repair["mode"] == "allow-write"
+    assert repair["phase"] in {"repair", "complete"}
 
 
 def test_web_mutations_require_csrf_and_reject_foreign_origin(tmp_path: Path) -> None:

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from context_agent.project_checks import ProjectCheckRunner
+from context_agent.project_checks import (
+    AmbiguousProjectRootError,
+    ProjectCheckRunner,
+    ProjectRootResolutionError,
+    resolve_project_root,
+)
 
 
 def test_project_check_runner_rejects_arbitrary_commands(tmp_path: Path) -> None:
@@ -70,3 +75,139 @@ def test_compileall_check_runs_with_fixed_arguments(tmp_path: Path) -> None:
     result = runner.run("compileall")[0]
     assert result.status == "passed"
     assert result.return_code == 0
+
+
+def test_resolve_project_root_uses_nearest_seed_manifest(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='outer'\n")
+    nested = tmp_path / "packages" / "ozon"
+    nested.mkdir(parents=True)
+    (nested / "pyproject.toml").write_text("[project]\nname='ozon'\n")
+    source = nested / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n")
+
+    resolved = resolve_project_root(
+        tmp_path,
+        seed_paths=("/workspace/packages/ozon/src/app.py",),
+    )
+
+    assert resolved == nested.resolve()
+
+
+def test_resolve_project_root_rejects_ambiguous_workspace(tmp_path: Path) -> None:
+    for name in ("one", "two"):
+        project = tmp_path / name
+        project.mkdir()
+        (project / "pyproject.toml").write_text(f"[project]\nname='{name}'\n")
+
+    with pytest.raises(AmbiguousProjectRootError):
+        resolve_project_root(tmp_path)
+
+
+def test_resolve_project_root_requires_manifest(tmp_path: Path) -> None:
+    with pytest.raises(ProjectRootResolutionError):
+        resolve_project_root(tmp_path)
+
+
+def test_runner_executes_from_explicit_nested_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "pyproject.toml").write_text("[project]\nname='nested'\n")
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2_000,
+    )
+
+    result = runner.run("ruff_check", project_root=nested)[0]
+
+    assert result.status == "passed"
+    assert captured["cwd"] == nested.resolve()
+
+
+def test_runner_rejects_project_root_outside_workspace(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-project"
+    outside.mkdir(exist_ok=True)
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2_000,
+    )
+
+    with pytest.raises(ValueError, match="escapes workspace"):
+        runner.run("ruff_check", project_root=outside)
+
+
+def test_runner_records_failed_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="failure evidence",
+            stderr="",
+        ),
+    )
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2_000,
+    )
+
+    result = runner.run("ruff_check")[0]
+
+    assert result.status == "failed"
+    assert result.return_code == 1
+    assert result.output == "failure evidence"
+
+
+def test_runner_records_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def timeout(command: list[str], **_kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(command, 30, output="partial")
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2_000,
+    )
+
+    result = runner.run("ruff_check")[0]
+
+    assert result.status == "timeout"
+    assert result.return_code is None
+    assert "partial" in result.output
+
+
+def test_runner_records_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_to_start(_command: list[str], **_kwargs: object) -> None:
+        raise OSError("executable unavailable")
+
+    monkeypatch.setattr(subprocess, "run", fail_to_start)
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2_000,
+    )
+
+    result = runner.run("ruff_check")[0]
+
+    assert result.status == "error"
+    assert result.return_code is None

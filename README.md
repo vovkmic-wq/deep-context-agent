@@ -5,6 +5,37 @@ CLI-агент на Python и Deep Agents с долговременным SQLite
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
 Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
+## Verification repair workflow — 0.31.0
+
+Нормативно определён безопасный переход от failed read-only проверки к новой
+allow-write repair-задаче: typed confirmation вместо сообщения «продолжи»,
+immutable source evidence, SHA-256 approval seal, централизованный write-gate,
+одна root cause на incident и независимый read-only verifier. Исходная задача не
+повышает права и не изменяется. Спецификация:
+`VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md`; порядок реализации:
+`DEEP_CONTEXT_AGENT_0_31_VERIFICATION_REPAIR_PROMPT.md`.
+
+Версия 0.31.0 реализует typed Web API, persisted relation, explicit
+confirmation, idempotency, path-bounded mutation gate и runtime-owned VERIFY.
+
+## Verification-only execution — 0.30.0
+
+Live job `b6b00104265fddec6ab4caf6` показал, что запрос только на проверку
+вложенного проекта ошибочно прошёл через DISCOVER/IMPLEMENT и завершился без
+проверок. Для устранения подготовлены
+`VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md` и
+`DEEP_CONTEXT_AGENT_0_30_VERIFICATION_ONLY_PROMPT.md`.
+
+Реализовано: отдельный `verification-only`, прямой runtime VERIFY из
+ближайшего project root, evidence-driven REPAIR, обязательный blocker для каждого
+BLOCKED и ограниченный model/context budget. Прямой запрос проверок не запускает
+DISCOVER, PLAN или IMPLEMENT и при PASS не вызывает LLM.
+
+Нормативные defaults: максимум 4 model generations на задачу,
+2 repair cycles, 2 model calls на repair, 24 000 входных токенов, 2 одинаковых
+failure и 1 provider timeout. Соответствующие `AGENT_VERIFICATION_*` параметры
+перечислены в `.env.example` и применяются версией 0.30.0.
+
 ## Исполняемый handoff — 0.29.0
 
 После incident с `edit_file` и пустым target подготовлены нормативные требования

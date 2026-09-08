@@ -155,3 +155,28 @@ def test_targeted_check_permission_is_independent_from_discovery() -> None:
 
     assert decision.allow_project_scan is False
     assert decision.allow_project_checks is True
+
+
+def test_explicit_verification_only_routes_directly_to_persistent_verify() -> None:
+    decision = route_chat_request(
+        "Только заверши pytest, Ruff, mypy и compileall для уже написанного проекта "
+        "без повторного аудита и реализации."
+    )
+
+    assert decision.execution == "persistent"
+    assert decision.workflow == "verification-only"
+    assert decision.scope == "project"
+    assert decision.allow_project_scan is True
+    assert decision.allow_project_checks is True
+    assert decision.mutation_requested is False
+    assert "VERIFICATION_ONLY_REQUESTED" in decision.reason_codes
+
+
+def test_verification_words_inside_pasted_log_do_not_trigger_verification() -> None:
+    decision = route_chat_request(
+        "Проанализируй лог:\nWindows PowerShell\n"
+        "PS C:\\project> Только запусти pytest без аудита."
+    )
+
+    assert decision.workflow == "log-analysis"
+    assert decision.execution == "single-turn"

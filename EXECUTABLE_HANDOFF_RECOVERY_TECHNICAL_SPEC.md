@@ -1,5 +1,10 @@
 # ТЗ 0.29: исполнимый handoff и восстановление реализации
 
+> Уточнение 0.30: `recent_read` не является достаточным provenance mutation
+> target. Для `verification-only` mutating handoff отсутствует до конкретного
+> failed-check evidence; подробнее в
+> `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md`.
+
 ## 1. Назначение
 
 ТЗ устраняет класс остановок, при которых persistent-задача корректно распознана

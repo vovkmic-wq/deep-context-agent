@@ -1,5 +1,47 @@
 # Техническое задание: Deep Context Agent
 
+## Реализованное дополнение 0.31: verification repair incident
+
+Нормативный документ: `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md`; порядок
+реализации: `DEEP_CONTEXT_AGENT_0_31_VERIFICATION_REPAIR_PROMPT.md`. Обязательны
+R01–R16 и A01–A30. Этап расширяет 0.30 и устраняет обнаруженный разрыв: failed
+read-only verification нельзя безопасно превратить в allow-write через обычное
+continuation-сообщение, а job ID и task ID имеют разные назначения.
+
+Исходная verification-задача остаётся неизменной. После отдельного типизированного
+подтверждения пользователя runtime создаёт новую repair-задачу, связанную с
+source task/job и immutable evidence. Semantic classifier и chat router в создании
+repair не участвуют. Один repair incident соответствует одной независимой
+корневой причине.
+
+До каждой мутации сервер проверяет хэшированный Repair Action Plan, evidence
+snapshot, source revision, project root, path allowlist, lease, drift и budgets.
+Изменение любого утверждённого входа закрывает gate как `STALE_EVIDENCE`.
+Завершение разрешает только свежий независимый read-only verifier по реальному
+diff и runtime-owned checks. Append-only ledger и operational-period checkpoints
+позволяют сменить worker/model без зависимости от истории чата.
+
+## Целевое дополнение 0.30: verification-only для вложенных проектов
+
+Нормативный документ: `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md`; порядок
+реализации: `DEEP_CONTEXT_AGENT_0_30_VERIFICATION_ONLY_PROMPT.md`. Обязательны
+V01–V12 и A01–A22. Этап вызван live-инцидентом job
+`b6b00104265fddec6ab4caf6`, diagnostic
+`b77bc36c73c04006b549842456e6b5be`: запрос только на проверку ошибочно запустил
+DISCOVER и IMPLEMENT, не определил корень вложенного проекта, сделал 14 model
+generations и завершился без successful checks и без structured blocker.
+
+Прямой verification request получает отдельный workflow `verification-only` и
+начинается с deterministic VERIFY. Project root определяется по точному scope,
+saved task и ближайшему `pyproject.toml`; `ProjectCheckRunner` всегда получает
+валидированный root как cwd. VERIFY-only не переходит в общий IMPLEMENT, а REPAIR
+разрешён только из конкретного persisted failed-check evidence.
+
+Факт чтения файла не является mutation provenance. Любой BLOCKED обязан иметь
+непустой persisted blocker, а parent diagnostics — тот же terminal error code,
+что job. VERIFY не вызывает LLM; repair cycles, повтор failures/provider timeouts
+и рост входного контекста имеют hard limits.
+
 ## Целевое дополнение 0.29: исполнимый handoff и точный blocker
 
 Нормативный документ: `EXECUTABLE_HANDOFF_RECOVERY_TECHNICAL_SPEC.md`; порядок
@@ -53,8 +95,10 @@ process. SQLite scheduler хранит очередь, claim/lease/generation, p
 временных бюджета, кумулятивные resource counters, evidence и executable next
 operation. Restart/reconnect не повторяет подтверждённые side effects.
 
-Обязательный фазовый автомат: DISCOVER → PLAN → IMPLEMENT → VERIFY → REPAIR →
-COMPLETE. Полное discovery ограничено двумя units по умолчанию; повторные list,
+Для обычной разработки обязателен фазовый автомат DISCOVER → PLAN → IMPLEMENT →
+VERIFY → REPAIR → COMPLETE. Отдельная ветка 0.30:
+VERIFICATION_ONLY: QUEUED → VERIFY → (REPAIR → VERIFY) → COMPLETE/BLOCKED.
+Полное discovery ограничено двумя units по умолчанию; повторные list,
 search, covered range, heartbeat и model prose не считаются прогрессом. После
 ceiling runtime переходит к реализации, допустимой reasoning escalation или
 структурированному blocker. Allow-write не означает запись любой ценой: безопасный
@@ -375,10 +419,12 @@ Web terminal отражает partial/blocked/cancelled отдельно от HT
     только идентификаторы `ruff_check`, `ruff_format_check`, `pytest`, `mypy`,
     `compileall`; запуск использует список argv, `shell=False`, очищенное от
     ключей окружение, timeout и ограниченный редактированный вывод.
-64. После мутации проверку разрешено повторить только в новой mutation epoch.
-    Идентичный повтор без изменения отклоняется, а общее число циклов проверки
-    в одном ходе ограничено. Это обеспечивает bounded analyze → fix → test →
-    repeat без бесконечного agent loop.
+64. В обычном mutation workflow повтор проверки разрешён только в новой mutation
+    epoch. Для `verification-only` первая runtime-owned проверка разрешена без
+    мутации и дедуплицируется по project-root/content fingerprint/check ID.
+    Идентичный повтор без нового evidence отклоняется, а общее число циклов
+    ограничено. Это обеспечивает bounded verify → repair → verify без
+    бесконечного agent loop.
 
 ## 2.1. Production-аудит и Web UI 0.13.0
 
@@ -873,8 +919,11 @@ Coding Plan пользователь явно задаёт
 38. AST-индекс находит class/function qualified name без импорта кода, а данные
     другого workspace из общей БД не возвращаются.
 39. `run_project_checks` отклоняет shell injection, не передаёт API keys в
-    дочернее окружение и не возвращает их в output. Одинаковая проверка без
-    мутации блокируется, после подтверждённой мутации выполняется повторно.
+    дочернее окружение и не возвращает их в output. В mutation workflow
+    одинаковая проверка без мутации блокируется. В `verification-only` начальный
+    check без мутации разрешён ровно один раз на content fingerprint. После FAIL
+    повтор требует подтверждённой REPAIR-мутации; без неё допускается только
+    bounded retry retryable runner error/timeout либо явный новый запуск.
 40. Регрессия на 1 000 001 строку подтверждает поиск маркеров начала и конца;
     манифест не помещает этот корпус в prompt и масштабируется как число пачек.
 41. Пятая страница при audit read limit 4 получает `denied`; четыре успешные

@@ -387,6 +387,12 @@ class AppConfig:
     execution_escalation_max_events: int = 2
     project_check_timeout_seconds: int = 300
     project_check_output_max_chars: int = 20_000
+    verification_max_model_generations: int = 4
+    verification_max_repair_cycles: int = 2
+    verification_max_model_calls_per_repair: int = 2
+    verification_max_input_tokens: int = 24_000
+    verification_max_identical_failures: int = 2
+    verification_max_provider_timeouts: int = 1
     failure_log_mode: str = "redacted"
     failure_log_retention_days: int = 30
     failure_log_max_rows: int = 10_000
@@ -596,6 +602,16 @@ class AppConfig:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS must be between 10 and 3600"
             )
+        for name, minimum, maximum in (
+            ("verification_max_model_generations", 0, 20),
+            ("verification_max_repair_cycles", 0, 10),
+            ("verification_max_model_calls_per_repair", 1, 10),
+            ("verification_max_input_tokens", 1_000, 200_000),
+            ("verification_max_identical_failures", 1, 10),
+            ("verification_max_provider_timeouts", 0, 10),
+        ):
+            if not minimum <= getattr(self, name) <= maximum:
+                raise ConfigurationError(f"{name} must be in {minimum}..{maximum}")
         if not 1_000 <= self.project_check_output_max_chars <= 100_000:
             raise ConfigurationError(
                 "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS must be between 1000 and 100000"
@@ -938,6 +954,36 @@ class AppConfig:
                 values,
                 "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS",
                 20_000,
+            ),
+            verification_max_model_generations=_int_setting(
+                values,
+                "AGENT_VERIFICATION_MAX_MODEL_GENERATIONS",
+                4,
+            ),
+            verification_max_repair_cycles=_int_setting(
+                values,
+                "AGENT_VERIFICATION_MAX_REPAIR_CYCLES",
+                2,
+            ),
+            verification_max_model_calls_per_repair=_int_setting(
+                values,
+                "AGENT_VERIFICATION_MAX_MODEL_CALLS_PER_REPAIR",
+                2,
+            ),
+            verification_max_input_tokens=_int_setting(
+                values,
+                "AGENT_VERIFICATION_MAX_INPUT_TOKENS",
+                24_000,
+            ),
+            verification_max_identical_failures=_int_setting(
+                values,
+                "AGENT_VERIFICATION_MAX_IDENTICAL_FAILURES",
+                2,
+            ),
+            verification_max_provider_timeouts=_int_setting(
+                values,
+                "AGENT_VERIFICATION_MAX_PROVIDER_TIMEOUTS",
+                1,
             ),
             failure_log_mode=values.get("AGENT_FAILURE_LOG_MODE", "redacted")
             .strip()

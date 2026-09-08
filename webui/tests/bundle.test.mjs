@@ -43,6 +43,9 @@ for (const required of [
   "adaptive-routing-form",
   "memory-badge",
   "vector_state",
+  "/repair-proposals",
+  "/repair-task",
+  "Create repair task",
 ]) {
   if (!source.includes(required)) {
     throw new Error(`Production bundle is missing feature: ${required}`);

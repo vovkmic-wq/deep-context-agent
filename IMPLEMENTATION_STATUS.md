@@ -1,5 +1,102 @@
 # Статус реализации
 
+## Verification repair incident 0.31.0 — реализовано, 2026-09-08
+
+Созданы `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md` (R01–R16, A01–A30) и
+`DEEP_CONTEXT_AGENT_0_31_VERIFICATION_REPAIR_PROMPT.md`. Обновлены глобальные
+ТЗ/промпт, Web-ТЗ, system prompt, README и CHANGELOG.
+
+Этап основан на фактическом сценарии: job `cd789d2491097e4c2233c303` корректно
+сохранил failed verification в read-only, но попытка продолжить его как Agent не
+могла безопасно повысить сохранённое `allow_write=false`; длинная формулировка
+дополнительно попала в semantic ambiguity. Целевое решение — отдельный typed
+repair workflow с immutable evidence и явным подтверждением пользователя.
+
+Зафиксированы: один incident на root cause, canonical Repair Action Plan и
+evidence SHA-256, механический write-gate, STALE_EVIDENCE, bounded work units,
+append-only ledger, durable transfer of command, независимый read-only verifier,
+provider TTL и изоляция самоизменения в worktree.
+
+Реализованы typed proposal/create API, отдельные task/job IDs и allow-write
+repair-фаза без semantic routing. Source read-only job остаётся неизменным;
+подтверждение связано с source revision, canonical plan/evidence SHA-256 и
+idempotency key. Централизованный mutation gate ограничивает approved paths,
+проверяет исходные target/manifest digests и отклоняет drift как
+`STALE_EVIDENCE`. После mutation receipt выполняется runtime-owned read-only
+ProjectCheckRunner; модельный самоотчёт не создаёт PASS. Append-only incident
+ledger хранит proposal, approval, invalidation, creation и terminal outcome.
+
+Web UI показывает отдельную кнопку «Исправить найденные ошибки / Create repair
+task», preview root/checks/paths/hashes, явное подтверждение и предотвращает
+double submit. Reload повторно использует persisted source→repair relation.
+
+Финальный автоматический контур: Ruff check/format — PASS, pytest — 418 passed и
+1 штатный Windows symlink skip, mypy — PASS по 29 source-файлам, compileall —
+PASS, TypeScript/bundle/model-choice — PASS. Wheel/sdist 0.31.0 и изолированная
+установка пакета проверены. Изолированный live Web API на портах 8879/8881/8882 подтвердил
+health/UI bundle, proposal_count=1, отказ без confirmation=409, создание новой
+repair task=202, идемпотентный повтор с тем же job ID и runtime version=0.31.0.
+`doctor --live` подтвердил Zhipu GLM-5.3 `live_response=OK`, configured OpenAI
+fallback и hybrid FastEmbed/Qdrant memory. Пользовательский порт
+8765 и Ozon-проект не затрагивались.
+
+Статус: **0.31.0 production PASS локально.**
+
+## Verification-only execution 0.30.0 — реализовано, 2026-09-08
+
+Live job `b6b00104265fddec6ab4caf6`, diagnostic
+`b77bc36c73c04006b549842456e6b5be` подтвердил новый incident. Прямая просьба
+только завершить проверки была маршрутизирована как `project-change`: runtime
+создал DISCOVER и IMPLEMENT вместо VERIFY, прочитал вложенный
+`/workspace/ozon_market_analytics/pyproject.toml`, затем ошибочно назначил этот
+manifest целью `edit_file`.
+
+Фактические показатели: 1 yielded и 1 failed unit, 14 model generations, два
+`OpenAITimeoutError` по 120 секунд, рост input estimate примерно 34k→45k tokens,
+0 mutations и 0 successful checks. Четыре `run_project_checks` завершились
+error/denied; terminal `no_verified_progress` сохранил `blocker_json={}`, а parent
+diagnostic при `status=blocked` оставил `error_code=null`. Rollback успешен,
+filesystem side effects отсутствуют.
+
+Созданы `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md` (V01–V12, A01–A22) и
+`DEEP_CONTEXT_AGENT_0_30_VERIFICATION_ONLY_PROMPT.md`. Обновлены глобальные
+ТЗ/промпт, Web-ТЗ, system prompt, README, CHANGELOG и связанные нормативные
+документы 0.28/0.29.
+
+Реализованы отдельный workflow `verification-only`, прямой старт с VERIFY,
+bounded root resolver ближайшего `pyproject.toml`, явный cwd для
+ProjectCheckRunner, evidence-only REPAIR с одним target, защита manifests от
+recent-read inference, обязательный structured blocker и наследование terminal
+error code в Web parent diagnostics. Модель не вызывается при VERIFY PASS и при
+read-only FAIL; число repair/model/provider повторов и входной контекст ограничены.
+
+Live-приёмка на изолированной вложенной копии:
+
+- `doctor --live`: Zhipu GLM-5.3, `live_response=OK`; основной порт 8765 не
+  останавливался;
+- PASS job `47fbaef53c33c58bdb4cf4fe`: первая и единственная unit `verify`,
+  root `/workspace/deep-context-agent`, `verification=passed`, COMPLETE,
+  0 discovery/implement/replan/model calls;
+- forced failure job `51d804a22347cb6ef651372b`: одна VERIFY unit,
+  `verification_failed`, непустой blocker с root и failed checks, без REPAIR или
+  файловых изменений в read-only режиме;
+- первоначальный live-запуск выявил слишком жадное извлечение virtual path;
+  parser исправлен и оба сценария повторены на новой чистой БД.
+- изолированный Web API job `4d9d37425ce9a67e425bc552` на порту 8879:
+  health=ok, version=0.30.0, workflow=`verification-only`, выбран
+  `/workspace/nested-demo`, `verification=passed`, terminal SSE=`completed`;
+  тестовый процесс остановлен, пользовательский порт 8765 не затрагивался.
+
+Финальный контрольный контур:
+
+- Ruff check/format — PASS, 94 Python-файла;
+- pytest — 412 passed, 1 штатный Windows symlink skip;
+- mypy — PASS, 28 source-файлов; compileall — PASS;
+- TypeScript, bundle и model-choice tests — PASS;
+- wheel/sdist 0.30.0 собраны; `pip check` — PASS.
+
+Статус: **0.30.0 production PASS локально после финального контрольного контура**.
+
 ## Executable handoff recovery 0.29.0 — реализовано, 2026-09-08
 
 По job `103bdbab6c558da6761380dc` и diagnostic task

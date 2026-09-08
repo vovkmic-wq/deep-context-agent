@@ -453,6 +453,31 @@ def test_crash_recovery_marks_in_progress_request_and_task(tmp_path: Path) -> No
     assert task["terminal_event"]["data"]["error_type"] == "process_interrupted"  # type: ignore[index]
 
 
+def test_parent_diagnostic_persists_terminal_job_error_code(tmp_path: Path) -> None:
+    with _store(tmp_path) as store:
+        parent = store.start_request(
+            query="verify nested project",
+            thread_id="verification-parent",
+            operation_kind="web_chat_parent",
+            source="web",
+            app_version="test",
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            task_id="verification-task",
+            request_id="verification-request",
+        )
+        store.finish_parent(
+            parent,
+            status="blocked",
+            duration_ms=12,
+            error_code="verification_failed",
+        )
+        request = store.request(str(parent))
+
+    assert request["status"] == "blocked"
+    assert request["error_code"] == "verification_failed"
+
+
 def test_concurrent_writes_keep_request_ids_isolated(tmp_path: Path) -> None:
     with _store(tmp_path) as store:
 

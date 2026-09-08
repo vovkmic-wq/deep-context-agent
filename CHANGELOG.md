@@ -5,6 +5,57 @@
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-09-08
+
+### Документация
+
+- Добавлены промпт и ТЗ этапа 0.31 для отдельной подтверждаемой allow-write
+  repair-задачи из failed read-only verification.
+- Зафиксированы механический write-gate, SHA-256 approval seal, разделение
+  root-cause incidents, immutable source evidence, append-only ledger,
+  operational-period handoff и независимый read-only Safety Verifier.
+- Web-ТЗ дополнено typed repair API и кнопкой
+  «Исправить найденные ошибки / Create repair task» без semantic routing.
+
+### Реализовано
+
+- Failed read-only verification формирует bounded repair proposals с immutable
+  redacted evidence, full-output SHA-256 и metadata ProjectCheckRunner.
+- Явное typed подтверждение создаёт отдельные allow-write task/job сразу в REPAIR;
+  source job не меняется, semantic classifier не участвует.
+- Approval seal, source revision, baseline digests и path allowlist защищают все
+  файловые мутации; drift закрывает gate как `STALE_EVIDENCE`.
+- Runtime-owned VERIFY сверяет mutation receipts и только фактический PASS
+  завершает repair; incident relation и terminal outcome сохраняются в SQLite.
+- Web UI показывает preview root/checks/paths/hashes, блокирует double submit и
+  восстанавливает persisted relation после reload.
+
+### Проверено
+
+- Ruff, format, 418 pytest-тестов, mypy, compileall, frontend/bundle, package
+  build/install и изолированный live HTTP/API repair regression проходят; один
+  Windows symlink-тест штатно пропущен.
+
+## [0.30.0] — 2026-09-08
+
+### Добавлено
+
+- Добавлены промпт и ТЗ 0.30 для отдельного `verification-only`, корректного
+  определения корня вложенного проекта и deterministic runtime VERIFY.
+- Зафиксирован live-инцидент job `b6b00104265fddec6ab4caf6`, diagnostic
+  `b77bc36c73c04006b549842456e6b5be`: 14 model generations, 0 mutations,
+  0 successful checks и terminal `no_verified_progress` без blocker.
+- Добавлен bounded resolver ближайшего `pyproject.toml`, явный project root для
+  ProjectCheckRunner и лимиты verification repair/model/context/provider timeout.
+
+### Исправлено
+
+- Verification-only запускается сразу с VERIFY, не переходит в общий IMPLEMENT,
+  не выбирает manifest из recent-read как mutation target и всегда сохраняет
+  structured blocker при BLOCKED.
+- Web parent diagnostics наследует terminal error code и blocker дочерней задачи;
+  UI показывает отдельный workflow и выбранный root через next operation.
+
 ## [0.29.0] — 2026-09-08
 
 ### Добавлено

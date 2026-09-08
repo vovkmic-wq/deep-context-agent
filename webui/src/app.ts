@@ -427,6 +427,7 @@ const workflowLabels: Record<string, string> = {
   "project-audit": "Аудит проекта / Project audit",
   "project-change": "Изменение проекта / Project change",
   "project-test": "Тестирование проекта / Project testing",
+  "verification-only": "Только проверка / Verification only",
   plan: "Планирование / Planning",
   debug: "Отладка / Debugging",
 };
@@ -608,11 +609,80 @@ async function refreshChatJobs(): Promise<void> {
       });
       row.append(control);
     }
+    if (
+      status === "blocked" &&
+      text(item.mode) === "read-only" &&
+      text(item.verification_status) === "failed"
+    ) {
+      const repair = document.createElement("button");
+      repair.type = "button";
+      repair.className = "job-control";
+      repair.textContent = "Исправить ошибки / Create repair task";
+      repair.addEventListener("click", () => {
+        repair.disabled = true;
+        void createRepairTask(text(item.id))
+          .catch((error: Error) => showToast(error.message))
+          .finally(() => {
+            repair.disabled = false;
+          });
+      });
+      row.append(repair);
+    }
     output.append(row);
     if (text(item.id) === activeChatJob) {
       button.classList.add("active");
     }
   }
+}
+
+async function createRepairTask(sourceJobId: string): Promise<void> {
+  const response = await api<{ items: Payload[] }>(
+    `/api/jobs/${encodeURIComponent(sourceJobId)}/repair-proposals`,
+    { method: "POST" },
+  );
+  const proposal = response.items.find(
+    (item) => Array.isArray(item.allowed_paths) && item.allowed_paths.length > 0,
+  );
+  if (!proposal) {
+    throw new Error(
+      "Нет безопасного исправления исходного кода: проверьте окружение проверки.",
+    );
+  }
+  const evidence = Array.isArray(proposal.evidence)
+    ? (proposal.evidence as Payload[])
+    : [];
+  const checks = evidence.map((item) => text(item.check)).filter(Boolean);
+  const paths = Array.isArray(proposal.allowed_paths)
+    ? proposal.allowed_paths.map((item) => text(item)).filter(Boolean)
+    : [];
+  const accepted = window.confirm(
+    `Создать отдельную задачу с правом записи?\n\nSource job: ${sourceJobId}\nProject root: ${text(proposal.project_root)}\nПроверки: ${checks.join(", ")}\nРазрешённые файлы: ${paths.join(", ")}\nPlan SHA-256: ${text(proposal.plan_sha256)}\nEvidence SHA-256: ${text(proposal.evidence_sha256)}\n\nИсходная read-only задача останется неизменной.`,
+  );
+  if (!accepted) return;
+  const idempotencyKey =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `repair-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const created = await api<Payload>(
+    `/api/jobs/${encodeURIComponent(sourceJobId)}/repair-task`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        confirmed: true,
+        proposal_id: text(proposal.proposal_id),
+        expected_checkpoint_revision: Number(proposal.source_revision),
+        plan_sha256: text(proposal.plan_sha256),
+        evidence_snapshot_sha256: text(proposal.evidence_sha256),
+        idempotency_key: idempotencyKey,
+        evidence_ids: evidence
+          .map((item) => text(item.evidence_id))
+          .filter(Boolean),
+      }),
+    },
+  );
+  activeChatJob = text(created.repair_job_id);
+  showToast("Задача исправления создана с отдельным разрешением записи.");
+  await refreshChatJobs();
 }
 
 function normalizeWorkspacePath(path: string): string {

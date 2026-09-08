@@ -1,5 +1,40 @@
 # Управляющий промпт реализации
 
+## Целевой этап 0.31: подтверждаемая repair-задача
+
+Выполняй `DEEP_CONTEXT_AGENT_0_31_VERIFICATION_REPAIR_PROMPT.md` строго по
+`VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md` (R01–R16, A01–A30). Failed
+read-only verification является source evidence, а не разрешением записи.
+
+Создавай новый allow-write repair incident только отдельным typed API после
+явного подтверждения пользователя. Seal canonical plan/evidence SHA-256 и source
+revision; применяй централизованный write-gate перед каждой мутацией. Continuation,
+semantic classifier, prompt text, смена модели и env не повышают полномочия.
+
+Один incident исправляет одну root cause. Work units получают конкретные targets
+и path territories. После изменений свежий независимый read-only verifier
+проверяет mutation receipts и запускает ProjectCheckRunner. Версия
+0.31.0 прошла A01–A30-oriented regressions, изолированный live Web API и
+полный quality gate; дальнейшие изменения сохраняют эти invariants.
+
+## Целевой этап 0.30: verification-only execution
+
+Выполняй `DEEP_CONTEXT_AGENT_0_30_VERIFICATION_ONLY_PROMPT.md` строго по
+`VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md` (V01–V12, A01–A22). Exact
+regression — job `b6b00104265fddec6ab4caf6`, diagnostic
+`b77bc36c73c04006b549842456e6b5be`.
+
+Запрос только на pytest/Ruff/mypy/compileall маршрутизируется как отдельный
+`verification-only`, начинает deterministic VERIFY и запускает checks из
+валидированного вложенного project root. Не запускай DISCOVER/PLAN/IMPLEMENT и не
+выбирай последний прочитанный manifest как edit target. REPAIR допустим только
+из persisted failed-check evidence и всегда возвращается в VERIFY.
+
+Каждый terminal BLOCKED имеет непустой structured blocker; parent diagnostics
+наследует job error code/category. VERIFY не расходует model calls. Repair prompts,
+повтор provider/tool failures и input context ограничены. До A01–A22, полного
+quality gate и двух live-прогонов не повышай версию и не заявляй production PASS.
+
 ## Целевой этап 0.29: executable handoff recovery
 
 Выполняй `DEEP_CONTEXT_AGENT_0_29_EXECUTABLE_HANDOFF_RECOVERY_PROMPT.md` строго по

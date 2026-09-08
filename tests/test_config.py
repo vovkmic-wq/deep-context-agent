@@ -281,6 +281,12 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
             "AGENT_AUDIT_MAX_READS_PER_FILE": "5",
             "AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "600",
             "AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "30000",
+            "AGENT_VERIFICATION_MAX_MODEL_GENERATIONS": "3",
+            "AGENT_VERIFICATION_MAX_REPAIR_CYCLES": "1",
+            "AGENT_VERIFICATION_MAX_MODEL_CALLS_PER_REPAIR": "2",
+            "AGENT_VERIFICATION_MAX_INPUT_TOKENS": "18000",
+            "AGENT_VERIFICATION_MAX_IDENTICAL_FAILURES": "2",
+            "AGENT_VERIFICATION_MAX_PROVIDER_TIMEOUTS": "1",
             "AGENT_AUTOPILOT_LEASE_SECONDS": "1200",
             "AGENT_AUTOPILOT_HEARTBEAT_SECONDS": "20",
             "AGENT_AUTOPILOT_UNIT_TIMEOUT_SECONDS": "1500",
@@ -327,6 +333,12 @@ def test_app_config_resolves_and_prepares_paths(tmp_path: Path) -> None:
     assert config.audit_max_reads_per_file == 5
     assert config.project_check_timeout_seconds == 600
     assert config.project_check_output_max_chars == 30_000
+    assert config.verification_max_model_generations == 3
+    assert config.verification_max_repair_cycles == 1
+    assert config.verification_max_model_calls_per_repair == 2
+    assert config.verification_max_input_tokens == 18_000
+    assert config.verification_max_identical_failures == 2
+    assert config.verification_max_provider_timeouts == 1
     assert config.autopilot_lease_seconds == 1_200
     assert config.autopilot_heartbeat_seconds == 20
     assert config.autopilot_unit_timeout_seconds == 1_500
@@ -381,6 +393,10 @@ def test_data_directory_cannot_be_exposed_inside_workspace(tmp_path: Path) -> No
         ({"AGENT_AUDIT_MAX_READS_PER_FILE": "1"}, "MAX_READS"),
         ({"AGENT_PROJECT_CHECK_TIMEOUT_SECONDS": "9"}, "CHECK_TIMEOUT"),
         ({"AGENT_PROJECT_CHECK_OUTPUT_MAX_CHARS": "999"}, "OUTPUT_MAX"),
+        (
+            {"AGENT_VERIFICATION_MAX_INPUT_TOKENS": "999"},
+            "verification_max_input_tokens",
+        ),
         ({"AGENT_FAILURE_LOG_MODE": "unsafe"}, "FAILURE_LOG_MODE"),
         ({"AGENT_FAILURE_LOG_RETENTION_DAYS": "0"}, "RETENTION_DAYS"),
         ({"AGENT_FAILURE_LOG_MAX_ROWS": "99"}, "MAX_ROWS"),

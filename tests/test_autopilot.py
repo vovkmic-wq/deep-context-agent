@@ -114,6 +114,40 @@ def test_store_identity_lease_control_resume_and_report(tmp_path: Path) -> None:
         assert other_mode != completed.job_id
 
 
+def test_verification_only_resume_returns_to_verify_not_implement(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "data" / "autopilot.sqlite3"
+    with AutopilotStore(database) as store:
+        _, lease = store.start_or_resume(
+            thread_id="verify-resume",
+            objective="Only run checks",
+            workspace=workspace,
+            allow_write=False,
+            batch_size=1,
+            workflow="verification-only",
+        )
+        store.mark_blocked(
+            lease,
+            error_code="verification_failed",
+            safe_message="A check failed.",
+            blocker={"error_code": "verification_failed"},
+        )
+        resumed, _ = store.start_or_resume(
+            thread_id="verify-resume",
+            objective="Only run checks",
+            workspace=workspace,
+            allow_write=False,
+            batch_size=1,
+            workflow="verification-only",
+        )
+
+    assert resumed.phase == "verify"
+    assert resumed.workflow == "verification-only"
+
+
 def test_expired_generation_is_interrupted_and_stale_owner_is_fenced(
     tmp_path: Path,
 ) -> None:
@@ -1251,6 +1285,168 @@ def test_implementation_cannot_mutate_outside_validated_target(
     assert details["next_operation_json"]["target"] == "/workspace/target.py"
     with AutopilotStore(config.autopilot_database) as store:
         assert store.verified_mutation_count(str(details["id"])) == 0
+
+
+def test_verification_only_starts_at_verify_and_never_calls_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    nested = config.workspace / "ozon_market_analytics"
+    nested.mkdir()
+    (nested / "pyproject.toml").write_text("[project]\nname='ozon'\n")
+    model = SequenceChatModel(responses=[AIMessage(content="must not be called")])
+    passed = ProjectCheckResult(
+        check="pytest",
+        command=("python", "-m", "pytest"),
+        return_code=0,
+        duration_seconds=0.01,
+        status="passed",
+        output="1 passed",
+    )
+    roots: list[Path | None] = []
+
+    def run_checks(
+        _checks: str = "",
+        *,
+        project_root: Path | None = None,
+    ) -> list[ProjectCheckResult]:
+        roots.append(project_root)
+        return [passed]
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        monkeypatch.setattr(runtime.project_check_runner, "run", run_checks)
+        response = runtime.run_autopilot_job(
+            "Только заверши проверки уже написанного кода в "
+            "/workspace/ozon_market_analytics без аудита.",
+            thread_id="verification-only-pass",
+            workflow="verification-only",
+            allow_write=False,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert "complete" in response
+    assert model.generation_attempts == 0
+    assert roots == [nested.resolve()]
+    assert [unit["phase"] for unit in details["work_units"]] == ["verify"]
+    assert details["verification_status"] == "passed"
+
+
+def test_verification_only_ambiguous_root_blocks_with_structure(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    for name in ("first", "second"):
+        project = config.workspace / name
+        project.mkdir()
+        (project / "pyproject.toml").write_text(f"[project]\nname='{name}'\n")
+    model = SequenceChatModel(responses=[AIMessage(content="must not be called")])
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        response = runtime.run_autopilot_job(
+            "Только заверши проверки уже написанного кода без аудита.",
+            thread_id="verification-only-ambiguous",
+            workflow="verification-only",
+            allow_write=False,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert "verification_project_root_ambiguous" in response
+    assert model.generation_attempts == 0
+    assert details["status"] == "blocked"
+    assert details["blocker_json"]["category"] == "verification_prerequisite"
+    assert details["blocker_json"]["missing_prerequisites"]
+
+
+def test_verification_only_failure_without_write_never_enters_implement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    (config.workspace / "pyproject.toml").write_text("[project]\nname='demo'\n")
+    model = SequenceChatModel(responses=[AIMessage(content="must not be called")])
+    failed = ProjectCheckResult(
+        check="pytest",
+        command=("python", "-m", "pytest"),
+        return_code=1,
+        duration_seconds=0.01,
+        status="failed",
+        output="tests/test_demo.py:3: AssertionError",
+    )
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        monkeypatch.setattr(
+            runtime.project_check_runner,
+            "run",
+            lambda **_kwargs: [failed],
+        )
+        response = runtime.run_autopilot_job(
+            "Только заверши проверки уже написанного кода без аудита.",
+            thread_id="verification-only-failed",
+            workflow="verification-only",
+            allow_write=False,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert "verification_failed" in response
+    assert model.generation_attempts == 0
+    assert {unit["phase"] for unit in details["work_units"]} == {"verify"}
+    assert details["blocker_json"]["evidence_ids"] == ["pytest"]
+
+
+def test_recent_manifest_read_is_not_inferred_as_mutation_target() -> None:
+    assert AgentRuntime._protected_inferred_mutation_target("/workspace/pyproject.toml")
+    assert not AgentRuntime._protected_inferred_mutation_target(
+        "/workspace/src/service.py"
+    )
+
+
+def test_verification_seed_path_stops_before_following_prose(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    model = SequenceChatModel(responses=[AIMessage(content="unused")])
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        seeds = runtime._verification_seed_paths(
+            "Проверь /workspace/ozon_market_analytics без повторного аудита."
+        )
+
+    assert seeds == ("/workspace/ozon_market_analytics",)
+
+
+def test_verification_repair_target_requires_one_existing_evidence_file(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    config.prepare_directories()
+    project = config.workspace / "nested"
+    target = project / "src" / "service.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("VALUE = 1\n")
+    model = SequenceChatModel(responses=[AIMessage(content="unused")])
+    evidence = [
+        {
+            "check": "ruff_check",
+            "status": "failed",
+            "output": "src/service.py:1:1: E999 invalid syntax",
+        }
+    ]
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        resolved = runtime._verification_repair_target(evidence, project)
+
+    assert resolved == "/workspace/nested/src/service.py"
 
 
 def test_legacy_autopilot_database_migrates_additively_without_losing_job(

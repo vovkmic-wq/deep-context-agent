@@ -1,5 +1,10 @@
 # ТЗ 0.28: production orchestration
 
+> Уточнение 0.30: запрос только на проверки регулируется
+> `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md` и не проходит общий
+> DISCOVER→IMPLEMENT этого документа. ProjectCheckRunner получает явный
+> валидированный root вложенного проекта.
+
 > Последующий обязательный hardening пустого mutating target, точного blocker и
 > goal decomposition вынесен в `EXECUTABLE_HANDOFF_RECOVERY_TECHNICAL_SPEC.md`.
 > Выполнение A01–A14 этого документа не заменяет приёмку A01–A18 этапа 0.29.

@@ -38,7 +38,7 @@ _MUTATING_NEXT_OPERATIONS: Final[frozenset[str]] = frozenset(
     {"create_file", "edit_file", "remove_path"}
 )
 _ALLOWED_PHASE_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
-    "queued": frozenset({"audit", "discover", "implement", "execute"}),
+    "queued": frozenset({"audit", "discover", "implement", "verify", "execute"}),
     "audit": frozenset({"audit", "verify", "complete", "blocked"}),
     "discover": frozenset({"discover", "plan", "blocked"}),
     "plan": frozenset({"implement", "blocked", "waiting_user"}),
@@ -513,6 +513,8 @@ class AutopilotStore:
         initial_phase = (
             "audit"
             if workflow == "project-audit"
+            else "verify"
+            if workflow == "verification-only"
             else "discover"
             if workflow in {"project-change", "project-test"}
             else "implement"
@@ -540,6 +542,12 @@ class AutopilotStore:
                         )
                             THEN autopilot_jobs.status
                         ELSE 'queued'
+                    END,
+                    phase = CASE
+                        WHEN excluded.workflow = 'verification-only'
+                             AND autopilot_jobs.phase NOT IN ('verify', 'repair')
+                            THEN 'verify'
+                        ELSE autopilot_jobs.phase
                     END,
                     control_requested = CASE
                         WHEN autopilot_jobs.status = 'running'
@@ -576,6 +584,42 @@ class AutopilotStore:
                 ),
             )
         return job_id
+
+    def prepare_repair_job(self, job_id: str, operation: NextOperation) -> None:
+        """Start a newly queued, explicitly approved job at bounded REPAIR."""
+
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT workspace, status, mode FROM autopilot_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown autopilot job: {job_id}")
+            if str(row["status"]) != "queued" or str(row["mode"]) != "allow-write":
+                raise ValueError("Repair job must be queued with write authority")
+            parsed = NextOperation.parse(
+                operation.as_dict(), Path(str(row["workspace"]))
+            )
+            now = time.time()
+            self._connection.execute(
+                "UPDATE autopilot_jobs SET phase='repair', resume_phase='repair', "
+                "next_operation=?, next_operation_json=?, "
+                "checkpoint_revision=checkpoint_revision+1, updated_at=? WHERE id=?",
+                (
+                    parsed.objective[:1_000],
+                    json.dumps(parsed.as_dict(), ensure_ascii=False, sort_keys=True)[
+                        :_NEXT_OPERATION_LIMIT
+                    ],
+                    now,
+                    job_id,
+                ),
+            )
+            self._connection.execute(
+                "INSERT INTO autopilot_phase_transitions("
+                "id,job_id,from_phase,to_phase,reason,created_at) "
+                "VALUES (?,?,'discover','repair','approved-verification-repair',?)",
+                (uuid4().hex, job_id, now),
+            )
 
     def resumable_jobs(self, *, workspace: Path) -> list[dict[str, object]]:
         """Return queued or crash-interrupted jobs eligible for reconciliation."""
@@ -637,6 +681,7 @@ class AutopilotStore:
             "project-audit",
             "project-change",
             "project-test",
+            "verification-only",
         }:
             raise ValueError("Unsupported Autopilot workflow")
         mode = "allow-write" if allow_write else "read-only"
@@ -700,6 +745,8 @@ class AutopilotStore:
                 initial_phase = (
                     "audit"
                     if workflow == "project-audit"
+                    else "verify"
+                    if workflow == "verification-only"
                     else "discover"
                     if workflow in {"project-change", "project-test"}
                     else "implement"
@@ -725,6 +772,9 @@ class AutopilotStore:
                         mode = excluded.mode,
                         phase = CASE
                             WHEN autopilot_jobs.phase = 'complete' THEN 'complete'
+                            WHEN excluded.workflow = 'verification-only'
+                                 AND autopilot_jobs.phase NOT IN ('verify', 'repair')
+                                THEN 'verify'
                             ELSE autopilot_jobs.phase
                         END,
                         batch_size = MIN(

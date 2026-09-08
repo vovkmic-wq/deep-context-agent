@@ -18,12 +18,15 @@ Workflow = Literal[
     "project-audit",
     "project-change",
     "project-test",
+    "verification-only",
     "plan",
     "debug",
 ]
 Scope = Literal["message", "attachment", "file", "project"]
 
-PROJECT_WORKFLOWS = frozenset({"project-audit", "project-change", "project-test"})
+PROJECT_WORKFLOWS = frozenset(
+    {"project-audit", "project-change", "project-test", "verification-only"}
+)
 AUDIT_WORKFLOWS = frozenset({"project-audit"})
 
 _FENCE_LINE_PATTERN = re.compile(r"^\s*(```|~~~)")
@@ -98,6 +101,21 @@ _FULL_VERIFICATION_PATTERN = re.compile(
     r"(?:run|perform)\s+(?:ruff|pytest|mypy)|"
     r"пол\w*\s+проверк|провед\w*\s+(?:все\s+)?тест|"
     r"запуст\w*\s+(?:ruff|pytest|mypy)|продакшн)"
+)
+_VERIFICATION_ONLY_PATTERN = re.compile(
+    r"(?iu)(?:"
+    r"(?:только|лишь)\s+(?:запусти|выполни|заверши|проведи)\w*\s+"
+    r"(?:провер|тест|верификац)|"
+    r"(?:запусти|выполни|заверши|продолжи)\w*[^\n.!?]{0,80}"
+    r"(?:pytest|ruff|mypy|compileall|провер\w*)[^\n.!?]{0,80}"
+    r"(?:без\s+(?:аудит|повторн\w*\s+реализац|измен)|"
+    r"уже\s+(?:написан|реализован|измен[её]н))|"
+    r"\bverification[- ]only\b|\bonly\s+(?:run|finish)\s+"
+    r"(?:the\s+)?(?:checks?|tests?|verification)"
+    r")"
+)
+_VERIFICATION_REPAIR_PATTERN = re.compile(
+    r"(?iu)(?:исправ|устран|почин|\b(?:fix|repair)\b)"
 )
 _PLAN_PATTERN = re.compile(r"(?iu)(?:\bplan\b|план|спланир|уточняющ)")
 _PATH_PATTERN = re.compile(
@@ -209,6 +227,9 @@ def route_chat_request(
     testing = bool(_TEST_PATTERN.search(instruction))
     cross_module = len(_CROSS_MODULE_PATTERN.findall(instruction)) >= 2
     full_verification = bool(_FULL_VERIFICATION_PATTERN.search(instruction))
+    verification_only = bool(_VERIFICATION_ONLY_PATTERN.search(instruction))
+    if verification_only:
+        mutation_requested = bool(_VERIFICATION_REPAIR_PATTERN.search(instruction))
     paths = tuple(
         match.group(0).rstrip(".,;:!?") for match in _PATH_PATTERN.finditer(instruction)
     )
@@ -235,6 +256,9 @@ def route_chat_request(
         workflow = "debug"
     elif log_intent and not (mutation_requested and scope == "project"):
         workflow = "log-analysis"
+    elif verification_only:
+        workflow = "verification-only"
+        scope = "project"
     elif scope == "project" and mutation_requested:
         workflow = "project-change"
     elif scope == "project" and audit and broad:
@@ -270,6 +294,8 @@ def route_chat_request(
         reasons.append("CROSS_MODULE_CHANGE")
     if full_verification:
         reasons.append("FULL_VERIFICATION_REQUESTED")
+    if verification_only:
+        reasons.append("VERIFICATION_ONLY_REQUESTED")
 
     if work_mode in {"ask", "plan", "debug"}:
         execution: ExecutionMode = "single-turn"

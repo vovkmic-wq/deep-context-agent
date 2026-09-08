@@ -1,5 +1,11 @@
 # Промт Web-интерфейса 0.27: durable task UX
 
+> Уточнение 0.30: Web-задачи только на проверку используют workflow
+> `verification-only` из `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md`, сразу
+> показывают VERIFY и вложенный virtual project root и не запускают общий
+> DISCOVER/IMPLEMENT. Terminal BLOCKED всегда показывает persisted blocker и
+> согласованный parent diagnostic error code.
+
 Обнови Web API и интерфейс Deep Context Agent по
 `DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md`. Не создавай отдельную вкладку
 Autopilot и не дублируй runtime policies во frontend. Чат остаётся основной точкой

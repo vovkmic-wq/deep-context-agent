@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import asdict, dataclass, replace
@@ -139,6 +140,54 @@ class TaskStateStore:
                 ":status,:revision,:owner,:lease_until,:evidence)",
                 values,
             )
+        return task
+
+    def create_explicit(
+        self,
+        *,
+        task_id: str,
+        thread: str,
+        workspace: Path,
+        objective: str,
+        route: RoutingDecision,
+        allow_write: bool,
+        evidence: str,
+        known_secrets: tuple[str, ...] = (),
+    ) -> SavedTask:
+        """Create a trusted server-owned task without semantic intent routing."""
+
+        if not re.fullmatch(r"[a-f0-9]{32}", task_id):
+            raise TaskConflict("Explicit task identity is invalid")
+        clean_objective = redact_sensitive_text(
+            objective.strip(), known_secrets=known_secrets
+        )
+        if not clean_objective or len(clean_objective) > 16_000:
+            raise TaskConflict("Explicit task objective is invalid")
+        task = SavedTask(
+            task_id,
+            thread.strip(),
+            str(workspace.resolve()),
+            clean_objective,
+            route.as_dict(),
+            bool(allow_write),
+            "partial",
+            1,
+            None,
+            0,
+            redact_sensitive_text(evidence, known_secrets=known_secrets)[:2_000],
+        )
+        values = asdict(task)
+        values["routing"] = json.dumps(task.routing, ensure_ascii=False)
+        try:
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO authorized_tasks VALUES "
+                    "(:id,:thread,:workspace,:objective,:routing,:allow_write,"
+                    ":status,:revision,:owner,:lease_until,:evidence)",
+                    values,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise TaskConflict("Explicit task identity already exists") from exc
         return task
 
     def resolve(
@@ -474,7 +523,8 @@ def resume_route(
         allow_project_checks=bool(
             saved.get(
                 "allow_project_checks",
-                saved.get("workflow") in {"project-change", "project-test"},
+                saved.get("workflow")
+                in {"project-change", "project-test", "verification-only"},
             )
         ),
         mutation_requested=(

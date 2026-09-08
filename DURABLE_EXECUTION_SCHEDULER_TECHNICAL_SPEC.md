@@ -39,6 +39,10 @@ Production-основа объединяет:
 3. evidence-driven progress/renewal;
 4. раздельные model/unit/task/wall-clock бюджеты как базовую настройку.
 
+Уточнение 0.30: этот общий автомат относится к разработке. Workflow
+`verification-only` использует отдельную ветку QUEUED→VERIFY→COMPLETE либо
+VERIFY→REPAIR→VERIFY и не создаёт discovery/implementation unit.
+
 Система остаётся ограниченной: durable не означает бесконечное выполнение. Права,
 privacy/local-only, стоимость, токены, число units, операции и абсолютный TTL не
 сбрасываются при handoff, restart или смене модели.
@@ -88,6 +92,10 @@ UTC timestamps служат журналу и restart recovery.
 QUEUED → DISCOVER → PLAN → IMPLEMENT → VERIFY → COMPLETE
                               ↑          ↓
                               └─ REPAIR ─┘
+
+VERIFICATION_ONLY: QUEUED → VERIFY → COMPLETE
+                              ↓
+                           REPAIR ─→ VERIFY
 ```
 
 Дополнительные состояния: `PAUSED`, `WAITING_USER`, `BLOCKED`, `CANCELLED`,
@@ -102,6 +110,8 @@ QUEUED → DISCOVER → PLAN → IMPLEMENT → VERIFY → COMPLETE
 
 Возврат из IMPLEMENT/VERIFY в полный DISCOVER запрещён. Разрешено точечное
 `targeted-discovery` для одного доказанного пробела с отдельным малым бюджетом.
+Для `verification-only` DISCOVER, PLAN и общий IMPLEMENT отсутствуют; выбор
+project root выполняет bounded deterministic resolver из ТЗ 0.30.
 
 ## S04. Ограничение discovery-only работы
 
@@ -252,7 +262,13 @@ Web-требования детализированы в отдельном пр
 - `discovery_exhausted_without_implementation` — escalation не помогла;
 - `implementation_blocked_*` — точная структурированная причина;
 - `verification_failed` / `repair_budget_exhausted`;
+- `ambiguous_project_root` / `verification_unavailable`;
+- `repair_target_unresolved`;
 - `cancelled_by_operator`.
+
+Любой terminal BLOCKED, включая legacy/recovery paths, обязан атомарно сохранить
+валидный structured blocker с category, summary, required action и diagnostic ID.
+Пустой blocker заменяется `internal_runtime_error`, а не публикуется как `{}`.
 
 `task_deadline` legacy отображается с миграционной расшифровкой, но новые
 persistent jobs не должны использовать его как общий неразделённый таймер.

@@ -1,5 +1,42 @@
 # Техническое задание: веб-интерфейс Deep Context Agent
 
+## Реализованное дополнение 0.31: Create repair task
+
+Для failed read-only verification Web UI показывает отдельную кнопку
+«Исправить найденные ошибки / Create repair task». Это не чат-команда и не resume:
+кнопка вызывает типизированный API, показывает сгруппированные root-cause
+proposals, source task/job, вложенный project root, failed checks, разрешённые
+paths и SHA-256 плана/evidence и требует явного подтверждения.
+
+Backend создаёт новые task/job в allow-write REPAIR, а исходные read-only записи
+не изменяет. API использует CSRF, ownership, checkpoint CAS, approval seal и
+idempotency; semantic classifier не вызывается. UI предотвращает double submit,
+восстанавливает source→repair relation после reload и показывает состояния
+REPAIR, INDEPENDENT VERIFY, STALE EVIDENCE и structured BLOCKED.
+
+Перед каждой мутацией действует серверный write-gate. PASS отображается только
+по результатам свежего read-only verifier и ProjectCheckRunner, не по тексту
+repair-модели. Полные требования определены в
+`VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md` R01–R16 и A01–A30.
+
+## Целевое дополнение 0.30: только проверка вложенного проекта
+
+Web API/UI реализуют V01–V12 из
+`VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md`. Прямая команда проверить готовый
+код создаёт workflow `verification-only`; accepted response и SSE сразу показывают
+VERIFY, virtual project root и текущий allowlisted check. DISCOVER, audit controls
+и общий IMPLEMENT для этого workflow не отображаются и не запускаются.
+
+При нескольких проектах UI предлагает выбрать только один безопасный virtual
+root. При однозначном `pyproject.toml` выбор автоматический. REPAIR показывается
+только вместе с failed-check ID, краткой диагностикой и конкретным target.
+
+Любой terminal BLOCKED отображает persisted category/summary/required action и
+diagnostic ID. Parent diagnostic не может иметь `error_code=null`, если job
+заблокирован. UI показывает model-call/context budget и provider timeouts, но не
+host paths, raw prompt/output или секреты. Reload/SSE сохраняют root, check
+receipts и terminal outcome.
+
 ## Целевое дополнение 0.29: исполнимая операция и понятная остановка
 
 Web API и UI реализуют E09 из
