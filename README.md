@@ -5,6 +5,17 @@ CLI-агент на Python и Deep Agents с долговременным SQLite
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
 Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
+## Исполняемый handoff — 0.29.0
+
+После incident с `edit_file` и пустым target подготовлены нормативные требования
+исполняемого handoff: широкая задача должна компилироваться в dependency graph
+конкретных операций, а каждый mutating worker проходить runtime preflight. Общая
+ошибка `missing information` заменяется точной классификацией и persisted blocker.
+Mutating work unit теперь запускается только с проверенным конкретным target,
+ожидаемым эффектом и runtime-owned планом проверки. Невалидный handoff проходит
+ограниченное восстановление либо завершается доказуемым persisted blocker; права
+и границы workspace при этом не расширяются.
+
 ## Production orchestration — 0.28.0
 
 Маршрутизатор различает точечную правку и межмодульную разработку; чтение,

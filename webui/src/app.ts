@@ -466,6 +466,23 @@ function formatJobProgress(data: Payload, eventName: string): string {
     ? `, файлы ${reviewed || "0"}/${total}, ожидают ${pending || "0"}`
     : "";
   const nextStep = data.next_step ? ` Следующий шаг: ${text(data.next_step)}.` : "";
+  const operation =
+    data.next_operation_data && typeof data.next_operation_data === "object"
+      ? (data.next_operation_data as Payload)
+      : {};
+  const target = text(operation.target);
+  const operationStatus = target
+    ? `, цель ${target}`
+    : text(data.phase) === "implement" || text(data.phase) === "repair"
+      ? ", конкретная операция подготавливается"
+      : "";
+  const blocker =
+    data.blocker && typeof data.blocker === "object"
+      ? (data.blocker as Payload)
+      : {};
+  const blockerStatus = text(blocker.summary)
+    ? ` Причина остановки: ${text(blocker.summary)} Требуется: ${text(blocker.required_action)}.`
+    : "";
   const activeRemaining = Math.max(
     0,
     Number(data.active_time_remaining_seconds || 0),
@@ -482,7 +499,7 @@ function formatJobProgress(data: Payload, eventName: string): string {
     Number(data.discovery_units || 0) || text(data.phase) === "discover"
       ? `, изучение ${text(data.discovery_units)}, точечное ${text(data.targeted_discovery_units)}, чтения ${text(data.file_reads)}, поиски ${text(data.discovery_searches)}, строки ${text(data.unique_lines_read)}`
       : "";
-  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, последняя активность в ${heartbeat}${fileProgress}, units завершено ${text(data.completed_units)}, передано ${text(data.yielded_units)}, ошибок ${text(data.failed_units)}, прервано ${text(data.interrupted_units)}, replans ${text(data.replans)}, файлов изменено ${text(data.changed_files)}, проверок ${text(data.checks_run)}${discovery}${budgets}.${nextStep}`;
+  return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, последняя активность в ${heartbeat}${fileProgress}, units завершено ${text(data.completed_units)}, передано ${text(data.yielded_units)}, ошибок ${text(data.failed_units)}, прервано ${text(data.interrupted_units)}, replans ${text(data.replans)}, файлов изменено ${text(data.changed_files)}, проверок ${text(data.checks_run)}${operationStatus}${discovery}${budgets}.${nextStep}${blockerStatus}`;
 }
 
 function showJobSummary(data: Payload): void {
@@ -495,9 +512,23 @@ function showJobSummary(data: Payload): void {
       : {};
   const status = element("chat-job-status");
   status.hidden = false;
+  const operation =
+    progress.next_operation_data &&
+    typeof progress.next_operation_data === "object"
+      ? (progress.next_operation_data as Payload)
+      : {};
+  const blocker =
+    progress.blocker && typeof progress.blocker === "object"
+      ? (progress.blocker as Payload)
+      : {};
+  const target = text(operation.target);
+  const operationText = target ? ` · цель ${target}` : "";
+  const blockerText = text(blocker.summary)
+    ? ` · причина ${text(blocker.summary)} · требуется ${text(blocker.required_action)}`
+    : "";
   setOperationStatus(
     "chat-job-status",
-    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · generation ${text(progress.lease_generation)} · завершено ${text(progress.completed_units)} · передано ${text(progress.yielded_units)} · ошибки ${text(progress.failed_units)} · прервано ${text(progress.interrupted_units)} · изучение ${text(progress.discovery_units)} (точечное ${text(progress.targeted_discovery_units)}) · изменено файлов ${text(progress.changed_files)} · проверок ${text(progress.checks_run)} · model ${Math.round(Number(progress.model_turn_timeout_seconds || 0))} с · unit осталось ${Math.round(Number(progress.unit_time_remaining_seconds || 0))} с · active осталось ${Math.round(Number(progress.active_time_remaining_seconds || 0))} с · TTL ${Math.round(Number(progress.wall_time_remaining_seconds || 0))} с.`,
+    `Autopilot ${activeChatJob}: ${text(job.status)} · фаза ${text(job.phase)} · generation ${text(progress.lease_generation)} · завершено ${text(progress.completed_units)} · передано ${text(progress.yielded_units)} · ошибки ${text(progress.failed_units)} · прервано ${text(progress.interrupted_units)} · изучение ${text(progress.discovery_units)} (точечное ${text(progress.targeted_discovery_units)}) · изменено файлов ${text(progress.changed_files)} · проверок ${text(progress.checks_run)}${operationText}${blockerText} · model ${Math.round(Number(progress.model_turn_timeout_seconds || 0))} с · unit осталось ${Math.round(Number(progress.unit_time_remaining_seconds || 0))} с · active осталось ${Math.round(Number(progress.active_time_remaining_seconds || 0))} с · TTL ${Math.round(Number(progress.wall_time_remaining_seconds || 0))} с.`,
     job.status === "complete" ? "success" : "normal",
   );
 }

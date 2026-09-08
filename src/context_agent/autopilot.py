@@ -34,6 +34,9 @@ _NEXT_OPERATION_ALLOWLIST: Final[frozenset[str]] = frozenset(
         "return_blocker",
     }
 )
+_MUTATING_NEXT_OPERATIONS: Final[frozenset[str]] = frozenset(
+    {"create_file", "edit_file", "remove_path"}
+)
 _ALLOWED_PHASE_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     "queued": frozenset({"audit", "discover", "implement", "execute"}),
     "audit": frozenset({"audit", "verify", "complete", "blocked"}),
@@ -59,6 +62,8 @@ class NextOperation:
     expected_effect: str = ""
     verification_commands: tuple[str, ...] = ()
     blocking_conditions: tuple[str, ...] = ()
+    contract_version: int = 1
+    component: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -70,6 +75,8 @@ class NextOperation:
             "expected_effect": self.expected_effect,
             "verification_commands": list(self.verification_commands),
             "blocking_conditions": list(self.blocking_conditions),
+            "contract_version": self.contract_version,
+            "component": self.component,
         }
 
     @classmethod
@@ -110,6 +117,8 @@ class NextOperation:
                 if resolved != workspace
                 else ""
             )
+        if operation in _MUTATING_NEXT_OPERATIONS and not target:
+            raise ValueError("Mutating next-operation requires a concrete target")
 
         def short_tuple(name: str, maximum: int, width: int) -> tuple[str, ...]:
             raw = value.get(name, ())
@@ -120,15 +129,31 @@ class NextOperation:
                 raise ValueError(f"Invalid next-operation field: {name}")
             return items
 
+        expected_effect = str(value.get("expected_effect") or "").strip()[:1_000]
+        verification_commands = short_tuple("verification_commands", 20, 1_000)
+        if operation in _MUTATING_NEXT_OPERATIONS and not expected_effect:
+            raise ValueError("Mutating next-operation requires an expected effect")
+        if operation in _MUTATING_NEXT_OPERATIONS and not verification_commands:
+            raise ValueError("Mutating next-operation requires a verification plan")
+        raw_contract_version = value.get("contract_version")
+        if raw_contract_version is not None and not isinstance(
+            raw_contract_version, (str, int)
+        ):
+            raise ValueError("Invalid next-operation contract version")
+        contract_version = int(raw_contract_version or 1)
+        if contract_version != 1:
+            raise ValueError("Unsupported next-operation contract version")
         return cls(
             phase=phase,
             operation=operation,
             target=target,
             objective=objective,
             required_evidence_ids=short_tuple("required_evidence_ids", 50, 200),
-            expected_effect=str(value.get("expected_effect") or "")[:1_000],
-            verification_commands=short_tuple("verification_commands", 20, 1_000),
+            expected_effect=expected_effect,
+            verification_commands=verification_commands,
             blocking_conditions=short_tuple("blocking_conditions", 20, 1_000),
+            contract_version=contract_version,
+            component=str(value.get("component") or "").strip()[:200],
         )
 
 
@@ -201,6 +226,7 @@ class AutopilotProgress:
     last_progress_kind: str = ""
     last_progress_at: float | None = None
     renewal_reason: str = ""
+    blocker: dict[str, object] | None = None
 
     @property
     def terminal(self) -> bool:
@@ -254,6 +280,7 @@ class AutopilotProgress:
             "last_progress_kind": self.last_progress_kind,
             "last_progress_at": self.last_progress_at,
             "renewal_reason": self.renewal_reason,
+            "blocker": self.blocker,
             "terminal": self.terminal,
         }
 
@@ -1282,6 +1309,7 @@ class AutopilotStore:
             """
             status = 'complete', phase = 'complete', report = ?,
             last_error_code = NULL, last_error_message = NULL,
+            blocker_json = '{}',
             lease_token = NULL, lease_until = NULL,
             updated_at = ?, finished_at = ?
             """,
@@ -1307,20 +1335,25 @@ class AutopilotStore:
         error_code: str,
         safe_message: str,
         report: str = "",
+        blocker: Mapping[str, object] | None = None,
     ) -> AutopilotProgress:
+        blocker_payload = json.dumps(
+            dict(blocker or {}), ensure_ascii=False, sort_keys=True
+        )[:_NEXT_OPERATION_LIMIT]
         now = time.time()
         self._leased_update(
             lease,
             """
             status = 'blocked', resume_phase = phase, phase = 'blocked',
             last_error_code = ?,
-            last_error_message = ?, report = ?, lease_token = NULL,
+            last_error_message = ?, report = ?, blocker_json = ?, lease_token = NULL,
             lease_until = NULL, updated_at = ?, finished_at = ?
             """,
             (
                 error_code[:100],
                 safe_message[:_SUMMARY_LIMIT],
                 report[:_REPORT_LIMIT],
+                blocker_payload,
                 now,
                 now,
             ),
@@ -1464,7 +1497,8 @@ class AutopilotStore:
                        model_turn_timeout_seconds, unit_timeout_seconds,
                        active_time_seconds, active_time_limit_seconds,
                        wall_time_limit_seconds, wall_deadline_at, created_at,
-                       last_progress_kind, last_progress_at, renewal_reason
+                       last_progress_kind, last_progress_at, renewal_reason,
+                       blocker_json
                 FROM autopilot_jobs WHERE id = ?
                 """,
                 (job_id,),
@@ -1554,6 +1588,11 @@ class AutopilotStore:
         except (json.JSONDecodeError, TypeError):
             parsed_next = {}
         next_operation_data = parsed_next if isinstance(parsed_next, dict) else {}
+        try:
+            parsed_blocker = json.loads(str(row["blocker_json"] or "{}"))
+        except (json.JSONDecodeError, TypeError):
+            parsed_blocker = {}
+        blocker = parsed_blocker if isinstance(parsed_blocker, dict) else {}
         changed_files = len(
             {
                 str(item["target"])
@@ -1668,6 +1707,7 @@ class AutopilotStore:
                 else None
             ),
             renewal_reason=str(row["renewal_reason"] or ""),
+            blocker=blocker or None,
         )
 
     def details(self, job_id: str, *, unit_limit: int = 100) -> dict[str, object]:
@@ -1729,6 +1769,11 @@ class AutopilotStore:
                 details[name] = json.loads(str(details.get(name) or "[]"))
             except json.JSONDecodeError:
                 details[name] = []
+        for name in ("next_operation_json", "blocker_json"):
+            try:
+                details[name] = json.loads(str(details.get(name) or "{}"))
+            except json.JSONDecodeError:
+                details[name] = {}
         details["progress"] = self.progress(job_id).as_dict()
         details["work_units"] = units
         details["tool_receipts"] = receipts
@@ -1751,6 +1796,39 @@ class AutopilotStore:
                 (job_id,),
             ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def recent_mutation_targets(self, job_id: str, *, limit: int = 100) -> set[str]:
+        """Return virtual targets that already have successful mutation receipts."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT target FROM autopilot_tool_receipts
+                WHERE job_id = ?
+                  AND operation IN (
+                      'write_file', 'edit_file', 'make_directory', 'remove_path'
+                  )
+                  AND status = 'success' AND target <> ''
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (job_id, max(1, min(limit, 1_000))),
+            ).fetchall()
+        return {str(row["target"]) for row in rows}
+
+    def recent_read_targets(self, job_id: str, *, limit: int = 20) -> list[str]:
+        """Return bounded, newest-first targets backed by successful reads."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT target FROM autopilot_tool_receipts
+                WHERE job_id = ? AND operation = 'read_file'
+                  AND status = 'success' AND target != ''
+                GROUP BY target ORDER BY MAX(created_at) DESC LIMIT ?
+                """,
+                (job_id, max(1, min(limit, 100))),
+            ).fetchall()
+        return [str(row["target"]) for row in rows]
 
     def list_jobs(self, *, workspace: Path, limit: int = 50) -> list[dict[str, object]]:
         with self._lock:
@@ -1927,6 +2005,7 @@ class AutopilotStore:
                     last_progress_kind TEXT NOT NULL DEFAULT '',
                     last_progress_at REAL,
                     renewal_reason TEXT NOT NULL DEFAULT '',
+                    blocker_json TEXT NOT NULL DEFAULT '{}',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     finished_at REAL
@@ -2030,6 +2109,7 @@ class AutopilotStore:
                 "last_progress_kind": "TEXT NOT NULL DEFAULT ''",
                 "last_progress_at": "REAL",
                 "renewal_reason": "TEXT NOT NULL DEFAULT ''",
+                "blocker_json": "TEXT NOT NULL DEFAULT '{}'",
             }
             for name, declaration in migrations.items():
                 if name not in columns:

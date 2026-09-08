@@ -20,6 +20,7 @@ from context_agent.model_routing import (
     ResourceRouter,
     request_signals,
 )
+from context_agent.project_checks import ProjectCheckResult
 from context_agent.runtime import AgentRuntime
 from context_agent.task_state import TaskConflict, TaskStateStore
 
@@ -257,6 +258,20 @@ def test_web_project_develop_log_long_resume_preserves_job_without_audit(
             "start_or_resume",
             lambda **_: pytest.fail("Development must not start audit"),
         )
+        monkeypatch.setattr(
+            runtime.project_check_runner,
+            "run",
+            lambda: [
+                ProjectCheckResult(
+                    check="compileall",
+                    command=("python", "-m", "compileall"),
+                    return_code=0,
+                    duration_seconds=0.01,
+                    status="passed",
+                    output="passed",
+                )
+            ],
+        )
         return runtime
 
     monkeypatch.setattr("context_agent.web._runtime_factory", factory)
@@ -310,8 +325,10 @@ def test_web_project_develop_log_long_resume_preserves_job_without_audit(
     with AutopilotStore(cfg.autopilot_database) as store:
         detail = store.details(first_job_id)
         assert detail["audit_run_id"] is None
-        assert {u["phase"] for u in detail["work_units"]} == {"implement"}
-        assert detail["status"] == "partial"
+        phases = {u["phase"] for u in detail["work_units"]}
+        assert {"implement", "verify"} <= phases
+        assert "audit" not in phases
+        assert detail["status"] == "complete"
     with sqlite3.connect(cfg.project_audit_database) as db:
         assert db.execute("SELECT count(*) FROM audit_runs").fetchone()[0] == 0
 
@@ -409,14 +426,30 @@ def test_cli_persistent_development_advances_checkpoint_without_audit(
             "start_or_resume",
             lambda **_: pytest.fail("No audit during development"),
         )
+        monkeypatch.setattr(
+            runtime.project_check_runner,
+            "run",
+            lambda: [
+                ProjectCheckResult(
+                    check="compileall",
+                    command=("python", "-m", "compileall"),
+                    return_code=0,
+                    duration_seconds=0.01,
+                    status="passed",
+                    output="passed",
+                )
+            ],
+        )
         runtime.run_user_job(
             "Измени код проекта: создай one.txt и two.txt", allow_write=True
         )
         jobs = runtime.autopilot_store.list_jobs(workspace=cfg.workspace)
-        assert len(jobs) == 1 and jobs[0]["status"] == "partial"
+        assert len(jobs) == 1 and jobs[0]["status"] == "complete"
         detail = runtime.autopilot_store.details(jobs[0]["id"])
-        assert len(detail["work_units"]) == 2
-        assert all(u["phase"] == "implement" for u in detail["work_units"])
+        assert len(detail["work_units"]) == 3
+        phases = [u["phase"] for u in detail["work_units"]]
+        assert phases.count("implement") == 2
+        assert phases.count("verify") == 1
     assert (cfg.workspace / "one.txt").read_text() == "ONE"
     assert (cfg.workspace / "two.txt").read_text() == "TWO"
     with TaskStateStore(cfg.context_database) as state:

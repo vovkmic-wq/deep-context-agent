@@ -17,6 +17,7 @@ from context_agent.autopilot import (
     AutopilotLeaseError,
     AutopilotRevisionError,
     AutopilotStore,
+    NextOperation,
 )
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.errors import AgentError, ConfigurationError
@@ -716,6 +717,32 @@ def test_durable_budgets_structured_operation_and_revision_cas(
             )
 
 
+def test_mutating_next_operation_requires_target_effect_and_verification(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    base: dict[str, object] = {
+        "phase": "implement",
+        "operation": "edit_file",
+        "objective": "Update one file",
+        "expected_effect": "updated implementation",
+        "verification_commands": ["run_project_checks"],
+    }
+    with pytest.raises(ValueError, match="concrete target"):
+        NextOperation.parse(base, workspace)
+    with pytest.raises(ValueError, match="expected effect"):
+        NextOperation.parse(
+            {**base, "target": "/workspace/source.py", "expected_effect": ""},
+            workspace,
+        )
+    with pytest.raises(ValueError, match="verification plan"):
+        NextOperation.parse(
+            {**base, "target": "/workspace/source.py", "verification_commands": []},
+            workspace,
+        )
+
+
 def test_project_change_advances_discover_implement_verify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1023,9 +1050,11 @@ def test_incident_shape_forces_implementation_instead_of_legacy_task_deadline(
     with AutopilotStore(config.autopilot_database) as store:
         job = store.list_jobs(workspace=config.workspace)[0]
         details = store.details(str(job["id"]))
-    assert "implementation_blocked_missing_information" in response
+    assert "implementation_no_mutation" in response
     assert details["status"] == "blocked"
-    assert details["last_error_code"] == ("implementation_blocked_missing_information")
+    assert details["last_error_code"] == "implementation_no_mutation"
+    assert details["blocker_json"]["category"] == "implementation_result_missing"
+    assert details["blocker_json"]["attempted_operation"]["target"]
     assert details["progress"]["discovery_units"] == 2
     assert details["progress"]["yielded_units"] == 2
     assert details["last_error_code"] != "task_deadline"
@@ -1035,13 +1064,21 @@ def test_incident_shape_forces_implementation_instead_of_legacy_task_deadline(
     }
 
 
-def test_project_change_allows_one_targeted_discovery_then_requires_mutation(
+def test_project_change_uses_validated_read_target_then_verifies_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = replace(_config(tmp_path), targeted_discovery_max_units=1)
+    config = replace(
+        _config(tmp_path),
+        discovery_max_units=1,
+        autopilot_soft_model_calls_per_unit=2,
+    )
     config.prepare_directories()
-    for name in ("source.py", "dependency.py", "contract.py"):
+    for name in (
+        "source.py",
+        "dependency.py",
+        "extra.py",
+    ):
         (config.workspace / name).write_text(f"NAME = {name!r}\n", encoding="utf-8")
     model = SequenceChatModel(
         responses=[
@@ -1056,46 +1093,32 @@ def test_project_change_allows_one_targeted_discovery_then_requires_mutation(
                     }
                 ],
             ),
-            AIMessage(content="Initial evidence covered."),
             AIMessage(
                 content="",
                 tool_calls=[
                     {
                         "name": "read_file",
-                        "args": {"file_path": "/workspace/dependency.py"},
-                        "id": "implementation-gap",
+                        "args": {"file_path": "/workspace/extra.py"},
+                        "id": "targeted-extra",
                         "type": "tool_call",
                     }
                 ],
             ),
-            AIMessage(content="One exact prerequisite is still needed."),
             AIMessage(
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
-                        "args": {"file_path": "/workspace/contract.py"},
-                        "id": "targeted-discovery",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(content="Targeted prerequisite covered."),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "write_file",
+                        "name": "edit_file",
                         "args": {
-                            "file_path": "/workspace/result.py",
-                            "content": "RESULT = True\n",
+                            "file_path": "/workspace/extra.py",
+                            "old_string": "NAME = 'extra.py'\n",
+                            "new_string": "NAME = 'implemented'\n",
                         },
                         "id": "implementation-mutation",
                         "type": "tool_call",
                     }
                 ],
             ),
-            AIMessage(content="Implementation complete."),
         ]
     )
     passed = ProjectCheckResult(
@@ -1110,7 +1133,7 @@ def test_project_change_allows_one_targeted_discovery_then_requires_mutation(
     with AgentRuntime(config, _provider(), model=model) as runtime:
         monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
         response = runtime.run_autopilot_job(
-            "Implement result.py after resolving one exact prerequisite.",
+            "Implement the required safe change after targeted discovery.",
             thread_id="targeted-discovery",
             workflow="project-change",
             allow_write=True,
@@ -1121,16 +1144,113 @@ def test_project_change_allows_one_targeted_discovery_then_requires_mutation(
             str(store.list_jobs(workspace=config.workspace)[0]["id"])
         )
     assert "complete" in response
-    assert details["progress"]["targeted_discovery_units"] == 1
+    assert details["progress"]["targeted_discovery_units"] == 0
     assert {unit["phase"] for unit in details["work_units"]} == {
         "discover",
-        "targeted-discovery",
         "implement",
         "verify",
     }
-    assert (config.workspace / "result.py").read_text(encoding="utf-8") == (
-        "RESULT = True\n"
+    assert details["next_operation_json"]["target"] == "/workspace/extra.py"
+    assert (config.workspace / "extra.py").read_text(encoding="utf-8") == (
+        "NAME = 'implemented'\n"
     )
+
+
+def test_empty_planner_target_is_blocked_before_implementation_worker(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        discovery_max_units=1,
+        targeted_discovery_max_units=0,
+    )
+    config.prepare_directories()
+    model = SequenceChatModel(responses=[AIMessage(content="No target discovered.")])
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        response = runtime.run_autopilot_job(
+            "Implement service, CLI, FastAPI, UI and tests.",
+            thread_id="empty-target-preflight",
+            workflow="project-change",
+            allow_write=True,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+    assert "planner_contract_invalid" in response
+    assert details["last_error_code"] == "planner_contract_invalid"
+    assert details["progress"]["phase_attempts"] == 0
+    assert details["progress"]["blocker"]["missing_prerequisites"]
+    assert details["blocker_json"]["attempted_operation"]["target"] == ""
+    assert [unit["phase"] for unit in details["work_units"]] == ["discover"]
+
+
+def test_implementation_cannot_mutate_outside_validated_target(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        discovery_max_units=1,
+        targeted_discovery_max_units=0,
+        autopilot_soft_model_calls_per_unit=2,
+    )
+    config.prepare_directories()
+    (config.workspace / "target.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (config.workspace / "other.py").write_text("VALUE = 2\n", encoding="utf-8")
+    model = SequenceChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/workspace/target.py"},
+                        "id": "discover-target",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "file_path": "/workspace/other.py",
+                            "old_string": "VALUE = 2\n",
+                            "new_string": "VALUE = 3\n",
+                        },
+                        "id": "wrong-target",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Could not apply the change."),
+        ]
+    )
+
+    with AgentRuntime(config, _provider(), model=model) as runtime:
+        response = runtime.run_autopilot_job(
+            "Update the implementation after reading its target.",
+            thread_id="validated-mutation-target",
+            workflow="project-change",
+            allow_write=True,
+        )
+
+    with AutopilotStore(config.autopilot_database) as store:
+        details = store.details(
+            str(store.list_jobs(workspace=config.workspace)[0]["id"])
+        )
+
+    assert "implementation_no_mutation" in response
+    assert (config.workspace / "other.py").read_text(encoding="utf-8") == (
+        "VALUE = 2\n"
+    )
+    assert details["next_operation_json"]["target"] == "/workspace/target.py"
+    with AutopilotStore(config.autopilot_database) as store:
+        assert store.verified_mutation_count(str(details["id"])) == 0
 
 
 def test_legacy_autopilot_database_migrates_additively_without_losing_job(
@@ -1164,6 +1284,7 @@ def test_legacy_autopilot_database_migrates_additively_without_losing_job(
             "last_progress_kind",
             "last_progress_at",
             "renewal_reason",
+            "blocker_json",
         ):
             connection.execute(f"ALTER TABLE autopilot_jobs DROP COLUMN {column}")
         for column in ("evidence_fingerprint", "verified_progress"):
@@ -1194,6 +1315,7 @@ def test_legacy_autopilot_database_migrates_additively_without_losing_job(
         "resume_phase",
         "active_time_seconds",
         "wall_deadline_at",
+        "blocker_json",
     } <= job_columns
     assert {"evidence_fingerprint", "verified_progress"} <= receipt_columns
 

@@ -1,5 +1,25 @@
 # Техническое задание: веб-интерфейс Deep Context Agent
 
+## Целевое дополнение 0.29: исполнимая операция и понятная остановка
+
+Web API и UI реализуют E09 из
+`EXECUTABLE_HANDOFF_RECOVERY_TECHNICAL_SPEC.md`. Карточка persistent-задачи
+показывает текущий компонент и virtual target только после успешного preflight,
+а также отдельно отображает подготовку операции, bounded recovery, mutation и
+runtime verification. Пустой target не может выглядеть как выполняемая правка.
+
+При остановке пользователь видит категорию, краткую доказуемую причину,
+недостающую предпосылку и требуемое действие. Формулировка «точная причина
+сохранена» допустима только при непустом persisted blocker. Для внутренней ошибки
+planner UI сообщает об ошибке планирования и diagnostic ID, а не предлагает
+пользователю вручную разбивать задачу или угадывать нужный файл.
+
+`GET /api/jobs/{id}`, SSE и reload возвращают согласованные contract/preflight,
+recovery, changed-files и checks counters. Данные bounded/redacted: физические
+пути, prompt bodies, file contents, ключи и raw exceptions не попадают в DOM/API.
+Acceptance повторяет incident с пустым target и подтверждает либо автоматическое
+восстановление к конкретной операции, либо полный structured blocker.
+
 ## Целевое дополнение 0.28: orchestration и агрегированная диагностика
 
 Web API использует тот же structured router и runtime, что CLI. В accepted/SSE

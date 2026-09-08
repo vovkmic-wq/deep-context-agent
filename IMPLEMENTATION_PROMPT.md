@@ -1,5 +1,24 @@
 # Управляющий промпт реализации
 
+## Целевой этап 0.29: executable handoff recovery
+
+Выполняй `DEEP_CONTEXT_AGENT_0_29_EXECUTABLE_HANDOFF_RECOVERY_PROMPT.md` строго по
+`EXECUTABLE_HANDOFF_RECOVERY_TECHNICAL_SPEC.md` (E01–E12, A01–A18). Сначала
+воспроизведи incident `103bdbab6c558da6761380dc`, затем исправь runtime contract,
+decomposition, preflight, bounded recovery, blocker persistence, verification и
+Web observability.
+
+Нельзя запускать IMPLEMENT с пустым target, увеличивать implementation attempts
+на preflight failure или просить модель угадать файл. Широкая цель должна стать
+durable dependency graph с конкретными leaf operations. `missing_information`
+разрешён только при действительно сохранённом prerequisite; planner defect имеет
+отдельный код и не перекладывается на пользователя.
+
+Подготовка документов не является исправлением. До A01–A18, полного regression
+suite и двух изолированных live-прогонов не повышай версию и не заявляй production
+PASS. Не затрагивай пользовательский сервер 8765 и не публикуй Git без отдельной
+актуальной команды пользователя.
+
 ## Целевой этап 0.28: production orchestration
 
 Выполняй `DEEP_CONTEXT_AGENT_0_28_PRODUCTION_ORCHESTRATION_PROMPT.md` строго по

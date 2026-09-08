@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-09-08
+
+### Добавлено
+
+- Добавлены исполняемый контракт следующей операции, preflight до создания
+  implementation worker и структурированный persisted blocker.
+- Web progress/API отображают безопасный target, компонент и действие для
+  восстановления; frontend пересобран из TypeScript source.
+- Добавлены regression-тесты пустого target, восстановления цели из read receipt
+  и запрета мутации вне проверенного target.
+
+### Исправлено
+
+- Устранён incident
+  `103bdbab6c558da6761380dc`: schema-validated executable handoff, preflight до
+  worker, bounded recovery и точный persisted blocker.
+- Последовательные операции над несколькими явно названными файлами выбирают
+  следующий незавершённый leaf, а повторный ход может безопасно продолжить
+  правку уже изменённого target.
+
 ## [0.28.0] — 2026-09-07
 
 ### Добавлено

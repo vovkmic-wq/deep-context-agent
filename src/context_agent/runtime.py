@@ -45,6 +45,7 @@ from context_agent.autopilot import (
     AutopilotLeaseError,
     AutopilotProgress,
     AutopilotStore,
+    NextOperation,
 )
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import ContextStore, SearchHit
@@ -1022,6 +1023,7 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         self._edit_retry_ready: set[tuple[str, int]] = set()
         self._edit_tool_blocked = False
         self._mutation_guard: Callable[[], None] | None = None
+        self._mutation_target: str | None = None
         self._mutations_allowed = True
         self._workspace_reads_allowed = True
         self._project_scan_allowed = True
@@ -1036,6 +1038,11 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
         """Apply a trusted per-request mutation policy before model tool calls."""
 
         self._mutations_allowed = allowed
+
+    def set_mutation_target(self, target: str | None) -> None:
+        """Constrain an implementation unit to its validated virtual target."""
+
+        self._mutation_target = normalize_virtual_path(target) if target else None
 
     def set_routing_scope(
         self,
@@ -1172,14 +1179,24 @@ class ToolCallPolicyMiddleware(AgentMiddleware):
                 "Filesystem mutation denied by the trusted chat mode policy.",
                 _filesystem_target(args),
             )
-        if name in MUTATING_FILESYSTEM_TOOLS and self._mutation_guard is not None:
-            self._mutation_guard()
         raw_args = request.tool_call.get("args", {})
         args = raw_args if isinstance(raw_args, Mapping) else {}
         requested_path = _filesystem_target(args)
         normalized_path = (
             normalize_virtual_path(requested_path) if requested_path else None
         )
+        if (
+            name in MUTATING_FILESYSTEM_TOOLS
+            and self._mutation_target is not None
+            and normalized_path != self._mutation_target
+        ):
+            return denied_tool_message(
+                request,
+                "Mutation target differs from the validated operation contract.",
+                requested_path,
+            )
+        if name in MUTATING_FILESYSTEM_TOOLS and self._mutation_guard is not None:
+            self._mutation_guard()
         current_path_key = (
             (normalized_path, self._path_versions[normalized_path])
             if normalized_path
@@ -4363,6 +4380,7 @@ class AgentRuntime:
                         )
                     finally:
                         self._tool_call_policy_middleware.set_mutation_guard(None)
+                        self._tool_call_policy_middleware.set_mutation_target(None)
                     heartbeat.ensure_owned()
             except AgentError as exc:
                 self._active_autopilot_receipt_context = None
@@ -4646,7 +4664,11 @@ class AgentRuntime:
 
         targeted = workflow in {"targeted-review", "targeted-change"}
         development = workflow in {"project-change", "project-test"}
-        phase_machine = development and allow_write
+        phase_machine = allow_write and workflow in {
+            "targeted-change",
+            "project-change",
+            "project-test",
+        }
         self._tool_call_policy_middleware.set_routing_scope(
             workspace_reads_allowed=targeted or development,
             project_scan_allowed=development,
@@ -4731,7 +4753,12 @@ class AgentRuntime:
                     or progress.discovery_searches
                     >= self.app_config.discovery_max_searches
                 )
-                if phase == "discover" and has_saved_task:
+                saved_target = self._resolve_conversational_target(
+                    lease.job_id,
+                    objective,
+                    durable_checkpoint(),
+                )
+                if phase == "discover" and has_saved_task and saved_target:
                     self.autopilot_store.transition_phase(
                         lease,
                         "plan",
@@ -4814,8 +4841,58 @@ class AgentRuntime:
                 phase,
                 objective,
                 checkpoint_before_unit,
+                job_id=lease.job_id,
             )
-            self.autopilot_store.set_next_operation(lease, next_operation)
+            try:
+                validated_operation = NextOperation.parse(
+                    next_operation,
+                    self.app_config.workspace,
+                )
+            except (TypeError, ValueError) as exc:
+                if (
+                    phase in {"implement", "repair"}
+                    and progress.targeted_discovery_units
+                    < self.app_config.targeted_discovery_max_units
+                ):
+                    progress = self.autopilot_store.replan(
+                        lease,
+                        batch_size=1,
+                        error_code="planner_contract_invalid",
+                        safe_message=(
+                            "Implementation target was not executable; one bounded "
+                            "targeted-discovery recovery is scheduled."
+                        ),
+                    )
+                    self.autopilot_store.transition_phase(
+                        lease,
+                        "targeted-discovery",
+                        reason="executable-target-required",
+                    )
+                    self._emit_autopilot_progress(
+                        progress_callback,
+                        self.autopilot_store.progress(lease.job_id),
+                        None,
+                        "replanned",
+                    )
+                    continue
+                blocker = self._operation_blocker(
+                    lease.job_id,
+                    error_code="planner_contract_invalid",
+                    summary=str(exc),
+                    attempted_operation=next_operation,
+                )
+                return self._block_autopilot(
+                    lease,
+                    None,
+                    error_code="planner_contract_invalid",
+                    safe_message=(
+                        "Runtime could not produce a validated executable operation; "
+                        "the structured planning blocker was preserved."
+                    ),
+                    callback=progress_callback,
+                    blocker=blocker,
+                )
+            self.autopilot_store.set_next_operation(lease, validated_operation)
             unit_id, sequence, worker_thread = self.autopilot_store.begin_unit(
                 lease,
                 phase=phase,
@@ -4833,6 +4910,7 @@ class AgentRuntime:
                 workflow,
                 phase=phase,
                 schema_contract=schema_contract,
+                operation_contract=validated_operation.as_dict(),
             )
             before_checkpoint = durable_checkpoint()
             before_progress = self.autopilot_store.progress(lease.job_id)
@@ -4844,6 +4922,9 @@ class AgentRuntime:
                 timeout_seconds=self.app_config.autopilot_unit_timeout_seconds,
             )
             self._active_autopilot_receipt_context = (lease, unit_id)
+            self._tool_call_policy_middleware.set_mutation_target(
+                validated_operation.target if phase in {"implement", "repair"} else None
+            )
             try:
                 with heartbeat:
                     self._tool_call_policy_middleware.set_mutation_guard(
@@ -4865,6 +4946,7 @@ class AgentRuntime:
                         )
                     finally:
                         self._tool_call_policy_middleware.set_mutation_guard(None)
+                        self._tool_call_policy_middleware.set_mutation_target(None)
                     heartbeat.ensure_owned()
             except AgentError as exc:
                 self._active_autopilot_receipt_context = None
@@ -4914,15 +4996,16 @@ class AgentRuntime:
                             return self._block_autopilot(
                                 lease,
                                 None,
-                                error_code=(
-                                    "implementation_blocked_missing_information"
-                                ),
+                                error_code="implementation_no_mutation",
                                 safe_message=(
-                                    "Implementation unit produced no mutation receipt; "
-                                    "the exact missing prerequisite is preserved in "
-                                    "the checkpoint."
+                                    "Implementation produced no mutation receipt for "
+                                    "the validated target; the structured blocker was "
+                                    "preserved."
                                 ),
                                 callback=progress_callback,
+                                blocker=self._no_mutation_blocker(
+                                    validated_operation.as_dict()
+                                ),
                             )
                     elif phase_machine and phase == "targeted-discovery":
                         if not information_delta:
@@ -5111,20 +5194,41 @@ class AgentRuntime:
                     return self._block_autopilot(
                         lease,
                         None,
-                        error_code="implementation_blocked_missing_information",
+                        error_code="implementation_no_mutation",
                         safe_message=(
                             "Implementation unit produced no verified workspace "
-                            "mutation. Broad discovery will not be restarted."
+                            "mutation for its validated target."
                         ),
                         callback=progress_callback,
+                        blocker=self._no_mutation_blocker(
+                            validated_operation.as_dict()
+                        ),
                     )
-                if has_saved_task and checkpoint.get("next_step"):
+                plan_items = {
+                    str(item).strip()
+                    for item in (checkpoint.get("plan") or [])
+                    if str(item).strip()
+                }
+                completed_items = {
+                    str(item).strip()
+                    for item in (checkpoint.get("completed_claims") or [])
+                    if str(item).strip()
+                }
+                checkpoint_complete = bool(
+                    plan_items and plan_items.issubset(completed_items)
+                )
+                if (
+                    has_saved_task
+                    and checkpoint.get("next_step")
+                    and not checkpoint_complete
+                ):
                     self.autopilot_store.set_next_operation(
                         lease,
                         self._conversational_next_operation(
                             "implement",
                             objective,
                             checkpoint,
+                            job_id=lease.job_id,
                         ),
                     )
                     self._emit_autopilot_progress(
@@ -5135,14 +5239,18 @@ class AgentRuntime:
                     )
                     continue
                 if has_saved_task:
-                    partial = self.autopilot_store.mark_partial(lease, answer)
+                    self.autopilot_store.transition_phase(
+                        lease,
+                        "verify",
+                        reason="saved-task-implementation-receipt",
+                    )
                     self._emit_autopilot_progress(
                         progress_callback,
-                        partial,
+                        self.autopilot_store.progress(lease.job_id),
                         None,
-                        "partial",
+                        "phase_transition",
                     )
-                    return answer
+                    continue
                 self.autopilot_store.transition_phase(
                     lease,
                     "verify",
@@ -5235,11 +5343,13 @@ class AgentRuntime:
             callback=progress_callback,
         )
 
-    @staticmethod
     def _conversational_next_operation(
+        self,
         phase: str,
         objective: str,
         checkpoint: Mapping[str, object],
+        *,
+        job_id: str,
     ) -> dict[str, object]:
         """Build a bounded scheduler-owned operation; model text is not authority."""
 
@@ -5252,6 +5362,10 @@ class AgentRuntime:
             "repair": "edit_file",
         }.get(phase, "analyze")
         next_step = str(checkpoint.get("next_step") or "").strip()
+        target = self._resolve_conversational_target(job_id, objective, checkpoint)
+        if phase in {"implement", "repair"} and target:
+            local_target = resolve_inside(self.app_config.workspace, target)
+            operation = "edit_file" if local_target.exists() else "create_file"
         structured_phase = (
             phase
             if phase
@@ -5268,7 +5382,7 @@ class AgentRuntime:
         return {
             "phase": structured_phase,
             "operation": operation,
-            "target": "",
+            "target": target if phase in {"implement", "repair"} else "",
             "objective": (next_step or objective)[:2_000],
             "required_evidence_ids": [],
             "expected_effect": {
@@ -5279,8 +5393,138 @@ class AgentRuntime:
                 "verify": "allowlisted check results",
                 "repair": "verified repair mutation receipt",
             }.get(phase, "bounded answer"),
-            "verification_commands": [],
+            "verification_commands": (
+                ["run_project_checks"] if phase in {"implement", "repair"} else []
+            ),
             "blocking_conditions": [],
+            "contract_version": 1,
+            "component": Path(target).name if target else "",
+        }
+
+    def _resolve_conversational_target(
+        self,
+        job_id: str,
+        objective: str,
+        checkpoint: Mapping[str, object],
+    ) -> str:
+        """Resolve one concrete target from trusted receipts or explicit text."""
+
+        next_step = str(checkpoint.get("next_step") or "").casefold()
+        completed_targets = self.autopilot_store.recent_mutation_targets(job_id)
+        read_targets = set(self.autopilot_store.recent_read_targets(job_id, limit=100))
+        texts = (objective, str(checkpoint.get("next_step") or ""))
+        candidates: list[str] = []
+        for text in texts:
+            normalized_text = text.replace("\\", "/")
+            matches = re.findall(r"/workspace/[\w./-]+", normalized_text)
+            matches.extend(
+                re.findall(
+                    r"(?<![/\w.-])[\w.-]+\.(?:py|toml|ya?ml|json|md|txt|js|ts|tsx|html|css)\b",
+                    normalized_text,
+                    flags=re.IGNORECASE,
+                )
+            )
+            for candidate in matches:
+                candidate = candidate.rstrip(".,;:)]}")
+                try:
+                    resolved = resolve_inside(self.app_config.workspace, candidate)
+                except PathSecurityError:
+                    continue
+                if resolved != self.app_config.workspace and resolved.parent.exists():
+                    virtual = (
+                        "/workspace/"
+                        + resolved.relative_to(self.app_config.workspace).as_posix()
+                    )
+                    if virtual not in candidates:
+                        candidates.append(virtual)
+        if next_step:
+            for candidate in candidates:
+                if Path(candidate).stem.casefold() in next_step:
+                    return candidate
+        for candidate in candidates:
+            if candidate not in completed_targets and candidate not in read_targets:
+                return candidate
+        for candidate in candidates:
+            if candidate not in completed_targets:
+                return candidate
+        if candidates:
+            # A later checkpoint may intentionally edit the same leaf again.
+            # Tool receipts and content hashes still prevent duplicate effects.
+            return candidates[0]
+        return next(
+            iter(self.autopilot_store.recent_read_targets(job_id, limit=20)),
+            "",
+        )
+
+    def _operation_blocker(
+        self,
+        job_id: str,
+        *,
+        error_code: str,
+        summary: str,
+        attempted_operation: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Build a bounded blocker from persisted evidence without guessing."""
+
+        candidates = self.autopilot_store.recent_read_targets(job_id, limit=5)
+        return {
+            "blocker_version": 1,
+            "error_code": error_code,
+            "category": "invalid_planner_output",
+            "summary": summary[:1_000],
+            "missing_prerequisites": [
+                {
+                    "kind": "executable_target",
+                    "name": "target",
+                    "reason": "No workspace-safe mutation target passed preflight.",
+                    "source": "runtime_preflight",
+                }
+            ],
+            "attempted_operation": {
+                "operation": str(attempted_operation.get("operation") or ""),
+                "phase": str(attempted_operation.get("phase") or ""),
+                "target": str(attempted_operation.get("target") or ""),
+            },
+            "candidate_targets": candidates,
+            "evidence_ids": [],
+            "required_action": (
+                "Resume after the planner can select one candidate target."
+                if candidates
+                else "Provide or discover one concrete implementation target."
+            ),
+            "retryable": bool(candidates),
+            "source": "runtime_preflight",
+        }
+
+    @staticmethod
+    def _no_mutation_blocker(
+        attempted_operation: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Describe an executable operation that returned without a mutation."""
+
+        return {
+            "blocker_version": 1,
+            "error_code": "implementation_no_mutation",
+            "category": "implementation_result_missing",
+            "summary": "The worker returned without a verified mutation receipt.",
+            "missing_prerequisites": [
+                {
+                    "kind": "mutation_receipt",
+                    "name": "workspace_mutation",
+                    "reason": "No successful mutating tool receipt was recorded.",
+                    "source": "runtime_ledger",
+                }
+            ],
+            "attempted_operation": {
+                "operation": str(attempted_operation.get("operation") or ""),
+                "phase": str(attempted_operation.get("phase") or ""),
+                "target": str(attempted_operation.get("target") or ""),
+            },
+            "candidate_targets": [str(attempted_operation.get("target") or "")],
+            "evidence_ids": [],
+            "required_action": "Retry or replan the same bounded target.",
+            "retryable": True,
+            "source": "runtime_ledger",
         }
 
     @staticmethod
@@ -5290,6 +5534,7 @@ class AgentRuntime:
         *,
         phase: str = "execute",
         schema_contract: str = "",
+        operation_contract: Mapping[str, object] | None = None,
     ) -> str:
         objective_digest = hashlib.sha256(objective.encode("utf-8")).hexdigest()
         bounded_objective = objective[:_WORK_UNIT_OBJECTIVE_MAX_CHARS]
@@ -5335,6 +5580,9 @@ class AgentRuntime:
                 "Runtime schema contract (authoritative names/signatures; verify the "
                 "exact current file before editing):\n"
                 f"{schema_contract or '{}'}\n\n"
+                "Executable operation contract (validated by runtime; perform this "
+                "target only):\n"
+                f"{json.dumps(dict(operation_contract or {}), ensure_ascii=False)}\n\n"
                 f"User objective and data:\n{bounded_objective}"
             )
         return (
@@ -5595,6 +5843,7 @@ class AgentRuntime:
         error_code: str,
         safe_message: str,
         callback: Callable[[AutopilotProgress, AuditProgress | None, str], None] | None,
+        blocker: Mapping[str, object] | None = None,
     ) -> str:
         report = ""
         if audit_progress is not None:
@@ -5607,6 +5856,7 @@ class AgentRuntime:
             error_code=error_code,
             safe_message=safe_message,
             report=report,
+            blocker=blocker,
         )
         self._emit_autopilot_progress(
             callback,

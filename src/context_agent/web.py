@@ -427,6 +427,14 @@ _AGENT_FAILURE_MESSAGES = {
     "implementation_blocked_missing_information": (
         "Реализация остановлена: не хватает конкретных подтверждённых данных."
     ),
+    "planner_contract_invalid": (
+        "Внутренний планировщик не сформировал исполнимую операцию. "
+        "Точная структурированная причина сохранена в диагностике."
+    ),
+    "implementation_no_mutation": (
+        "Исполнимая операция завершилась без подтверждённого изменения. "
+        "Целевой файл и причина сохранены в диагностике."
+    ),
     "implementation_blocked_scope_conflict": (
         "Реализация остановлена из-за конфликта согласованной области работы."
     ),
@@ -745,6 +753,8 @@ class TaskRegistry:
                         "discovery_budget_exhausted",
                         "discovery_exhausted_without_implementation",
                         "implementation_blocked_missing_information",
+                        "planner_contract_invalid",
+                        "implementation_no_mutation",
                         "implementation_blocked_scope_conflict",
                         "implementation_blocked_permission_denied",
                         "implementation_blocked_unsupported_tool",

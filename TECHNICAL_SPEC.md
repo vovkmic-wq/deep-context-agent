@@ -1,5 +1,27 @@
 # Техническое задание: Deep Context Agent
 
+## Целевое дополнение 0.29: исполнимый handoff и точный blocker
+
+Нормативный документ: `EXECUTABLE_HANDOFF_RECOVERY_TECHNICAL_SPEC.md`; порядок
+реализации: `DEEP_CONTEXT_AGENT_0_29_EXECUTABLE_HANDOFF_RECOVERY_PROMPT.md`.
+Обязательны E01–E12 и A01–A18. Этап вызван incident
+`103bdbab6c558da6761380dc`: scheduler передал IMPLEMENT операцию `edit_file` с
+пустым target, выполнил три units без мутации и завершился общей ошибкой, хотя
+точная недостающая предпосылка не была сохранена.
+
+Любая mutating work unit запускается только после schema/preflight проверки
+`ExecutableOperationContract`: конкретный безопасный target, ожидаемый эффект,
+актуальные evidence, dependencies и verification plan обязательны. Широкая цель
+компилируется в durable graph небольших leaf operations. Пустой target является
+ошибкой planner contract и проходит bounded recovery; он не перекладывается на
+пользователя как `missing information`.
+
+Terminal blocker обязан быть непустой persisted структурой с категорией,
+prerequisites, attempted operation, evidence и required action. UI и ответ могут
+утверждать, что точная причина сохранена, только после успешной durable записи и
+валидации этих полей. После mutation runtime запускает проверку leaf; COMPLETE
+требует PASS всех обязательных leaf requirements.
+
 ## Целевое дополнение 0.28: production orchestration
 
 Нормативный документ: `PRODUCTION_ORCHESTRATION_TECHNICAL_SPEC.md`; порядок:

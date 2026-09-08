@@ -1,5 +1,46 @@
 # Статус реализации
 
+## Executable handoff recovery 0.29.0 — реализовано, 2026-09-08
+
+По job `103bdbab6c558da6761380dc` и diagnostic task
+`488aa222a53743a9a04690ef6bc96262` подтверждён новый incident: 3 yielded units,
+6 чтений, 5 context searches, но 0 changed files и 0 checks. Runtime сохранил
+`operation=edit_file` с пустым `target`, пустыми `blocking_conditions` и
+`verification_commands`, затем вернул
+`implementation_blocked_missing_information`. Заявленная точная предпосылка в
+checkpoint отсутствует.
+
+Созданы `EXECUTABLE_HANDOFF_RECOVERY_TECHNICAL_SPEC.md` (E01–E12, A01–A18) и
+`DEEP_CONTEXT_AGENT_0_29_EXECUTABLE_HANDOFF_RECOVERY_PROMPT.md`. Обновлены
+глобальные ТЗ/промпт, Web-ТЗ, system prompt, README и CHANGELOG. Требуются
+типизированный contract, preflight gate, goal graph, bounded recovery, точный
+blocker, leaf verification, persistence/restart и Web observability.
+
+Реализованы schema-validated `NextOperation`, preflight до `begin_unit`,
+ограниченное targeted recovery, выбор следующего target из точных путей и
+подтверждённых read receipts, запрет записи за пределами target и структурный
+blocker в SQLite/Web progress. Runtime-owned verification остаётся обязательным
+условием COMPLETE. Исторический incident покрыт детерминированными regression-
+тестами.
+
+Финальная проверка 2026-09-08:
+
+- Ruff check и format-check — PASS, 92 Python-файла отформатированы;
+- mypy — PASS, 28 source-файлов; compileall — PASS;
+- pytest — 392 passed, 1 штатный Windows symlink skip;
+- TypeScript, bundle и model-choice tests — PASS; wheel/sdist 0.29.0 собраны;
+- `pip check` — PASS; `doctor --live` — GLM-5.3, `live_response=OK`;
+- изолированный Web API на порту 8879 — health/runtime 200, версия 0.29.0,
+  hybrid FTS5 + FastEmbed/Qdrant доступен; основной порт 8765 не остановлен;
+- normal live job `e709dc83192e96b636257c92`: `/workspace/service.py`,
+  1 changed file, runtime VERIFY, 1 check, `verification=passed`, COMPLETE;
+- forced-invalid live job `b5d53085935d9ce498f48cb2`: пустой mutating target
+  отклонён до implementation worker (`phase_attempts=0`), сохранён непустой
+  blocker `planner_contract_invalid`; пользовательские файлы не затронуты.
+
+Статус 0.29.0: **production PASS локально**. Git-публикация в этом ходе не
+выполнялась, поскольку она требует отдельной актуальной команды по промпту 0.29.
+
 ## Production orchestration 0.28.0 — реализовано, 2026-09-07
 
 Выполнены R01–R07 и A01–A14 из
