@@ -1,5 +1,12 @@
 # Промпт реализации Deep Context Agent 0.31
 
+Последующий план устранения lifecycle-дефектов:
+[промпт 0.32](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md) по
+[ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
+Он сохраняет typed approval/write-gate этого этапа, уточняет dual lease renewal,
+durable transfer/finalization и правильный root/venv независимого VERIFY.
+Не считать создание repair task доказательством завершения всего repair-цикла.
+
 Работай строго по `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md` (R01–R16,
 A01–A30) и сохраняй ограничения предыдущих ТЗ. Цель — создать механически
 защищённый переход от failed read-only verification к отдельной подтверждённой

@@ -1,5 +1,13 @@
 # ТЗ 0.25: устойчивая задача, семантический intent и адаптивный выбор LLM
 
+## Запланированное уточнение 0.32
+
+[ТЗ жизненного цикла](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
+L01–L08 дополняет identity/continuation: сохранённая задача и job имеют связанное
+владение с независимым heartbeat и durable transfer. Resume сохраняет
+VerificationContext и повторно валидирует root/окружение, не подменяя его Python
+агента. История 0.25–0.31 остаётся; текущий runtime-дефект ещё требует реализации.
+
 Дополнение после инцидента 2026-09-04: последующий этап 0.26 описан в
 `AUTOPILOT_PROGRESS_RECOVERY_TECHNICAL_SPEC.md`. Он уточняет R1/R3 runtime-owned
 handoff до hard limit, R4 execution escalation и R5 parent/child diagnostics.
@@ -13,8 +21,11 @@ handoff до hard limit, R4 execution escalation и R5 parent/child diagnostics.
 цель не заменяется запросом «продолжи». SQLite хранит план, remaining/next step,
 подтверждённые tool operations, последний результат и причину остановки. Resume
 восстанавливает состояние без зависимости от контекстного окна модели.
-Миграция не удаляет старые таблицы. Изменение checkpoint/terminal state требует
-актуального owner/revision/lease. Старые логи не импортируются как полномочия.
+Миграция не удаляет старые таблицы. Изменение checkpoint и side effects требуют
+актуального owner/revision/lease. Для terminal reconciliation после expiry
+controller применяет только durable evidence той же execution generation и
+CAS-защиту из L04/L05 этапа 0.32, без выдачи worker права записи. Новый owner,
+cancel/revoke имеют приоритет; старые логи не импортируются как полномочия.
 
 ## R2. Intent и полномочия
 

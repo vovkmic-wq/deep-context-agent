@@ -1,5 +1,11 @@
 # Промпт реализации Deep Context Agent 0.30
 
+Последующее уточнение 0.32:
+[промпт lifecycle](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md) по
+[ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md), L06–L09.
+Передавай валидированный root/environment во все VERIFY, включая обычную
+разработку. Не используй Python агента как скрытый fallback вложенного проекта.
+
 > Последующий этап: `DEEP_CONTEXT_AGENT_0_31_VERIFICATION_REPAIR_PROMPT.md` по
 > `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md`. Он заменяет попытку повысить
 > read-only continuation созданием отдельной подтверждённой repair-задачи.

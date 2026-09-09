@@ -2,6 +2,13 @@
 
 Статус: реализовано в 0.24.0; результаты и ограничения — IMPLEMENTATION_STATUS.md.
 
+Последующее уточнение — [промпт 0.32](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md)
+по [ТЗ lifecycle](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
+Lease сохранённой задачи необходимо продлевать вместе с job; после terminal
+outcome нельзя оставлять обычный running. Recovery применяет только подтверждённую
+связь execution/generation и сохраняет project root/environment. Эти исправления
+на 2026-09-09 запланированы, не следуют автоматически из наличия continuation.
+
 1. Зафиксировать baseline и сохранить пользовательские изменения.
 2. Ввести постоянную задачу в существующей SQLite: identity, thread, workspace,
    direct objective, workflow, scope, разрешение записи, этап, результат и revision.

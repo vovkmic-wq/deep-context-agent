@@ -25,6 +25,17 @@ from context_agent.project_checks import ProjectCheckResult
 from context_agent.runtime import AgentRuntime
 
 
+def _mock_verified_project(runtime, monkeypatch, passed):
+    root = runtime.app_config.workspace
+    (root / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+
+    def run(*, project_root):
+        assert project_root == root.resolve()
+        return [passed]
+
+    monkeypatch.setattr(runtime.project_check_runner, "run", run)
+
+
 def _config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         project_root=tmp_path,
@@ -825,7 +836,7 @@ def test_project_change_advances_discover_implement_verify(
     )
 
     with AgentRuntime(config, _provider(), model=model) as runtime:
-        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        _mock_verified_project(runtime, monkeypatch, passed)
         response = runtime.run_autopilot_job(
             "Inspect source.py, implement implemented.py and verify the project.",
             thread_id="phase-machine",
@@ -880,10 +891,11 @@ def test_allow_write_job_requires_current_verification_pass(
     )
 
     with AgentRuntime(config, _provider(), model=model) as runtime:
-        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        _mock_verified_project(runtime, monkeypatch, passed)
         result = runtime.run_autopilot_job(
             "Perform a complete project audit and implement confirmed fixes.",
             thread_id="verified-write",
+            include_patterns=("*.py",),
             allow_write=True,
         )
 
@@ -1165,7 +1177,7 @@ def test_project_change_uses_validated_read_target_then_verifies_mutation(
     )
 
     with AgentRuntime(config, _provider(), model=model) as runtime:
-        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        _mock_verified_project(runtime, monkeypatch, passed)
         response = runtime.run_autopilot_job(
             "Implement the required safe change after targeted discovery.",
             thread_id="targeted-discovery",
@@ -1609,7 +1621,7 @@ def test_crash_after_mutation_receipt_reconciles_to_verify_without_replay(
         output="1 passed",
     )
     with AgentRuntime(config, _provider(), model=model) as runtime:
-        monkeypatch.setattr(runtime.project_check_runner, "run", lambda: [passed])
+        _mock_verified_project(runtime, monkeypatch, passed)
         response = runtime.run_autopilot_job(
             objective,
             thread_id="crash-after-mutation",

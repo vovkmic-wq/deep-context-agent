@@ -1,5 +1,14 @@
 # ТЗ 0.27: долговечный планировщик и доказуемое продвижение задачи
 
+## Запланированное уточнение 0.32
+
+[ТЗ жизненного цикла](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
+L01–L05 уточняет S02: heartbeat продлевает не только job, но и связанную saved
+task; checkpoint revision, fencing generation и budgets различаются. Длительный
+model call/VERIFY не должен оставлять saved-task lease без обновления.
+Terminal state проецируется из durable outcome с CAS и обработкой finish=False.
+Это план исправления выявленного дефекта 0.31.0, не подтверждение его устранения.
+
 Статус: нормативный документ реализованного этапа 0.27.0. Сам документ не является
 доказательством PASS; фактические automated/live evidence и ограничения записаны
 в `IMPLEMENTATION_STATUS.md`.
@@ -74,7 +83,9 @@ UTC timestamps служат журналу и restart recovery.
 2. HTTP возвращает task/job ID; жизненный цикл не принадлежит открытому SSE.
 3. Worker атомарно claim-ит одну unit через owner, generation, lease и CAS revision.
 4. Для job одновременно активна не более чем одна mutation-capable unit.
-5. Завершение, yield, pause, failure и requeue записываются одной транзакцией.
+5. Изменение состояния и outbox event записываются транзакционно в выбранной
+   owner-БД. Между отдельными SQLite применяются идемпотентные проекции/ACK и
+   recovery по L04/L05 этапа 0.32, а не обещание одной межбазовой транзакции.
 6. После crash просроченный lease переводится в interrupted/requeue без повторения
    подтверждённых side effects.
 7. Restart поднимает scheduler и продолжает разрешённые queued/running jobs после
@@ -83,6 +94,10 @@ UTC timestamps служат журналу и restart recovery.
 9. Retries транспорта, retries unit и переход между фазами имеют разные счётчики.
 10. Все side-effect tools используют idempotency/evidence receipts; смена provider
     не разрешает replay успешной мутации.
+11. Shared ownership controller продлевает task/job leases с проверкой обеих
+    аренд; старый worker не возрождает expiry и не завершает новую generation.
+12. Uncertain side effect после crash до receipt требует сверки, не автоматического
+    повторного исполнения. Pending terminal projections сохраняются до ACK.
 
 ## S03. Фазовый автомат
 

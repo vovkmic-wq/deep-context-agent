@@ -1,5 +1,31 @@
 # Управляющий промпт реализации
 
+## Целевой этап 0.32: lease, terminal state и VerificationContext
+
+Выполняй [промпт 0.32](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md)
+по [ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md), L01–L13,
+A01–A34; Web — по
+[Web-промпту 0.32](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
+Это план, а не отчёт о готовом коде. Версия пакета пока 0.31.0.
+
+Начни с воспроизводимых failing regressions: длительный ход переживает срок
+saved-task lease, `finish(False)` оставляет running, обычный project-change
+проверяет вложенный Ozon из workspace агентским Python. Затем последовательно
+реализуй dual renewal/CAS fencing, terminal outbox/reconciliation и обязательный
+контекст root/environment во всех точках вызова ProjectCheckRunner.
+
+Опирайся на механические gates, persisted handoff и независимую верификацию;
+применение Habr/LangChain описано в разделе 1.1 ТЗ. Checkpoints не заменяют
+полномочия runtime и не делают несколько SQLite одной транзакцией. Не устанавливай
+DCS или новый облачный backend и не обновляй зависимости только ради аналогии.
+
+Не лечи expiry бесконечным lease, снятием CAS или повторными просьбами
+«продолжи». Не используй sys.executable как скрытый fallback проверяемого проекта.
+Повтори incident в изолированной fixture, длительный live-сценарий и restart;
+сопоставь task/job/diagnostics/API/UI, root и Python receipts. Заполни матрицу
+приёмки фактическими результатами; непройденные пункты оставь явно открытыми.
+Подготовка документов не разрешает объявлять этап выполненным.
+
 ## Целевой этап 0.31: подтверждаемая repair-задача
 
 Выполняй `DEEP_CONTEXT_AGENT_0_31_VERIFICATION_REPAIR_PROMPT.md` строго по
@@ -14,8 +40,10 @@ semantic classifier, prompt text, смена модели и env не повыш
 Один incident исправляет одну root cause. Work units получают конкретные targets
 и path territories. После изменений свежий независимый read-only verifier
 проверяет mutation receipts и запускает ProjectCheckRunner. Версия
-0.31.0 прошла A01–A30-oriented regressions, изолированный live Web API и
-полный quality gate; дальнейшие изменения сохраняют эти invariants.
+0.31.0 прошла зафиксированные в IMPLEMENTATION_STATUS.md regression/quality
+checks и ограниченный live Web API. Эти результаты сохраняются как история,
+но не доказывают прохождение всех A01–A30 или длительного полного repair-цикла:
+последующий incident выявил открытые дефекты, описанные в этапе 0.32.
 
 ## Целевой этап 0.30: verification-only execution
 

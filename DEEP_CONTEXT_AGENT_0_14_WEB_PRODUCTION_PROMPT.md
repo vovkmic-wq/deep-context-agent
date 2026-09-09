@@ -1,5 +1,13 @@
 # Production-промт Web UI Deep Context Agent 0.14.0
 
+Последующий план исправления status/root/environment:
+[Web-промпт 0.32](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md) и
+[ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
+Используй общий backend controller, durable terminal outcome и явный статус
+проекций. Разделённые штатные SQLite-хранилища этапа 0.18+ не являются второй
+обходной логикой; их согласованность требует explicit recovery, а не локальной
+подмены статуса в браузере. Документирование не означает готовность нового UI.
+
 ## Роль и источники истины
 
 Ты — ведущий Python/TypeScript-разработчик локального агентного приложения.

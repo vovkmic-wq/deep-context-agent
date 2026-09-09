@@ -80,6 +80,7 @@ from context_agent.structured_logging import (
     close_structured_logger,
     configure_structured_logger,
 )
+from context_agent.task_lifecycle import reconcile_execution_states
 from context_agent.task_state import (
     TaskConflict,
     TaskStateStore,
@@ -1563,13 +1564,40 @@ def create_app(
                 active_loop.default_exception_handler(context)
 
         loop.set_exception_handler(exception_handler)
+
+        async def reconcile_loop() -> None:
+            while True:
+                await asyncio.sleep(config.task_reconcile_interval_seconds)
+                await asyncio.to_thread(reconcile_once)
+
+        def reconcile_once() -> None:
+            try:
+                reconcile_execution_states(
+                    config.context_database, config.autopilot_database
+                )
+            except Exception as exc:
+                logger.error(
+                    "Task reconciliation deferred",
+                    extra={
+                        "event_code": "task_reconciliation_deferred",
+                        "safe_fields": {"exception_type": type(exc).__name__},
+                    },
+                )
+
+        reconciliation = None
         try:
             with AutopilotStore(config.autopilot_database) as store:
                 resumable = store.resumable_jobs(workspace=config.workspace)
+            await asyncio.to_thread(reconcile_once)
+            reconciliation = asyncio.create_task(reconcile_loop())
             for persisted_job in resumable:
                 submit_persisted_job(persisted_job)
             yield
         finally:
+            if reconciliation is not None:
+                reconciliation.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reconciliation
             loop.set_exception_handler(previous_handler)
             tasks.close()
             diagnostics.close()
@@ -1911,7 +1939,7 @@ def create_app(
                     execution=body.execution_mode,
                     allow_write=body.allow_write,
                     owner=task_id,
-                    lease_seconds=config.task_timeout_seconds + 60,
+                    lease_seconds=config.task_lease_seconds,
                     task_id=body.continuation_task_id,
                     known_secrets=tuple(p.api_key for p in task_providers),
                     semantic=semantic_classifier(
@@ -2206,7 +2234,7 @@ def create_app(
             finally:
                 if saved_task is not None:
                     with TaskStateStore(config.context_database) as state:
-                        state.finish(
+                        state.finalize(
                             saved_task,
                             "cancelled" if cancelled.is_set() else outcome,
                             evidence,
@@ -2635,7 +2663,7 @@ def create_app(
                         thread_id,
                         config.workspace,
                         task_id,
-                        config.autopilot_lease_seconds + 60,
+                        config.task_lease_seconds,
                     )
             outcome = "blocked"
             try:
@@ -2662,6 +2690,12 @@ def create_app(
                         "blocked": "blocked",
                         "cancelled": "cancelled",
                     }.get(progress.status, "partial")
+                    if (
+                        saved_task is not None
+                        and outcome == "completed"
+                        and workflow != "verification-only"
+                    ):
+                        outcome = "partial"
                     return {
                         "answer": result,
                         "job_id": progress.job_id,
@@ -2673,7 +2707,7 @@ def create_app(
             finally:
                 if saved_task is not None:
                     with TaskStateStore(config.context_database) as state:
-                        state.finish(
+                        state.finalize(
                             saved_task,
                             "cancelled" if cancelled.is_set() else outcome,
                             f"recovered_request:{task_id}; outcome:{outcome}",

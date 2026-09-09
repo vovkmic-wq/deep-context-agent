@@ -1,5 +1,19 @@
 # ТЗ 0.31: подтверждаемая repair-задача из verification evidence
 
+## Запланированное уточнение 0.32
+
+[ТЗ жизненного цикла и контекста проверки](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
+L01–L13/A01–A34 дополняет repair incident. Typed approval по-прежнему создаёт
+новую allow-write задачу; source read-only не меняется. Новая repair execution
+получает согласованный root/environment context, независимое обновляемое
+владение task/job и terminal projection с защитой generation.
+
+Исправление lease, evidence freshness и согласованности статусов не является
+повышением прав source-задачи. Historical root-less evidence требует новой
+правильной проверки перед выбором repair targets. Health/HTTP 202 и создание
+relation не заменяют live FAIL→REPAIR→PASS. Исторические проверки 0.31 сохранены,
+но длительный lifecycle последнего инцидента ещё не прошёл приёмку 0.32.
+
 ## 1. Назначение
 
 Этап устраняет разрыв между безопасной read-only проверкой и исправлением

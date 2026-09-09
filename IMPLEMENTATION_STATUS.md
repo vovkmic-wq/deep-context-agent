@@ -1,5 +1,68 @@
 # Статус реализации
 
+## Task lifecycle / verification context 0.32 — в работе, 2026-09-09
+
+Дополнительная приёмка по запросу пользователя: длительное ожидание с двумя
+heartbeat, конкурентный takeover, штатный handoff и два crash-window выполнены
+дважды на новых БД. Целевой набор — 24 passed. Методика и границы доказательства:
+[TASK_LIFECYCLE_0_32_TEST_REPORT.md](TASK_LIFECYCLE_0_32_TEST_REPORT.md).
+
+Реализованы и проверяются: независимый saved-task heartbeat, CAS renewal без
+смены revision, terminal outbox и fenced projection, связь task/job generation,
+startup/периодическая сверка статусов. Добавлен статус finalization_pending в UI.
+Проверки требуют окружение целевого проекта, выполняют preflight и сохраняют
+fingerprint исходников/окружения; изменение исходников делает результат stale.
+
+Промежуточный прогон 2026-09-09: pytest — 439 passed, 1 skipped (Windows symlink);
+Ruff check/format — PASS; mypy — PASS (31 source files); TypeScript, frontend
+tests и сборка — PASS. Тесты включают реальное временное venv/compileall и
+восстановление после разрыва двух commits с проверкой generation fencing.
+Live continuity — PASS: четыре реальных Web-хода (создание файла, анализ лога,
+перезапуск приложения, продолжение и чтение) с существующим ключом. Данные:
+`%TEMP%/dca-continuity-live-8lig0cvh`; первый request
+`41713fe917174e20953104ca9a0a35eb`, последний `8aa8b6a307a9401cb1f272343921bf16`.
+Дополнительный тест silent subprocess дольше исходного lease — PASS;
+модуль lifecycle — 14 passed. Это отдельный реальный subprocess-тест,
+не подмена live-проверки медленного LLM.
+После добавления явного project_root в model tool обновлены тестовые fixtures
+контракта runner; полный повторный прогон завершился без падений (90.85 s).
+Это ещё не приёмка A01–A34: полный live-повтор timeout/handoff/recovery,
+проверка UI и оставшиеся требования VerificationContext не завершены.
+Версия 0.32 не выпущена; итоговый production PASS не заявлен.
+
+Созданы:
+
+- `DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md` — пошаговая реализация;
+- `TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md` — L01–L13, A01–A34;
+- `DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md` — API/SSE/UI.
+
+Обновлены глобальный промпт/ТЗ, Web-ТЗ, system prompt, связанные документы
+scheduler, continuity, orchestration, verification/repair, README и CHANGELOG.
+Повторно изучены статья Habr 1064052 и официальные материалы LangChain;
+источники и конкретное применение отделены от собственных требований в ТЗ 0.32.
+
+Incident job `9134483d5b0edd7fe90e758e`, saved task
+`d97b9babc8b740e4b7ff5427770d0c87`, parent diagnostic
+`a3a399f949704266abfefbbef5fb497d`: 2026-09-08 срок saved-task lease истёк в
+18:37:56 по Москве, job heartbeat оставался активным до 18:39:07; в 18:39:11 job
+завершился blocked/task_authority_lost, saved task осталась running.
+Сохранённый VERIFY использовал `/workspace` и Python агента вместо вложенного
+Ozon. pytest 11 passed — факт прежнего лога, а не новый PASS в правильном root;
+Ruff check/format оставались красными. Два provider timeout примерно по 120 секунд
+увеличили время исполнения, но их внешняя причина отдельно не установлена.
+
+План: единый ownership controller с dual renewal, fenced finalization/outbox,
+bounded reconciliation, валидированный root/environment context во всех VERIFY,
+честный Web status и повтор инцидента с takeover/crash/timeout live-сценариями.
+На исходном документационном этапе A01–A34 имели статус NOT RUN; актуальные
+промежуточные результаты приведены выше. Версия остаётся 0.31.0.
+
+Проверка документации 2026-09-09: 22 изменённых/новых файла, включая текстовый
+system prompt, проверены на строгий UTF-8 без BOM/U+FFFD; 40 локальных
+Markdown-ссылок существуют. Последовательности L01–L13, A01–A34, 21 шаг основного
+и 14 шагов Web-промпта корректны. `git diff --check` — PASS; version files без
+изменений. Это проверка документов, не выполнение приёмочных сценариев A01–A34.
+
 ## Verification repair incident 0.31.0 — реализовано, 2026-09-08
 
 Созданы `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md` (R01–R16, A01–A30) и
@@ -40,7 +103,11 @@ repair task=202, идемпотентный повтор с тем же job ID �
 fallback и hybrid FastEmbed/Qdrant memory. Пользовательский порт
 8765 и Ozon-проект не затрагивались.
 
-Статус: **0.31.0 production PASS локально.**
+Исторический итог этого прогона: перечисленные automated checks и ограниченные
+live API-сценарии прошли. Прежняя формулировка «production PASS локально» была
+слишком широкой: успешное создание repair-задачи и doctor не доказывают полный
+длительный repair→VERIFY→terminal lifecycle. Последующий incident и оставшаяся
+работа зарегистрированы выше в этапе 0.32; результаты старых тестов не удалены.
 
 ## Verification-only execution 0.30.0 — реализовано, 2026-09-08
 

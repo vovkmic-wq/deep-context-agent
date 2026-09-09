@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import builtins
 import json
+import math
 import re
 import sqlite3
 import time
@@ -44,12 +46,18 @@ class SavedTask:
     owner: str | None
     lease_until: float
     evidence: str
+    projection_state: str = "none"
 
     def public(self) -> dict[str, Any]:
         """Expose no physical path or objective in default status responses."""
         return {
             "task_id": self.id,
-            "status": self.status,
+            "status": (
+                "finalization_pending"
+                if self.projection_state == "pending"
+                else self.status
+            ),
+            "projection_state": self.projection_state,
             "revision": self.revision,
             "workflow": self.routing["workflow"],
             "scope": self.routing["scope"],
@@ -61,11 +69,11 @@ class SavedTask:
 class TaskStateStore:
     """An additive table in context SQLite; atomic claims fence stale workers."""
 
-    def __init__(self, database: Path) -> None:
+    def __init__(self, database: Path, *, timeout_seconds: float = 10) -> None:
         database.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(database, timeout=10)
+        self.db = sqlite3.connect(database, timeout=timeout_seconds)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA busy_timeout=10000")
+        self.db.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS authorized_tasks ("
             "id TEXT PRIMARY KEY, thread TEXT NOT NULL, workspace TEXT NOT NULL,"
@@ -81,6 +89,23 @@ class TaskStateStore:
             "CREATE TABLE IF NOT EXISTS task_checkpoints ("
             "task_id TEXT PRIMARY KEY REFERENCES authorized_tasks(id), "
             "payload TEXT NOT NULL, updated_at REAL NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS task_terminal_events ("
+            "id TEXT PRIMARY KEY, task_id TEXT NOT NULL, owner TEXT NOT NULL, "
+            "revision INTEGER NOT NULL, status TEXT NOT NULL, evidence TEXT NOT NULL, "
+            "created_at REAL NOT NULL, projection TEXT NOT NULL DEFAULT 'pending', "
+            "UNIQUE(task_id, owner, revision))"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS task_terminal_pending "
+            "ON task_terminal_events(projection, created_at)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS task_execution_links ("
+            "task_id TEXT NOT NULL, owner TEXT NOT NULL, revision INTEGER NOT NULL, "
+            "job_id TEXT NOT NULL, job_generation INTEGER NOT NULL, "
+            "PRIMARY KEY(task_id,owner,revision))"
         )
         self.db.commit()
 
@@ -99,8 +124,10 @@ class TaskStateStore:
 
     def list(self, thread: str, workspace: Path) -> list[SavedTask]:
         rows = self.db.execute(
-            "SELECT * FROM authorized_tasks WHERE thread=? AND workspace=? "
-            "ORDER BY rowid DESC LIMIT 100",
+            "SELECT t.*, COALESCE((SELECT e.projection FROM task_terminal_events e "
+            "WHERE e.task_id=t.id AND e.owner=t.owner AND e.revision=t.revision), "
+            "'none') AS projection_state FROM authorized_tasks t "
+            "WHERE thread=? AND workspace=? ORDER BY t.rowid DESC LIMIT 100",
             (thread, str(workspace.resolve())),
         ).fetchall()
         return [self._decode(row) for row in rows]
@@ -405,6 +432,10 @@ class TaskStateStore:
             ).fetchone()
             if row is None:
                 raise TaskConflict("Saved task is unavailable for restart recovery")
+            if row["owner"] is not None and float(row["lease_until"]) >= now:
+                raise TaskConflict(
+                    "Saved-task lease is still live; recovery cannot take it"
+                )
             revision = int(row["revision"]) + 1
             changed = self.db.execute(
                 "UPDATE authorized_tasks SET owner=?, lease_until=?, "
@@ -425,11 +456,33 @@ class TaskStateStore:
         return (
             self.db.execute(
                 "SELECT 1 FROM authorized_tasks WHERE id=? AND owner=? "
-                "AND revision=? AND lease_until>=? AND status='running'",
+                "AND revision=? AND lease_until>=? AND status='running' "
+                "AND NOT EXISTS (SELECT 1 FROM task_terminal_events e WHERE "
+                "e.task_id=authorized_tasks.id AND e.owner=authorized_tasks.owner "
+                "AND e.revision=authorized_tasks.revision)",
                 (task.id, task.owner, task.revision, time.time()),
             ).fetchone()
             is not None
         )
+
+    def renew(self, task: SavedTask, seconds: float) -> bool:
+        """Extend only a live owner without changing its fencing revision."""
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Lease duration must be finite and positive")
+        now = time.time()
+        with self.db:
+            return (
+                self.db.execute(
+                    "UPDATE authorized_tasks SET lease_until=MAX(lease_until, ?) "
+                    "WHERE id=? AND owner=? AND revision=? AND status='running' "
+                    "AND lease_until>=? AND NOT EXISTS (SELECT 1 FROM "
+                    "task_terminal_events e WHERE e.task_id=authorized_tasks.id "
+                    "AND e.owner=authorized_tasks.owner "
+                    "AND e.revision=authorized_tasks.revision)",
+                    (now + seconds, task.id, task.owner, task.revision, now),
+                ).rowcount
+                == 1
+            )
 
     def cancel_owner(self, owner: str) -> None:
         with self.db:
@@ -495,6 +548,140 @@ class TaskStateStore:
                 ).rowcount
                 == 1
             )
+
+    def record_terminal(self, task: SavedTask, status: str, evidence: str) -> str:
+        """Controller-only outcome record; never grants expired worker authority."""
+        if status not in {*_RESUMABLE, "completed", "cancelled"}:
+            raise ValueError("Invalid task status")
+        if not task.owner:
+            raise TaskConflict("Terminal outcome requires execution identity")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            existing = self.db.execute(
+                "SELECT id, status FROM task_terminal_events "
+                "WHERE task_id=? AND owner=? AND revision=?",
+                (task.id, task.owner, task.revision),
+            ).fetchone()
+            if existing:
+                if existing["status"] != status:
+                    raise TaskConflict("Execution already has another terminal outcome")
+                return str(existing["id"])
+            current = self.db.execute(
+                "SELECT 1 FROM authorized_tasks WHERE id=? AND owner=? "
+                "AND revision=? AND status='running'",
+                (task.id, task.owner, task.revision),
+            ).fetchone()
+            if current is None:
+                raise TaskConflict("Terminal execution has been superseded")
+            event_id = uuid4().hex
+            self.db.execute(
+                "INSERT INTO task_terminal_events "
+                "(id,task_id,owner,revision,status,evidence,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    task.id,
+                    task.owner,
+                    task.revision,
+                    status,
+                    redact_sensitive_text(evidence)[:2000],
+                    time.time(),
+                ),
+            )
+        return event_id
+
+    def bind_execution(self, task: SavedTask, job_id: str, generation: int) -> None:
+        """Persist the exact job generation before the worker executes tools."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if not self.owns(task):
+                raise TaskConflict("Cannot bind a job to stale task ownership")
+            self.db.execute(
+                "INSERT INTO task_execution_links VALUES (?,?,?,?,?) "
+                "ON CONFLICT(task_id,owner,revision) DO UPDATE SET "
+                "job_id=excluded.job_id, job_generation=excluded.job_generation",
+                (task.id, task.owner, task.revision, job_id, generation),
+            )
+
+    def linked_running(
+        self, *, limit: int = 100
+    ) -> builtins.list[tuple[SavedTask, str, int]]:
+        """Return only generation-matched links, never infer identity from prose."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("Invalid reconciliation limit")
+        rows = self.db.execute(
+            "SELECT t.*, l.job_id, l.job_generation FROM authorized_tasks t "
+            "JOIN task_execution_links l ON l.task_id=t.id AND l.owner=t.owner "
+            "AND l.revision=t.revision WHERE t.status='running' LIMIT ?",
+            (limit,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            values = dict(row)
+            job_id = values.pop("job_id")
+            generation = values.pop("job_generation")
+            values["routing"] = json.loads(values["routing"])
+            values["allow_write"] = bool(values["allow_write"])
+            result.append((SavedTask(**values), str(job_id), int(generation)))
+        return result
+
+    def project_terminal(self, event_id: str) -> str:
+        """Apply durable controller evidence with fencing, even after lease expiry."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            event = self.db.execute(
+                "SELECT * FROM task_terminal_events WHERE id=?", (event_id,)
+            ).fetchone()
+            if event is None:
+                raise TaskConflict("Terminal event is unavailable")
+            if event["projection"] != "pending":
+                return str(event["projection"])
+            changed = self.db.execute(
+                "UPDATE authorized_tasks SET status=?, evidence=?, owner=NULL, "
+                "lease_until=0, revision=revision+1 WHERE id=? AND owner=? "
+                "AND revision=? AND status='running'",
+                (
+                    event["status"],
+                    event["evidence"],
+                    event["task_id"],
+                    event["owner"],
+                    event["revision"],
+                ),
+            ).rowcount
+            projection = "projected" if changed == 1 else "superseded"
+            self.db.execute(
+                "UPDATE task_terminal_events SET projection=? WHERE id=?",
+                (projection, event_id),
+            )
+        return projection
+
+    def finalize(self, task: SavedTask, status: str, evidence: str) -> str:
+        """Persist first, then project; a crash between commits is recoverable."""
+        try:
+            event_id = self.record_terminal(task, status, evidence)
+        except TaskConflict:
+            current = self.db.execute(
+                "SELECT 1 FROM authorized_tasks WHERE id=? AND owner=? "
+                "AND revision=? AND status='running'",
+                (task.id, task.owner, task.revision),
+            ).fetchone()
+            if current is None:
+                return "superseded"
+            raise
+        return self.project_terminal(event_id)
+
+    def reconcile_terminals(self, *, limit: int = 100) -> int:
+        """Replay a bounded page without starting jobs or altering other owners."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("Invalid reconciliation limit")
+        events = self.db.execute(
+            "SELECT id FROM task_terminal_events WHERE projection='pending' "
+            "ORDER BY created_at, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for event in events:
+            self.project_terminal(str(event["id"]))
+        return len(events)
 
 
 def is_continuation(query: str) -> bool:

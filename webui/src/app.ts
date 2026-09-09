@@ -542,11 +542,13 @@ async function refreshChatJobs(): Promise<void> {
   const selector = element<HTMLSelectElement>("chat-task");
   selector.replaceChildren(new Option("Автоматически / Auto", ""));
   for (const task of objectives.items) {
-    if (["partial", "blocked", "interrupted", "running"].includes(text(task.status))) {
+    if (["partial", "blocked", "interrupted", "running", "finalization_pending"].includes(text(task.status))) {
+      const pending = task.status === "finalization_pending";
       const option = new Option(
-        `${text(task.task_id).slice(0, 8)} · ${text(task.workflow)} · ${text(task.status)} · r${text(task.revision)}`,
+        `${text(task.task_id).slice(0, 8)} · ${text(task.workflow)} · ${pending ? "Синхронизация результата / Finalizing" : text(task.status)} · r${text(task.revision)}`,
         text(task.task_id),
       );
+      option.disabled = pending;
       option.dataset.revision = text(task.revision);
       selector.add(option);
     }

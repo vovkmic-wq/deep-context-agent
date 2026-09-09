@@ -28,7 +28,7 @@ from context_agent.context_store import ContextSource, ContextStore, SearchHit
 from context_agent.errors import PathSecurityError, WebSearchError
 from context_agent.paths import resolve_inside, strip_workspace_prefix
 from context_agent.project_audit import ProjectAuditStore
-from context_agent.project_checks import ProjectCheckRunner
+from context_agent.project_checks import ProjectCheckRunner, resolve_project_root
 
 
 class SearchClient(Protocol):
@@ -608,8 +608,11 @@ def build_agent_tools(
             sort_keys=True,
         )
 
-    def run_project_checks(checks: str = "") -> str:
-        """Run only allowlisted Ruff, pytest, mypy, or compileall checks."""
+    def run_project_checks(checks: str = "", project_root: str = "") -> str:
+        """Run allowlisted checks in the nearest manifest project and its venv.
+
+        Supply a workspace project path when several nested projects exist.
+        """
 
         if project_check_runner is None:
             return json.dumps(
@@ -618,7 +621,10 @@ def build_agent_tools(
                 sort_keys=True,
             )
         try:
-            results = project_check_runner.run(checks)
+            root = resolve_project_root(
+                workspace, seed_paths=(project_root,) if project_root else ()
+            )
+            results = project_check_runner.run(checks, project_root=root)
         except ValueError as exc:
             return json.dumps(
                 {
@@ -652,6 +658,8 @@ def build_agent_tools(
                         "duration_seconds": round(result.duration_seconds, 3),
                         "status": result.status,
                         "output": result.output,
+                        "verification_context": result.context,
+                        "full_output_sha256": result.output_sha256,
                     }
                     for result in results
                 ],

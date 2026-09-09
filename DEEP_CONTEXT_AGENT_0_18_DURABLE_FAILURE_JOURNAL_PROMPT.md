@@ -1,5 +1,16 @@
 # Production prompt: durable failure journal 0.18.0
 
+## Запланированное уточнение 0.32: terminal journal и reconciliation
+
+Применяй L04/L05/L11/L12 из
+[ТЗ жизненного цикла](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
+Terminal record связывает task/job/execution generation с receipt references;
+parent diagnostic сохраняет исходную причину остановки, а status projections
+идемпотентно восстанавливаются после crash. Failure journal остаётся отдельным
+от graph rollback и RAG. Retention не удаляет pending terminal events и нужное
+для незавершённого recovery evidence. Ни JSONL, ни frontend не становятся
+вторым источником полномочий. Это план исправления, не выполненная миграция.
+
 ## 1. Цель
 
 Реализовать отдельный надёжный журнал ошибок и неудачных запросов Deep Context

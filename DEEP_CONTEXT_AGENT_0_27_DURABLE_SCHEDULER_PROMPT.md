@@ -1,5 +1,11 @@
 # Промт реализации Deep Context Agent 0.27: durable scheduler
 
+Последующее обязательное уточнение:
+[промпт 0.32](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md) по
+[ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md), L01–L05.
+Продлевать task и job leases; terminal updates нескольких SQLite согласовывать
+через durable outbox/projections. Это план, не доказательство выполненного fix.
+
 Работай автономно, последовательно и доказательно. Цель — устранить блокировку
 долгой persistent-задачи общим 900-секундным deadline и циклы discovery без
 реализации. Выполняй требования `DURABLE_EXECUTION_SCHEDULER_TECHNICAL_SPEC.md`

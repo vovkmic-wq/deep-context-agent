@@ -1,5 +1,36 @@
 # Техническое задание: Deep Context Agent
 
+## Запланированное дополнение 0.32: владение и контекст проверок
+
+Нормативный документ:
+[TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
+Порядок реализации:
+[DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md);
+Web-часть:
+[DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
+Обязательны L01–L13 и A01–A34. Статус на 2026-09-09 — документация подготовлена,
+исправления кода и live-приёмка 0.32 ещё не выполнены; пакет остаётся 0.31.0.
+
+Incident job `9134483d5b0edd7fe90e758e` подтверждает истечение saved-task lease
+при живом job heartbeat, terminal `blocked` при сохранённом `running` и запуск
+VERIFY из `/workspace` с Python агента вместо вложенного Ozon. Исторические
+11 passed не являются итоговым PASS в правильном окружении.
+
+Controller обязан продлевать обе аренды через owner/generation CAS независимо
+от model/tool/subprocess, не сбрасывая бюджеты и не расширяя права. Утративший
+владение worker прекращает побочные эффекты. Terminal outcome сохраняется
+долговечно и идемпотентно проецируется в task/job/diagnostics/Web; отказ
+`finish()` обрабатывается, после crash действует bounded reconciliation.
+Транзакция одной SQLite не выдаётся за атомарную транзакцию всех хранилищ.
+
+Каждый путь VERIFY, включая обычную разработку, CLI, repair и resume, использует
+единый валидированный VerificationContext: ближайший согласованный project root,
+manifest/config fingerprints, окружение проекта и план проверок. Неявный fallback
+на Python агента запрещён. Отсутствие зависимостей — отдельная проблема окружения,
+а не основание менять source code. Завершение требует свежих check receipts и
+согласованного terminal state. Применимость источников Habr/LangChain и границы
+их гарантий зафиксированы в разделе 1.1 нормативного документа.
+
 ## Реализованное дополнение 0.31: verification repair incident
 
 Нормативный документ: `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md`; порядок

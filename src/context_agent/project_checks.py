@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
+from context_agent.artifact_policy import DEFAULT_ARTIFACT_POLICY
 from context_agent.paths import PathSecurityError, resolve_inside
+from context_agent.verification_context import (
+    context_metadata,
+    probe_environment,
+    source_fingerprint,
+)
 
 _SENSITIVE_ENV_MARKERS: Final[tuple[str, ...]] = (
     "ACCESS_KEY",
@@ -37,20 +43,12 @@ _SECRET_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?:sk-(?:proj-)?|zai[-_]?)[A-Za-z0-9._-]{12,}"
 )
 _PROJECT_MANIFEST: Final[str] = "pyproject.toml"
-_ROOT_SCAN_EXCLUDES: Final[frozenset[str]] = frozenset(
-    {
-        ".agent_data",
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".venv",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-    }
-)
+
+
+class ProjectEnvironmentError(ValueError):
+    """The project's interpreter is unavailable; this is not a code defect."""
+
+    error_code = "verification_environment_unavailable"
 
 
 class ProjectRootResolutionError(ValueError):
@@ -70,6 +68,8 @@ def resolve_project_root(
     *,
     seed_paths: tuple[str, ...] = (),
     max_manifests: int = 100,
+    max_entries: int = 10_000,
+    timeout_seconds: float = 5,
 ) -> Path:
     """Resolve the nearest trusted project root, then a unique bounded candidate."""
 
@@ -78,8 +78,8 @@ def resolve_project_root(
     for raw_seed in seed_paths:
         try:
             seed = resolve_inside(root, raw_seed)
-        except PathSecurityError:
-            continue
+        except PathSecurityError as exc:
+            raise ProjectRootResolutionError("Unsafe project seed path") from exc
         current = seed if seed.is_dir() else seed.parent
         while current == root or current.is_relative_to(root):
             if (current / _PROJECT_MANIFEST).is_file():
@@ -98,18 +98,38 @@ def resolve_project_root(
         )
 
     manifests: list[Path] = []
-    if (root / _PROJECT_MANIFEST).is_file():
-        manifests.append(root / _PROJECT_MANIFEST)
-    for candidate in root.rglob(_PROJECT_MANIFEST):
-        relative_parts = candidate.relative_to(root).parts[:-1]
-        if any(part.casefold() in _ROOT_SCAN_EXCLUDES for part in relative_parts):
+    pending = [root]
+    visited: set[Path] = set()
+    scanned = 0
+    started = time.monotonic()
+    while pending:
+        directory = pending.pop()
+        resolved = directory.resolve()
+        if not resolved.is_relative_to(root) or resolved in visited:
             continue
-        if candidate not in manifests:
-            manifests.append(candidate)
-        if len(manifests) > max_manifests:
-            raise AmbiguousProjectRootError(
-                "Project-root scan exceeded the bounded manifest limit."
-            )
+        visited.add(resolved)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                scanned += 1
+                if (
+                    scanned > max_entries
+                    or time.monotonic() - started > timeout_seconds
+                ):
+                    raise ProjectRootResolutionError(
+                        "Project-root scan budget exceeded"
+                    )
+                if entry.is_symlink():
+                    continue
+                candidate = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    if DEFAULT_ARTIFACT_POLICY.directory_reason(entry.name) is None:
+                        pending.append(candidate)
+                elif entry.name == _PROJECT_MANIFEST and entry.is_file():
+                    manifests.append(candidate)
+                    if len(manifests) > max_manifests:
+                        raise AmbiguousProjectRootError(
+                            "Project-root scan exceeded the bounded manifest limit."
+                        )
     safe_roots = tuple(
         path
         for path in dict.fromkeys(manifest.parent.resolve() for manifest in manifests)
@@ -141,6 +161,8 @@ class ProjectCheckResult:
     duration_seconds: float
     status: str
     output: str
+    context: dict[str, Any] = field(default_factory=dict)
+    output_sha256: str = ""
 
 
 class ProjectCheckRunner:
@@ -152,10 +174,18 @@ class ProjectCheckRunner:
         workspace: Path,
         timeout_seconds: int,
         output_max_chars: int,
+        environment_python: Path | None = None,
+        environment_root: Path | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.timeout_seconds = timeout_seconds
         self.output_max_chars = output_max_chars
+        if (environment_python is None) != (environment_root is None):
+            raise ValueError(
+                "Explicit environment requires both Python and project root"
+            )
+        self.environment_python = environment_python
+        self.environment_root = environment_root.resolve() if environment_root else None
 
     @property
     def allowed_checks(self) -> tuple[str, ...]:
@@ -169,10 +199,70 @@ class ProjectCheckRunner:
     ) -> list[ProjectCheckResult]:
         """Run comma-separated check identifiers from the immutable allowlist."""
 
-        execution_root = self._validated_project_root(project_root)
         requested = _parse_checks(checks)
-        python = self._project_python(execution_root)
+        execution_root = self._validated_project_root(project_root)
+        try:
+            python = (
+                str(self.environment_python.absolute())
+                if self.environment_python and self.environment_root == execution_root
+                else self._project_python(execution_root)
+            )
+        except ProjectEnvironmentError as exc:
+            return [
+                ProjectCheckResult(check, (), None, 0, "unavailable", str(exc))
+                for check in requested
+            ]
         environment, secret_values = _sanitized_environment()
+        try:
+            probe = probe_environment(
+                python, execution_root, environment, self.timeout_seconds
+            )
+            if self.environment_root != execution_root:
+                expected_prefix = Path(python).parent.parent.resolve()
+                if Path(probe["prefix"]).resolve() != expected_prefix:
+                    raise ValueError("Project environment identity mismatch")
+            needed = {
+                "ruff_check": "ruff",
+                "ruff_format_check": "ruff",
+                "pytest": "pytest",
+                "mypy": "mypy",
+            }
+            missing = sorted(
+                {
+                    needed[c]
+                    for c in requested
+                    if c in needed and not probe["tools"].get(needed[c])
+                }
+            )
+            if missing:
+                raise ValueError(
+                    "Project environment dependencies missing: " + ", ".join(missing)
+                )
+            baseline = source_fingerprint(execution_root)
+            context = context_metadata(
+                execution_root, self.workspace, python, probe, requested, baseline
+            )
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else ""
+            if not reason.startswith(("Project environment", "Verification source")):
+                reason = "Project environment preflight failed: " + type(exc).__name__
+            return [
+                ProjectCheckResult(
+                    check,
+                    (),
+                    None,
+                    0,
+                    "unavailable",
+                    reason,
+                )
+                for check in requested
+            ]
+        environment.pop("VIRTUAL_ENV", None)
+        if probe["prefix"] != probe["base_prefix"]:
+            environment["VIRTUAL_ENV"] = probe["prefix"]
+        environment["PATH"] = (
+            str(Path(python).parent) + os.pathsep + environment.get("PATH", "")
+        )
         results: list[ProjectCheckResult] = []
 
         with tempfile.TemporaryDirectory(prefix="deep-context-checks-") as temp_root:
@@ -207,6 +297,10 @@ class ProjectCheckRunner:
                             duration_seconds=time.monotonic() - started,
                             status="timeout",
                             output=self._sanitize_output(output, secret_values),
+                            context=context,
+                            output_sha256=hashlib.sha256(
+                                output.encode("utf-8")
+                            ).hexdigest(),
                         )
                     )
                     continue
@@ -219,6 +313,7 @@ class ProjectCheckRunner:
                             duration_seconds=time.monotonic() - started,
                             status="error",
                             output=self._sanitize_output(str(error), secret_values),
+                            context=context,
                         )
                     )
                     continue
@@ -236,13 +331,37 @@ class ProjectCheckRunner:
                         duration_seconds=time.monotonic() - started,
                         status="passed" if completed.returncode == 0 else "failed",
                         output=self._sanitize_output(output, secret_values),
+                        context=context,
+                        output_sha256=hashlib.sha256(
+                            output.encode("utf-8")
+                        ).hexdigest(),
                     )
                 )
 
+        try:
+            fresh = source_fingerprint(execution_root) == baseline
+        except (ValueError, OSError):
+            fresh = False
+        if not fresh:
+            results = [
+                replace(
+                    result,
+                    status="stale",
+                    output=(
+                        "Verification context changed during checks; "
+                        "results are not current.\n" + result.output
+                    ),
+                )
+                for result in results
+            ]
         return results
 
     def _validated_project_root(self, project_root: Path | None) -> Path:
-        resolved = (project_root or self.workspace).resolve()
+        resolved = (
+            project_root.resolve()
+            if project_root is not None
+            else resolve_project_root(self.workspace)
+        )
         if resolved != self.workspace and not resolved.is_relative_to(self.workspace):
             raise ValueError("Project-check root escapes workspace")
         if not resolved.is_dir():
@@ -257,8 +376,11 @@ class ProjectCheckRunner:
         )
         for candidate in candidates:
             if candidate.is_file():
-                return str(candidate.resolve())
-        return sys.executable
+                return str(candidate.absolute())
+        raise ProjectEnvironmentError(
+            "Project environment unavailable: configure the project's virtual "
+            "environment before running checks. Agent Python fallback is disabled."
+        )
 
     def _command(
         self,

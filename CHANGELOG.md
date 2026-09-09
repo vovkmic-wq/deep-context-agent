@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### Запланировано — 0.32, 2026-09-09
+
+- Подготовлены подробный промпт, отдельное ТЗ L01–L13/A01–A34 и Web-промпт:
+  dual task/job lease renewal, fencing, согласованная terminal finalization,
+  recovery и явный VerificationContext для всех сценариев исполнения.
+- Обновлены глобальные документы, связанные ТЗ scheduler/continuity/verification/
+  repair, system prompt и статус реализации. Добавлена применимость Habr/DCS и
+  официальных материалов LangChain без переноса их гарантий на собственный runtime.
+- Зафиксированы ещё не устранённые дефекты job `9134483d5b0edd7fe90e758e`:
+  saved task running после BLOCKED и проверки вложенного Ozon из workspace
+  агентским Python. Исторический pytest PASS не закрывает этот incident.
+- Это документационный этап, не выпуск 0.32.0: Python-код, схемы БД и версия
+  пакета не изменены; новые regression/live-тесты пока не выполнены.
+
 ## [0.31.0] — 2026-09-08
 
 ### Документация

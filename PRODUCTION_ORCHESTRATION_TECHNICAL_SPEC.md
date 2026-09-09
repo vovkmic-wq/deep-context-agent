@@ -1,5 +1,16 @@
 # ТЗ 0.28: production orchestration
 
+## Запланированное уточнение 0.32
+
+Для всех VERIFY, включая обычный project-change после IMPLEMENT/REPAIR,
+обязательны L01–L13 из
+[ТЗ жизненного цикла](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
+Исправление только verification-only недостаточно: каждый вызов runner получает
+явные nested project root и project environment через общий VerificationContext.
+Task/job ownership продлевается во время model/tool/check и между units;
+terminal outcome согласуется через fenced projections. Матрица A01–A34 0.32
+обязательна дополнительно к прежним тестам, а не считается пройденной заранее.
+
 > Уточнение 0.30: запрос только на проверки регулируется
 > `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md` и не проходит общий
 > DISCOVER→IMPLEMENT этого документа. ProjectCheckRunner получает явный

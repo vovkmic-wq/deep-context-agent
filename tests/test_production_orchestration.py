@@ -131,7 +131,14 @@ def test_project_checks_are_allowed_without_project_discovery(
         output="1 passed",
     )
     with AgentRuntime(config, _provider("lmstudio", "local"), model=model) as runtime:
-        monkeypatch.setattr(runtime.project_check_runner, "run", lambda _="": [result])
+        (config.workspace / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+
+        def run_checks(checks="", *, project_root):
+            assert checks == "pytest"
+            assert project_root == config.workspace.resolve()
+            return [result]
+
+        monkeypatch.setattr(runtime.project_check_runner, "run", run_checks)
         runtime.set_routing_scope(
             workspace_reads_allowed=True,
             project_scan_allowed=False,

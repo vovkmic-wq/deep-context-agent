@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,22 @@ from context_agent.project_checks import (
     ProjectRootResolutionError,
     resolve_project_root,
 )
+
+
+@pytest.fixture
+def runner_environment(tmp_path, monkeypatch):
+    """Explicitly bind the test interpreter, never rely on production fallback."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    monkeypatch.setattr(
+        "context_agent.project_checks.probe_environment",
+        lambda *_: {
+            "version": "fixture",
+            "prefix": sys.prefix,
+            "base_prefix": sys.base_prefix,
+            "tools": {"ruff": True, "pytest": True, "mypy": True},
+        },
+    )
+    return {"environment_python": Path(sys.executable), "environment_root": tmp_path}
 
 
 def test_project_check_runner_rejects_arbitrary_commands(tmp_path: Path) -> None:
@@ -28,6 +45,7 @@ def test_project_check_runner_rejects_arbitrary_commands(tmp_path: Path) -> None
 def test_project_check_runner_uses_no_shell_and_redacts_environment_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    runner_environment,
 ) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setenv("OPENAI_API_KEY", "secret-api-value")
@@ -48,6 +66,7 @@ def test_project_check_runner_uses_no_shell_and_redacts_environment_secrets(
         workspace=tmp_path,
         timeout_seconds=30,
         output_max_chars=80,
+        **runner_environment,
     )
     result = runner.run("ruff_check")[0]
 
@@ -65,9 +84,12 @@ def test_project_check_runner_uses_no_shell_and_redacts_environment_secrets(
     assert captured_command[-4:] == ["ruff", "check", "--no-cache", "."]
 
 
-def test_compileall_check_runs_with_fixed_arguments(tmp_path: Path) -> None:
+def test_compileall_check_runs_with_fixed_arguments(
+    tmp_path: Path, runner_environment
+) -> None:
     (tmp_path / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
     runner = ProjectCheckRunner(
+        **runner_environment,
         workspace=tmp_path,
         timeout_seconds=30,
         output_max_chars=2_000,
@@ -112,6 +134,7 @@ def test_resolve_project_root_requires_manifest(tmp_path: Path) -> None:
 def test_runner_executes_from_explicit_nested_project_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    runner_environment,
 ) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()
@@ -124,6 +147,8 @@ def test_runner_executes_from_explicit_nested_project_root(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     runner = ProjectCheckRunner(
+        environment_python=Path(sys.executable),
+        environment_root=nested,
         workspace=tmp_path,
         timeout_seconds=30,
         output_max_chars=2_000,
@@ -149,7 +174,7 @@ def test_runner_rejects_project_root_outside_workspace(tmp_path: Path) -> None:
 
 
 def test_runner_records_failed_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_environment
 ) -> None:
     monkeypatch.setattr(
         subprocess,
@@ -162,6 +187,7 @@ def test_runner_records_failed_check(
         ),
     )
     runner = ProjectCheckRunner(
+        **runner_environment,
         workspace=tmp_path,
         timeout_seconds=30,
         output_max_chars=2_000,
@@ -175,13 +201,14 @@ def test_runner_records_failed_check(
 
 
 def test_runner_records_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_environment
 ) -> None:
     def timeout(command: list[str], **_kwargs: object) -> None:
         raise subprocess.TimeoutExpired(command, 30, output="partial")
 
     monkeypatch.setattr(subprocess, "run", timeout)
     runner = ProjectCheckRunner(
+        **runner_environment,
         workspace=tmp_path,
         timeout_seconds=30,
         output_max_chars=2_000,
@@ -195,13 +222,14 @@ def test_runner_records_timeout(
 
 
 def test_runner_records_os_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_environment
 ) -> None:
     def fail_to_start(_command: list[str], **_kwargs: object) -> None:
         raise OSError("executable unavailable")
 
     monkeypatch.setattr(subprocess, "run", fail_to_start)
     runner = ProjectCheckRunner(
+        **runner_environment,
         workspace=tmp_path,
         timeout_seconds=30,
         output_max_chars=2_000,
@@ -211,3 +239,26 @@ def test_runner_records_os_error(
 
     assert result.status == "error"
     assert result.return_code is None
+
+
+def test_source_drift_invalidates_pass(tmp_path, monkeypatch, runner_environment):
+    source = tmp_path / "main.py"
+    source.write_text("VALUE = 1\n")
+
+    def mutate(command, **kwargs):
+        source.write_text("VALUE = 2\n")
+        return subprocess.CompletedProcess(command, 0, stdout="passed", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mutate)
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2000,
+        **runner_environment,
+    )
+    result = runner.run("compileall")[0]
+    assert result.status == "stale"
+    assert result.context["project_root"] == "/workspace"
+    assert result.context["context_id"]
+    assert str(tmp_path) not in str(result.context)
+    assert result.output_sha256

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -576,6 +577,11 @@ def test_project_checks_can_repeat_only_after_a_verified_mutation(
     (app_config.workspace / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
 
     with AgentRuntime(app_config, _provider_config(), model=model) as runtime:
+        (app_config.workspace / "pyproject.toml").write_text(
+            "[project]\nname='fixture'\n", encoding="utf-8"
+        )
+        runtime.project_check_runner.environment_python = Path(sys.executable)
+        runtime.project_check_runner.environment_root = app_config.workspace.resolve()
         runtime.ask(
             "Run compileall for /workspace/main.py, apply exact content "
             "VALUE = 2, then validate again."

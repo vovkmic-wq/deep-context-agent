@@ -1,5 +1,31 @@
 # Техническое задание: веб-интерфейс Deep Context Agent
 
+## Запланированное дополнение 0.32: достоверный статус выполнения
+
+Реализовать L04/L05/L06/L11 и A30/A33 из
+[ТЗ жизненного цикла](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
+по [Web-промпту 0.32](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
+На 2026-09-09 подготовлена документация; это не утверждение о готовом API/UI.
+
+Карточка чата, saved-task list, job, диагностика и SSE используют один terminal
+record и явный projection status. `blocked` не отображается одновременно как
+обычный `running`; незавершённая проекция показывается как `finalization_pending`
+с причиной и временем последнего подтверждения. Потеря связи сама по себе не
+означает ни живой worker, ни BLOCKED. Reload/restart восстанавливает состояние,
+не продлевает lease через frontend и не запускает задачу повторно.
+
+В карточке каждой проверки показывать virtual project root, безопасное имя
+окружения/Python, check status и актуальность evidence. Детали owner/generation,
+heartbeat, expiry, environment fingerprints и причины ошибок — в раскрываемой
+диагностике. Секреты и физические пути не попадают в публичный DTO.
+Результат из другого root/окружения не обозначается PASS текущего проекта.
+
+Typed repair 0.31 сохраняет отдельное подтверждение и неизменность source
+read-only задачи. UI не повышает права и не исправляет статусы локальным
+JavaScript: использует общий backend controller. Приёмка включает длительный
+live-запуск, обновление страницы, restart и сверку с persisted evidence, а не
+только доступность health endpoint и наличие строк в bundle.
+
 ## Реализованное дополнение 0.31: Create repair task
 
 Для failed read-only verification Web UI показывает отдельную кнопку

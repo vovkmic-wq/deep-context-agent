@@ -5,6 +5,19 @@ CLI-агент на Python и Deep Agents с долговременным SQLite
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
 Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
+## Известные ограничения и план 0.32
+
+Пакет пока 0.31.0. Последний длительный запуск выявил непродлённую аренду saved
+task, несовпадение `running`/`blocked` и проверку вложенного Ozon из неверного
+корня/окружения. Итоговый PASS этого сценария отсутствует.
+
+Подготовлены [пошаговый промпт](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md),
+[ТЗ и матрица приёмки](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md) и
+[Web-промпт](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
+Документы задают будущие исправления и повторные live-тесты; сами по себе не
+меняют Python-код или состояние задач. Актуальный статус — в
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+
 ## Verification repair workflow — 0.31.0
 
 Нормативно определён безопасный переход от failed read-only проверки к новой

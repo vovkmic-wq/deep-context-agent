@@ -1,0 +1,34 @@
+# Проверки lifecycle 0.32 — 2026-09-09
+
+Изолированные сценарии находятся в `tests/test_task_lifecycle_acceptance.py`.
+Каждый из пяти сценариев выполняется дважды на чистых временных SQLite.
+Пользовательские workspace, задачи, сервер и базы не изменяются.
+
+| Сценарий | Проверяемое свойство | Результат |
+| --- | --- | --- |
+| Длительное ожидание без вывода | Ожидание 1.5 s превышает lease 1 s; независимые task/job heartbeat сохраняют владение и revision | PASS ×2 |
+| Конкурентный takeover | Два потока одновременно претендуют на истёкшую аренду; один победитель; прежний worker не renew/finish/finalize новую generation | PASS ×2 |
+| Штатный handoff | Живую аренду нельзя захватить через recovery; после partial/checkpoint новый owner сохраняет task ID, scope, права и routing | PASS ×2 |
+| Crash после job commit | Отдельный Python-процесс завершается через os._exit(73) до финализации saved task; reconciliation переводит running в blocked | PASS ×2 |
+| Crash после terminal outbox commit | Отдельный процесс завершается до projection; новое соединение применяет событие ровно один раз | PASS ×2 |
+
+Команда целевой проверки:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_task_lifecycle_acceptance.py tests/test_task_lease_lifecycle.py -ra
+```
+
+Результат: **24 passed in 11.67 s**. Проверяется сохранение error code,
+отсутствие автоматического повторного запуска terminal job и идемпотентность
+повторной сверки. Предыдущий модуль дополнительно проверяет отмену,
+устаревшую projection и реальный subprocess без stdout.
+
+Полная регрессия: **449 passed, 1 skipped in 98.28 s**. Пропущено создание
+symlink, недоступное в текущей Windows-среде. Ruff check и format (106 файлов),
+mypy (31 source files) — PASS. Runtime-код в этом тестовом этапе не менялся.
+
+Границы доказательства: задержка контролируемая, а не реальный медленный LLM;
+тесты используют настоящие SQLite, потоки и аварийно завершённые процессы.
+Это не доказательство всех переходов scheduler между implementation/repair units,
+не полный A01–A34 и не основание объявлять всю версию production-ready.
+Ранее выполненный live continuity с реальными API описан в IMPLEMENTATION_STATUS.md.

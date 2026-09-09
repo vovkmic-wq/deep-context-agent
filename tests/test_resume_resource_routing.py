@@ -196,6 +196,8 @@ def test_web_project_develop_log_long_resume_preserves_job_without_audit(
 
     cfg = config_at(tmp_path, model_call_retries=0)
     task_plan = ["Create A", "Append B"]
+    cfg.prepare_directories()
+    (cfg.workspace / "pyproject.toml").write_text("[project]\nname='fixture'\n")
     models = iter(
         [
             SequenceChatModel(
@@ -261,7 +263,7 @@ def test_web_project_develop_log_long_resume_preserves_job_without_audit(
         monkeypatch.setattr(
             runtime.project_check_runner,
             "run",
-            lambda: [
+            lambda *, project_root: [
                 ProjectCheckResult(
                     check="compileall",
                     command=("python", "-m", "compileall"),
@@ -390,6 +392,8 @@ def test_cli_persistent_development_advances_checkpoint_without_audit(
     tmp_path, monkeypatch
 ):
     cfg = config_at(tmp_path, model_call_retries=0, autopilot_max_work_units=3)
+    cfg.prepare_directories()
+    (cfg.workspace / "pyproject.toml").write_text("[project]\nname='fixture'\n")
     model = SequenceChatModel(
         responses=[
             call(
@@ -429,7 +433,7 @@ def test_cli_persistent_development_advances_checkpoint_without_audit(
         monkeypatch.setattr(
             runtime.project_check_runner,
             "run",
-            lambda: [
+            lambda *, project_root: [
                 ProjectCheckResult(
                     check="compileall",
                     command=("python", "-m", "compileall"),

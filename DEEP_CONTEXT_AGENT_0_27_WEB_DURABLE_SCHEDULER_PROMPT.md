@@ -1,5 +1,11 @@
 # Промт Web-интерфейса 0.27: durable task UX
 
+Последующее дополнение:
+[Web-промпт 0.32](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md) и
+[ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md), L04/L05/L11.
+Task/job/Web status сверяются с persisted terminal outcome; незавершённая
+проекция обозначается явно. UI polling не выдаёт и не продлевает ownership.
+
 > Уточнение 0.30: Web-задачи только на проверку используют workflow
 > `verification-only` из `VERIFICATION_ONLY_EXECUTION_TECHNICAL_SPEC.md`, сразу
 > показывают VERIFY и вложенный virtual project root и не запускают общий

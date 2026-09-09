@@ -79,6 +79,7 @@ from context_agent.repair import RepairConflictError, VerificationRepairStore
 from context_agent.routing import AUDIT_WORKFLOWS, PROJECT_WORKFLOWS, route_chat_request
 from context_agent.schema_contract import build_schema_contract
 from context_agent.semantic_routing import semantic_classifier
+from context_agent.task_lifecycle import TaskLeaseHeartbeat
 from context_agent.task_state import SavedTask, TaskStateStore
 from context_agent.token_estimation import estimate_input_tokens
 from context_agent.tools import (
@@ -3435,6 +3436,8 @@ class AgentRuntime:
         )
         self._tool_call_policy_middleware = tool_call_policy_middleware
         self._saved_task: SavedTask | None = None
+        self._task_heartbeat: TaskLeaseHeartbeat | None = None
+        self._last_autopilot_job_id: str | None = None
         self._current_user_instruction = ""
         self._manual_model_default = False
         self._managed_routing = False
@@ -3526,7 +3529,7 @@ class AgentRuntime:
                 execution="single-turn",
                 allow_write=allow_write,
                 owner=owner,
-                lease_seconds=self.app_config.task_timeout_seconds + 60,
+                lease_seconds=self.app_config.task_lease_seconds,
                 known_secrets=tuple(p.api_key for p in self.provider_configs),
                 semantic=semantic_classifier(
                     self.app_config, self.provider_configs, thread=thread_id
@@ -3560,7 +3563,8 @@ class AgentRuntime:
         finally:
             if task is not None:
                 with TaskStateStore(self.app_config.context_database) as store:
-                    store.finish(task, status, f"request:{owner}; outcome:{status}")
+                    store.finalize(task, status, f"request:{owner}; outcome:{status}")
+            self._stop_task_heartbeat()
             self._saved_task = None
             self._managed_routing = False
             self._provider_failover_middleware.routing_query = ""
@@ -3578,10 +3582,25 @@ class AgentRuntime:
         task: SavedTask | None = None,
     ) -> None:
         """Install trusted current-turn identity, not text-derived permissions."""
+        self._stop_task_heartbeat()
         self._saved_task = task
+        if task is not None:
+            heartbeat = TaskLeaseHeartbeat(
+                self.app_config.context_database,
+                task,
+                seconds=self.app_config.task_lease_seconds,
+                interval=self.app_config.task_heartbeat_seconds,
+            )
+            heartbeat.start()
+            self._task_heartbeat = heartbeat
         self._reliability.cancelled = cancelled
         self._reliability.authority = self._check_task_ownership
         self._managed_routing = True
+
+    def _stop_task_heartbeat(self) -> None:
+        if self._task_heartbeat is not None:
+            self._task_heartbeat.close()
+            self._task_heartbeat = None
 
     def run_user_job(
         self,
@@ -3604,7 +3623,7 @@ class AgentRuntime:
                 execution="autopilot",
                 allow_write=allow_write,
                 owner=owner,
-                lease_seconds=self.app_config.task_timeout_seconds + 60,
+                lease_seconds=self.app_config.task_lease_seconds,
                 known_secrets=tuple(p.api_key for p in self.provider_configs),
                 semantic=semantic_classifier(
                     self.app_config, self.provider_configs, thread=thread_id
@@ -3633,11 +3652,23 @@ class AgentRuntime:
                 **kwargs,
             )
             outcome = "partial"
+            if self._last_autopilot_job_id is not None:
+                progress = self.autopilot_store.progress(self._last_autopilot_job_id)
+                outcome = {
+                    "blocked": "blocked",
+                    "cancelled": "cancelled",
+                    "complete": (
+                        "completed"
+                        if route.workflow == "verification-only"
+                        else "partial"
+                    ),
+                }.get(progress.status, "partial")
             return answer
         finally:
             if task is not None:
                 with TaskStateStore(self.app_config.context_database) as store:
-                    store.finish(task, outcome, f"request:{owner}; outcome:{outcome}")
+                    store.finalize(task, outcome, f"request:{owner}; outcome:{outcome}")
+            self._stop_task_heartbeat()
             self._saved_task = None
             self._managed_routing = False
             self._provider_failover_middleware.routing_query = ""
@@ -3769,6 +3800,8 @@ class AgentRuntime:
             raise ExecutionStopped("runtime_ledger_unavailable") from exc
 
     def _check_task_ownership(self) -> None:
+        if self._task_heartbeat is not None and self._task_heartbeat.lost:
+            raise ExecutionStopped("task_authority_lost")
         if self._saved_task is not None:
             with TaskStateStore(self.app_config.context_database) as store:
                 if not store.owns(self._saved_task):
@@ -4177,6 +4210,7 @@ class AgentRuntime:
 
     def run_autopilot_job(self, objective: str, **kwargs: Any) -> str:
         """Run a persistent job with unit and durable task budgets."""
+        self._last_autopilot_job_id = None
         self._persistent_budget = True
         self._reliability.start_budget(persistent=True)
         try:
@@ -4250,6 +4284,10 @@ class AgentRuntime:
             ),
             wall_time_limit_seconds=self.app_config.autopilot_max_wall_time_seconds,
         )
+        self._last_autopilot_job_id = job_progress.job_id
+        if self._saved_task is not None and lease is not None:
+            with TaskStateStore(self.app_config.context_database) as state:
+                state.bind_execution(self._saved_task, lease.job_id, lease.generation)
         if job_progress.status == "complete":
             self._emit_autopilot_progress(
                 progress_callback,
@@ -5809,6 +5847,21 @@ class AgentRuntime:
     ) -> str | None:
         """Run allowlisted checks and bounded repair turns until they pass."""
 
+        if project_root is None:
+            try:
+                project_root = resolve_project_root(
+                    self.app_config.workspace,
+                    seed_paths=self._verification_seed_paths(objective),
+                )
+            except ProjectRootResolutionError as exc:
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code=exc.error_code,
+                    safe_message=str(exc),
+                    callback=callback,
+                    blocker=self._verification_root_blocker(exc, objective),
+                )
         repair_cycles = min(
             self.app_config.autopilot_repair_cycles,
             self.app_config.verification_max_repair_cycles
@@ -5844,11 +5897,9 @@ class AgentRuntime:
             )
             try:
                 with verification_heartbeat:
-                    results = (
-                        self.project_check_runner.run(project_root=project_root)
-                        if project_root is not None
-                        else self.project_check_runner.run()
-                    )
+                    self._check_task_ownership()
+                    results = self.project_check_runner.run(project_root=project_root)
+                    self._check_task_ownership()
                     verification_heartbeat.ensure_owned()
             except AutopilotLeaseError as exc:
                 raise AgentError(
@@ -5877,9 +5928,9 @@ class AgentRuntime:
                         else ""
                     ),
                     "runner_correlation_id": f"{lease.job_id}:{unit_id}",
-                    "full_output_sha256": hashlib.sha256(
-                        result.output.encode("utf-8")
-                    ).hexdigest(),
+                    "verification_context": getattr(result, "context", {}),
+                    "full_output_sha256": getattr(result, "output_sha256", "")
+                    or hashlib.sha256(result.output.encode("utf-8")).hexdigest(),
                     "output_truncated": len(result.output) > 4_000,
                     "output": result.output.replace(
                         str(self.app_config.workspace),
@@ -5927,6 +5978,26 @@ class AgentRuntime:
             )
             if passed:
                 return None
+            if any(result.status in {"unavailable", "stale"} for result in results):
+                return self._block_autopilot(
+                    lease,
+                    audit_progress,
+                    error_code=(
+                        "verification_context_stale"
+                        if any(result.status == "stale" for result in results)
+                        else "verification_environment_unavailable"
+                    ),
+                    safe_message=(
+                        "Verification context is stale; a fresh check is required."
+                        if any(result.status == "stale" for result in results)
+                        else next(
+                            result.output
+                            for result in results
+                            if result.status == "unavailable"
+                        )
+                    ),
+                    callback=callback,
+                )
             if not results and self._saved_task is not None:
                 partial = self.autopilot_store.mark_partial(
                     lease,
@@ -5945,9 +6016,17 @@ class AgentRuntime:
                     "No allowlisted project checks are configured.",
                 )
             failure_fingerprint = hashlib.sha256(
-                json.dumps(serialized, ensure_ascii=False, sort_keys=True).encode(
-                    "utf-8"
-                )
+                json.dumps(
+                    [
+                        {
+                            key: item[key]
+                            for key in ("check", "status", "return_code", "output")
+                        }
+                        for item in serialized
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
             ).hexdigest()
             identical_failures = (
                 identical_failures + 1
@@ -6625,6 +6704,7 @@ class AgentRuntime:
     def close(self) -> None:
         """Close persistent resources owned by this runtime."""
         if not self._closed:
+            self._stop_task_heartbeat()
             self.autopilot_store.close()
             self.project_audit_store.close()
             self.context_store.close()

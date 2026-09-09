@@ -342,6 +342,9 @@ class AppConfig:
     model_output_tokens: int = 8192
     task_model_attempts: int = 80
     task_timeout_seconds: int = 900
+    task_lease_seconds: int = 900
+    task_heartbeat_seconds: int = 30
+    task_reconcile_interval_seconds: int = 5
     model_turn_timeout_seconds: int = 180
     no_progress_limit: int = 8
     repetition_mode: str = "observe"
@@ -516,6 +519,16 @@ class AppConfig:
         if not 0 <= self.autopilot_repair_cycles <= 20:
             raise ConfigurationError(
                 "AGENT_AUTOPILOT_REPAIR_CYCLES must be between 0 and 20"
+            )
+        if not 30 <= self.task_lease_seconds <= 3_600:
+            raise ConfigurationError("AGENT_TASK_LEASE_SECONDS must be 30..3600")
+        if not 1 <= self.task_reconcile_interval_seconds <= 300:
+            raise ConfigurationError(
+                "AGENT_TASK_RECONCILE_INTERVAL_SECONDS must be 1..300"
+            )
+        if not 1 <= self.task_heartbeat_seconds <= self.task_lease_seconds / 3:
+            raise ConfigurationError(
+                "AGENT_TASK_HEARTBEAT_SECONDS must be 1..TASK_LEASE_SECONDS/3"
             )
         if not 30 <= self.autopilot_lease_seconds <= 3_600:
             raise ConfigurationError(
@@ -705,6 +718,13 @@ class AppConfig:
             task_model_attempts=_int_setting(values, "AGENT_TASK_MODEL_ATTEMPTS", 80),
             task_timeout_seconds=_int_setting(
                 values, "AGENT_TASK_TIMEOUT_SECONDS", 900
+            ),
+            task_lease_seconds=_int_setting(values, "AGENT_TASK_LEASE_SECONDS", 900),
+            task_heartbeat_seconds=_int_setting(
+                values, "AGENT_TASK_HEARTBEAT_SECONDS", 30
+            ),
+            task_reconcile_interval_seconds=_int_setting(
+                values, "AGENT_TASK_RECONCILE_INTERVAL_SECONDS", 5
             ),
             model_turn_timeout_seconds=_int_setting(
                 values, "AGENT_MODEL_TURN_TIMEOUT_SECONDS", 180

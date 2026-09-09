@@ -1,5 +1,13 @@
 # ТЗ 0.30: verification-only и корректная проверка вложенного проекта
 
+## Запланированное уточнение 0.32
+
+[ТЗ жизненного цикла и VerificationContext](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
+L06–L09 усиливает V03/V04: root и Python проекта проверяются как общий
+неизменяемый контекст для всех вызовов, а не только verification-only.
+L01–L05 задаёт renewal и согласованную финализацию; это ещё не реализованный
+план исправления последнего live-инцидента, не новый результат приёмки.
+
 > Нормативное расширение для исправления failed read-only verification:
 > `VERIFICATION_REPAIR_INCIDENT_TECHNICAL_SPEC.md`. Оно запрещает повышение прав
 > этой задачи и определяет отдельный подтверждаемый repair incident.
@@ -75,6 +83,12 @@ candidates и не запускает проверки наугад. Корен�
 cwd и ищет конфигурации/виртуальное окружение относительно него. Все команды
 остаются из фиксированного allowlist: pytest, Ruff check, Ruff format check,
 mypy, compileall и явно поддерживаемые package checks.
+
+Контекст включает manifest/config/lock hashes, environment identity/sys.prefix,
+проектный package origin, code revision и required check plan. Нет `.venv` или
+нужной зависимости — environment blocker/разрешённая подготовка окружения, не
+неявный fallback на sys.executable агента. Venv launch path сохраняется без
+разрушения symlink-семантики. При drift старые receipts не создают новый PASS.
 
 Receipt каждой проверки содержит virtual project root, check ID, безопасную
 команду, exit category/code, duration и bounded/redacted output. Ошибка запуска,
