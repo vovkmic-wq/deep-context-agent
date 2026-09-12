@@ -130,6 +130,12 @@ Public DTO/ошибки/логи: без owner tokens, ключей, полны�
 
 ## 7. R6 — live и выпуск
 
+Граф сохраняет каждый checkpoint синхронно до следующего шага (durability="sync").
+На малом executor (max_concurrency=2) многошаговые tool/duplicate сценарии должны
+завершаться без взаимного ожидания delta/checkpoint futures. CI исполняет реальные
+POSIX symlink tests отдельно и всю регрессию на Linux/Windows; зависший/отменённый
+прогон не является PASS. Это дополнительный тест C12/C18, не ослабление A01–A34.
+
 Дважды на чистых БД выполнить реальный LLM end-to-end из R4. Отдельно —
 контролируемый HTTP timeout/backoff/fallback, cancel, crash/restart. Не путать
 симуляцию транспорта с реальным provider response. Проверять разрешённый fallback,

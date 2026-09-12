@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+- По stack trace чистого CI: явный sync checkpoint commit на каждом model/tool
+  шаге, regression на малом executor. Устранение ожидания фоновых checkpoint/delta
+  futures проверяется на новых dependencies, без увеличения timeout/прав.
+
 - Межплатформенный CI на Ubuntu/Windows с закреплёнными SHA actions,
   read-only permissions и без provider credentials; настоящий POSIX symlink
   acceptance для собственного Python проекта и изоляции manifest discovery.

@@ -1,5 +1,13 @@
 # Управляющий промпт реализации
 
+## Checkpoint regression из чистого CI — 2026-09-12
+
+Сохраняй явный durability="sync" на runtime graph invoke. Подтверди его тестом
+нескольких последовательных tool steps на executor с max_concurrency=2, затем
+повтори полную регрессию на чистых dependencies/Linux/Windows и real LLM live.
+Не исправляй checkpoint wait увеличением timeout/числа потоков или снятием guards.
+Не называй sync checkpoint атомарным откатом файловых изменений.
+
 ## Дополнение к завершению 0.32 — реализация и приёмка
 
 Нормативное дополнение: [ТЗ R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)

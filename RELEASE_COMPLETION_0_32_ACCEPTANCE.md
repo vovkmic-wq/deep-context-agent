@@ -12,6 +12,17 @@ test_unix_verification_acceptance.py требуют настоящие POSIX sym
 
 ## C01–C18
 
+CI candidate fbf5ef6 / run 34675475964 отменён после выявления остановки прогресса
+в runtime tests. Diagnostic candidate 80134b7 / run 34675762783: A23 POSIX tests
+PASS на Ubuntu/Python 3.11 и 3.12; полный pytest отменён для получения stack dump.
+Стек: test_duplicate_read_only_and_web_calls_are_denied_within_turn, ожидание
+LangGraph checkpoint/delta futures. CI установил deepagents 0.7.13,
+langchain 1.4.0/core 1.6.3 (локально 0.7.8, 1.3.16/core 1.6.0).
+Runtime теперь явно выбирает durability="sync"; тест проверяет этот контракт
+и исполняет реальный граф с max_concurrency=2. До исправления assertion FAIL,
+после — PASS в обоих локальных наборах dependencies. Полный CI/live повторяется;
+отменённые прогоны не учитываются как полная успешная регрессия.
+
 | ID | Статус | Доказательство / границы |
 | --- | --- | --- |
 | C01 | PASS | Typed schema 2: test_verification_provenance.py, context store, frozen repair transfer; два расширенных live проверяют task/job attribution и parent context после restart |

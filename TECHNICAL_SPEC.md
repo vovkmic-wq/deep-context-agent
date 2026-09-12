@@ -1,5 +1,14 @@
 # Техническое задание: Deep Context Agent
 
+## R6: порядок checkpoint commit — 2026-09-12
+
+Runtime обязан явно вызывать граф с durability="sync": завершить checkpoint
+шага до следующего шага, не полагаясь на async default зависимости. Это не
+транзакция для файловых side effects и не замена fencing/rollback. Регрессия
+с несколькими tool steps и max_concurrency=2 должна завершаться, сохранять
+историю и прежние duplicate-call guards. CI на чистых Linux/Windows проверяет
+устанавливаемый dependency range, не только ранее прогретый локальный venv.
+
 ## Дополнение к завершению 0.32 — реализация и приёмка
 
 Нормативное дополнение: [ТЗ R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)

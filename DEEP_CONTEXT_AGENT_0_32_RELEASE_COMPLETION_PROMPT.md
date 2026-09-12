@@ -5,6 +5,9 @@
 R1 schema 2 и paged root discovery реализованы 2026-09-12. При продолжении
 не переписывай их заново: проверь контекст/cursor regression и оставшийся A23.
 Live harness дополнительно проверяет durable parent context и task/job attribution.
+R6 CI выявил ожидание checkpoint/delta futures на новых dependencies: проверь
+явный durability="sync", малый executor и повтор полного CI/live. Отменённые
+диагностические прогоны не считать PASS; не снимать прежние assertions.
 Реализуй [дополнение R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)
 вместе с [исходным ТЗ](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md).
 Не называй документацию реализацией, контролируемую задержку реальным LLM,

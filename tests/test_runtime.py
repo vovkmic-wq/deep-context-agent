@@ -1632,6 +1632,7 @@ def test_duplicate_mutation_ledger_resets_between_turns(tmp_path: Path) -> None:
 
 def test_duplicate_read_only_and_web_calls_are_denied_within_turn(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = [
         {
@@ -1690,6 +1691,16 @@ def test_duplicate_read_only_and_web_calls_are_denied_within_turn(
             "truncated": len("verified") > max_chars,
         },
     ) as runtime:
+        original_invoke = runtime.agent.invoke
+
+        def bounded_invoke(*args, **kwargs):
+            # Several sequential tool steps on a small executor must not leave
+            # checkpoint/delta futures waiting for each other at graph shutdown.
+            assert kwargs.get("durability") == "sync"
+            kwargs["config"] = {**kwargs["config"], "max_concurrency": 2}
+            return original_invoke(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.agent, "invoke", bounded_invoke)
         runtime.ask(
             "Acceptance: call runtime_info, get_pypi_package_info for langchain, "
             "fetch_web_page for https://example.test/source, and "

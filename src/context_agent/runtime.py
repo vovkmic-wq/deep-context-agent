@@ -6766,6 +6766,10 @@ class AgentRuntime:
                     "configurable": configurable,
                     "recursion_limit": selected_recursion_limit,
                 },
+                # Commit each graph step before advancing. Async checkpoint/delta
+                # futures can exhaust a small executor while awaiting each other;
+                # sync also makes the persistence boundary explicit for recovery.
+                durability="sync",
             )
         except Exception as exc:
             self.last_tool_audit = tuple(self._tool_audit_middleware.entries)
