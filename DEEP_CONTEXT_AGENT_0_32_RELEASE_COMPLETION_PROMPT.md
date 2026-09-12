@@ -1,9 +1,9 @@
 # Промпт 0.32: завершить production-приёмку
 
-Статус: реализация/приёмка, обновлено 2026-09-12. Выполненные пункты и остаток:
+Статус: приёмка 0.32.0 PASS, обновлено 2026-09-12. Выполненные пункты и пакет:
 [матрица доказательств](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
 R1 schema 2 и paged root discovery реализованы 2026-09-12. При продолжении
-не переписывай их заново: проверь контекст/cursor regression и оставшийся A23.
+не переписывай их заново: сохраняй контекст/cursor regression и пройденный A23.
 Live harness дополнительно проверяет durable parent context и task/job attribution.
 R6 CI выявил ожидание checkpoint/delta futures на новых dependencies: проверь
 явный durability="sync", малый executor и повтор полного CI/live. Отменённые

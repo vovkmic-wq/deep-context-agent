@@ -1,14 +1,58 @@
 # Приёмка завершения 0.32
 
-Состояние на 2026-09-12: **production PASS отсутствует**. Изменения локальные,
-ветка codex/task-lifecycle-0.32, исходный HEAD 9edcece; package version 0.31.0.
-R1–R5 реализованы и проверены на Windows; R6 имеет реальные live и packaging
-evidence. C18 остаётся BLOCKED до фактического A23 Unix/symlink acceptance.
-Для этого кандидат отправляется только в codex/task-lifecycle-0.32: GitHub Actions
-запускает Ubuntu 24.04 (Python 3.11/3.12) и Windows 2022 (Python 3.12).
-Workflow не получает API-ключи, не создаёт релиз и не изменяет main. Два теста
-test_unix_verification_acceptance.py требуют настоящие POSIX symlinks и не могут
-считаться пройденными по Windows skip. Результат CI будет записан после завершения.
+Состояние на 2026-09-12: **приёмка 0.32.0 R1–R6/C01–C18 PASS** в заявленных границах.
+Ветка codex/task-lifecycle-0.32, исходный HEAD 9edcece; принят candidate 559198c.
+После gate выпущен пакет 0.32.0; финальная проверка зафиксирована ниже.
+Публикуется рабочая ветка, main/tag/GitHub Release не изменяются. CI не получает
+API-ключи и не выполняет платные provider calls.
+
+## Финальный пакет 0.32.0
+
+Python __version__, installed distribution metadata, pyproject.toml и
+webui/package.json согласованы: 0.32.0. Локальная editable установка обновлена
+без изменения зависимостей/API-ключей. Runtime пользователя не перезапускался.
+
+Финальный повтор: **515 passed / 3 platform skips (77.73 s)**, Ruff check/format
+(126 files), mypy (34 source files), compileall, frontend TypeScript/bundle/
+model_choices — PASS. Platform skips покрыты приведённым Linux/Windows CI.
+Wheel/sdist собраны в .pytest-tmp/release-acceptance-20260912.
+Wheel deep_context_agent-0.32.0-py3-none-any.whl SHA-256:
+2579C3333481C6BEF814909575195116ACBEDA36A1AA85B7575D81B6EC9640CD.
+Переустановка этого wheel в чисто созданный ранее 7pn6uh7n вне checkout:
+version=0.32.0, pip check, CLI, import origin, Web restart ×2 — PASS.
+Полный runtime CI 559198c и финальный package smoke используют один runtime;
+после CI изменены лишь release metadata, документы и assertion версии smoke harness.
+
+## Итоговая межплатформенная приёмка
+
+[GitHub Actions 34676350881](https://github.com/vovkmic-wq/deep-context-agent/actions/runs/34676350881)
+на 559198c524c53adb15d6e5a4990276178433a169: все три jobs SUCCESS.
+
+| Среда | Pytest | JUnit duration | Остальные gates |
+| --- | --- | --- | --- |
+| Ubuntu 24.04 / Python 3.11 | 518 passed, 0 skipped | 105.296 s | Ruff, format, mypy, compileall, build PASS |
+| Ubuntu 24.04 / Python 3.12 | 518 passed, 0 skipped | 115.142 s | Ruff, format, mypy, compileall, build PASS |
+| Windows 2022 / Python 3.12 | 516 passed, 2 POSIX-only skipped | 185.720 s | Ruff, format, mypy, compileall, build PASS |
+
+JUnit artifacts скачаны в .pytest-tmp/ci-34676350881 (не публикуются в git).
+A23: два настоящих POSIX symlink tests выполнены без skip на обеих Ubuntu;
+Windows общий symlink-escape test также PASS. Windows без symlink privilege
+локально даёт 515 passed / 3 skips (последний full run 69.61 s).
+Один deprecation warning в стороннем Starlette TestClient/AnyIO, не ошибка приложения.
+
+После sync checkpoint commit real LLM acceptance повторён на двух новых БД:
+
+| Fixture basename | Source → repair | Duration | Результат |
+| --- | --- | --- | --- |
+| dca-release-live-pkhzwq5y | 5de2de2dfd83ab446b9db317 → 216f785e2a54ddbfc553a79f | 145.00 s | PASS |
+| dca-release-live-aqq_2xnn | 829dcd32554b4feec20c043b → 283b5a6a45d4c1e1962320e3 | 122.73 s | PASS |
+
+GLM-5.3, во втором создании fixture сработал разрешённый OpenAI gpt-5.6-sol fallback.
+Пять checks одного schema2 context PASS, исходная read-only задача и тесты
+неизменны, parent context и provenance подтверждены после restart.
+Cancelled subprocess live dca-web-cancel-ieb8htit: PASS 0.375 s, pytest exited,
+late_write=false. Новая clean installation dca-clean-install-7pn6uh7n: pip check,
+CLI, import из site-packages, Web startup/restart ×2 PASS.
 
 ## C01–C18
 
@@ -48,7 +92,7 @@ vector_index: исправлены sys.platform guards, без отключен�
 | C15 | PASS | live_release_completion.py --runs 2, два чистых workspace/БД/venv; реальные zhipu/glm-5.3 и разрешённый openai fallback |
 | C16 | PASS | test_http_fallback.py: настоящий loopback HTTP + controlled model adapter, timeout/fallback, manual configured chain, local-only veto, bounded attempts. Не тест реальной LLM или OpenAI SDK loopback transport |
 | C17 | PASS | wheel/sdist build; clean_install_smoke.py: fresh venv вне checkout, pip check, CLI help, import из site-packages, Web startup/health/static twice; additive copied DB test |
-| C18 | BLOCKED | R1 typed schema/provenance, namespace и A17 paging закрыты. A23 Unix/symlink venv не выполнен: WSL без дистрибутива, Docker отсутствует, Windows symlink privilege недоступна. Версию/релиз не повышать |
+| C18 | PASS | A01–A34 сопоставлены ниже; недостающий A23 закрыт реальными POSIX tests на двух Ubuntu. Полный CI, повторные real LLM и packaging gates пройдены |
 
 ## Дополнительная итерация R1 — 2026-09-12
 
@@ -187,12 +231,12 @@ Lifecycle/SQLite/cancel subset до двух дополнительных prefli
 | A15–A16 | nested root/ambiguous/unsafe seed tests; browser/live используют /workspace/ozon_like |
 | A17 | PASS: persisted frontier, restart/cancel/CAS, pruning, wide-tree ambiguity, entries/time/checkpoint caps; test_root_discovery_paging.py |
 | A18–A20 | runtime verification-only/development tests, frozen repair root/approval и два live restart |
-| A21–A24 | own venv/.pth/wrong origin/missing tools tests; Windows Unicode paths live. A23 Unix symlink venv здесь НЕ выполнен |
+| A21–A24 | own venv/.pth/wrong origin/missing tools tests, Windows Unicode paths live; A23 реальный symlink venv на Ubuntu 3.11/3.12 PASS |
 | A25–A27 | drift/plan/gate/failure fingerprint regression |
 | A28–A29 | redacted bounded returned output, scope veto, source drift; subprocess — не OS sandbox для недоверенного pytest |
 | A30–A31 | browser/API/SSE, terminal projection/restart и SQLite backup migration |
 | A32–A33 | Ozon-like FAIL→REPAIR→PASS ×2 + отдельно controlled timeouts, cancellation и crash tests |
-| A34 | Quality/build/install выполнены; общий release BLOCKED из-за непроведённого A23 Unix/symlink acceptance |
+| A34 | Quality/build/install, C01–C18 и недостающий A23 PASS; версия повышается только после этого gate |
 
 ## Эксплуатационные ограничения
 
@@ -201,6 +245,7 @@ Lifecycle/SQLite/cancel subset до двух дополнительных prefli
 Это не обещание нулевой задержки: ОС/cleanup ограничены отдельными таймаутами.
 Windows detached/reparented процессы вне контролируемого дерева не обеспечены
 Job Object sandbox; adversarial checks нельзя считать изолированными.
-Symlink test пропущен из-за отсутствия Windows privilege. Полный security PASS
-для symlink/junction и межплатформенный certification не заявляются.
+Локальный Windows symlink skip компенсирован реальным CI на Windows/Ubuntu.
+Это проверка заявленных symlink-сценариев, не универсальная security certification
+для всех junction/reparse-point races и всех платформ. macOS здесь не проверялся.
 Рабочий сервер пользователя, реальный Ozon, пользовательские БД и ключи не менялись.

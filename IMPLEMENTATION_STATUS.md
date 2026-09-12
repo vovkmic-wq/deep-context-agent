@@ -1,5 +1,19 @@
 # Статус реализации
 
+## Runtime gate 0.32 — PASS, 2026-09-12
+
+Все R1–R6 реализованы. C01–C18 закрыты для заявленных границ локального агента.
+GitHub Actions run 34676350881 (candidate 559198c): Ubuntu 3.11 и 3.12 —
+518 passed без skips; Windows 3.12 — 516 passed / 2 POSIX-only skips.
+Ruff, mypy, compileall, wheel/sdist во всех трёх средах PASS.
+Повторные real LLM runs pkhzwq5y/aqq_2xnn: FAIL→explicit REPAIR→пять checks PASS;
+Web cancel ieb8htit: 0.375 s, PID завершён, поздней записи нет.
+Новый clean venv 7pn6uh7n: pip check, CLI, Web restart ×2 PASS.
+После gate версии manifests и installed metadata синхронизированы на 0.32.0;
+финальный wheel smoke PASS (version, pip check, CLI, Web ×2), локальный full pytest
+515 passed / 3 platform skips (77.73 s). Факты — в release matrix. Ниже — исторические итерации,
+а не актуальные блокеры. Пользовательский сервер, Ozon и БД не перезапускались.
+
 ## Межплатформенный кандидат — 2026-09-12
 
 Добавлен GitHub Actions workflow для Ubuntu 24.04 / Python 3.11 и 3.12,

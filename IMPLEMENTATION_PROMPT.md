@@ -18,8 +18,8 @@
 реализованы bounded renewal/reconciliation, отмена работающих checks/preflight,
 исправлен подтверждённый REPAIR и общий Web execution status. Два реальных
 LLM FAIL→REPAIR→PASS, браузерная проверка и clean-install smoke выполнены.
-Точные доказательства и незакрытые gates: [матрица приёмки](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
-Версия пакета пока 0.31.0: частичная приёмка не означает production-релиз 0.32.
+Актуальная версия, доказательства и release gate:
+[матрица приёмки](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
 
 Реализован контракт R1 schema 2: immutable VerificationContext хранит task/job/run/
 attempt IDs, snapshot разрешений проверяющего runner, root provenance, code/config/
@@ -28,7 +28,7 @@ lock/dependency fingerprints, версии и origins, launch path/prefix. В п
 PASS. При resume сохранённый root проверяется до discovery. Discovery использует
 общие исключения и SQLite frontier/cursor; partial не считается уникальным root.
 Scanner не держит writer lock во время обхода; отмена сохраняет последний commit.
-Фактическая Windows-приёмка и незакрытый Unix/symlink gate перечислены в матрице.
+Фактические Windows/Linux и Unix/symlink проверки перечислены в матрице.
 
 ## Целевой этап 0.32: lease, terminal state и VerificationContext
 
@@ -36,7 +36,8 @@ Scanner не держит writer lock во время обхода; отмена
 по [ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md), L01–L13,
 A01–A34; Web — по
 [Web-промпту 0.32](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
-Это план, а не отчёт о готовом коде. Версия пакета пока 0.31.0.
+Порядок ниже сохраняет исходные требования. Не повторяй завершённые изменения
+вслепую: текущий статус реализации и проверок находится в release matrix.
 
 Начни с воспроизводимых failing regressions: длительный ход переживает срок
 saved-task lease, `finish(False)` оставляет running, обычный project-change

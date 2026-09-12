@@ -1,5 +1,11 @@
 # Проверки lifecycle 0.32 — 2026-09-09
 
+Итог runtime-приёмки 2026-09-12: **PASS**, включая A23 на настоящем Ubuntu.
+CI 34676350881: 518 passed (Python 3.11), 518 passed (3.12), Windows 516 passed /
+2 POSIX-only skipped. Все quality/build steps PASS. Новые real LLM runs
+pkhzwq5y/aqq_2xnn и cancel ieb8htit приведены в release matrix. Ниже сохранены
+исторические результаты; прежние строки «A23 не закрыт» не являются текущим статусом.
+
 Продолжение R1 от 2026-09-12: schema 2/provenance и saved-root-before-discovery,
 namespace/custom origins на реальных venv, persistent root scan с CAS и отменой.
 Последние два live проверяют context parent/task/job IDs и пять checks PASS;

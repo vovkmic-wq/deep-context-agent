@@ -5,6 +5,12 @@
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-12
+
+R1–R6/C01–C18: runtime gate пройден на candidate 559198c, включая полный
+Windows/Linux CI, A23 и повторные real LLM FAIL→REPAIR→PASS. Manifest version
+синхронизирован в Python/Web; доказательства и ограничения — в release matrix.
+
 - CI/Linux выявил Windows-only ctypes/subprocess API в неподходящих ветках
   статического анализа: добавлены явные sys.platform guards, без type-ignore.
 

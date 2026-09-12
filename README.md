@@ -1,6 +1,10 @@
 # Deep Context Agent
 
-## Дополнение к завершению 0.32 — реализация и приёмка
+Версия **0.32.0**. Runtime-приёмка пройдена: Linux/Windows CI, реальные
+FAIL→REPAIR→PASS, отмена subprocess, чистая установка CLI/Web.
+Это локальный агент для доверенных проектов, не OS sandbox для враждебного кода.
+
+## Принятые изменения 0.32
 
 Нормативное дополнение: [ТЗ R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)
 и [порядок реализации](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md).
@@ -10,8 +14,8 @@
 реализованы bounded renewal/reconciliation, отмена работающих checks/preflight,
 исправлен подтверждённый REPAIR и общий Web execution status. Два реальных
 LLM FAIL→REPAIR→PASS, браузерная проверка и clean-install smoke выполнены.
-Точные доказательства и незакрытые gates: [матрица приёмки](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
-Версия пакета пока 0.31.0: частичная приёмка не означает production-релиз 0.32.
+Актуальная версия, доказательства и release gate:
+[матрица приёмки](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
 
 Реализован контракт R1 schema 2: immutable VerificationContext хранит task/job/run/
 attempt IDs, snapshot разрешений проверяющего runner, root provenance, code/config/
@@ -20,24 +24,24 @@ lock/dependency fingerprints, версии и origins, launch path/prefix. В п
 PASS. При resume сохранённый root проверяется до discovery. Discovery использует
 общие исключения и SQLite frontier/cursor; partial не считается уникальным root.
 Scanner не держит writer lock во время обхода; отмена сохраняет последний commit.
-Фактическая Windows-приёмка и незакрытый Unix/symlink gate перечислены в матрице.
+Фактические Windows/Linux и Unix/symlink проверки перечислены в матрице.
 
 CLI-агент на Python и Deep Agents с долговременным SQLite-контекстом,
 поиском и безопасным чтением публичных веб-страниц, а также ограниченной
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,
 Qwen и Zhipu AI GLM через OpenAI-compatible API.
 
-## Известные ограничения и план 0.32
+## Жизненный цикл и границы 0.32
 
-Пакет пока 0.31.0. Последний длительный запуск выявил непродлённую аренду saved
-task, несовпадение `running`/`blocked` и проверку вложенного Ozon из неверного
-корня/окружения. Итоговый PASS этого сценария отсутствует.
+Исходный incident: непродлённая аренда saved task, несовпадение running/blocked
+и проверка вложенного Ozon из неверного корня/окружения. Исправления реализованы;
+новая приёмка использует изолированный Ozon-like проект, не пользовательский Ozon.
 
 Подготовлены [пошаговый промпт](DEEP_CONTEXT_AGENT_0_32_TASK_LIFECYCLE_PROMPT.md),
 [ТЗ и матрица приёмки](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md) и
 [Web-промпт](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
-Документы задают будущие исправления и повторные live-тесты; сами по себе не
-меняют Python-код или состояние задач. Актуальный статус — в
+Ограничения: subprocess cleanup не является OS sandbox для враждебного кода;
+проверены Windows и Ubuntu, другие ОС не сертифицировались. Актуальный статус — в
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
 
 ## Verification repair workflow — 0.31.0

@@ -67,7 +67,7 @@ def main() -> None:
     run(["-m", "pip", "check"], "dependencies")
     run(["-m", "context_agent", "--help"], "cli")
     script = """
-import json, sys
+import importlib.metadata, json, sys
 from pathlib import Path
 import context_agent
 from context_agent.config import AppConfig, ProviderConfig
@@ -75,6 +75,7 @@ from context_agent.web import create_app
 from fastapi.testclient import TestClient
 origin = Path(context_agent.__file__).resolve()
 assert origin.is_relative_to(Path(sys.prefix).resolve()), str(origin)
+assert context_agent.__version__ == importlib.metadata.version('deep-context-agent')
 root = Path.cwd()
 config = AppConfig(project_root=root, workspace=root/'workspace',
                    context_root=root/'workspace', data_dir=root/'data')
@@ -89,7 +90,8 @@ for repeat in range(2):
         js = client.get('/static/app.js')
         assert js.status_code == 200 and len(js.content) > 1000
         assert client.get('/api/jobs').status_code == 200
-print(json.dumps({'origin_in_clean_venv': True, 'web_restart_passes': 2}))
+print(json.dumps({'origin_in_clean_venv': True, 'web_restart_passes': 2,
+                  'version': context_agent.__version__}))
 """
     result = json.loads(run(["-c", script], "web"))
     result.update({"wheel": wheel.name, "pip_check": "PASS", "cli": "PASS"})
