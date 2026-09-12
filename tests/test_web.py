@@ -17,7 +17,10 @@ from context_agent.config import AppConfig, ProviderConfig
 from context_agent.diagnostics import DiagnosticStore
 from context_agent.errors import AgentError
 from context_agent.project_audit import ProjectAuditStore
+from context_agent.routing import route_chat_request
 from context_agent.runtime import AgentRuntime
+from context_agent.task_lifecycle import TaskLeaseHeartbeat
+from context_agent.task_state import TaskStateStore
 from context_agent.web import (
     TaskRegistry,
     _agent_failure_code,
@@ -115,6 +118,43 @@ def _config(tmp_path: Path) -> AppConfig:
         data_dir=tmp_path / "data",
         context_root=tmp_path / "workspace",
     )
+
+
+def test_queue_renews_saved_task_before_worker_starts(tmp_path):
+    config = _config(tmp_path)
+    with TaskStateStore(config.context_database) as store:
+        query = "Implement one feature"
+        saved = store.create(
+            "queued", config.workspace, query, route_chat_request(query), True
+        )
+        saved = store.claim(saved, "queued-owner", 1)
+    release = threading.Event()
+    entered = threading.Event()
+    with DiagnosticStore(config.diagnostics_database) as journal:
+        registry = TaskRegistry(journal, logging.getLogger("queue-test"), max_workers=1)
+
+        def occupy(_emit, _cancel):
+            entered.set()
+            release.wait(5)
+
+        registry.submit("occupy", occupy)
+        assert entered.wait(2)
+        guard = TaskLeaseHeartbeat(
+            config.context_database, saved, seconds=1, interval=0.05
+        )
+        try:
+            task_id = registry.submit(
+                "queued", lambda _emit, _cancel: {}, lease_guard=guard
+            )
+            threading.Event().wait(1.2)
+            with TaskStateStore(config.context_database) as store:
+                assert store.owns(saved), "Queue lost its ownership before worker start"
+            release.set()
+            assert registry.get(task_id).done.wait(3)
+        finally:
+            release.set()
+            registry.close()
+        assert not guard._thread.is_alive()
 
 
 def _provider() -> ProviderConfig:
@@ -308,6 +348,17 @@ def test_web_creates_confirmed_repair_as_a_separate_allow_write_job(
                 "evidence_ids": [proposal["evidence"][0]["evidence_id"]],
             },
         )
+        assert created.status_code == 202
+        # A replay must not revive a terminal repair or reset its phase.
+        child_id = created.json()["repair_job_id"]
+        with AutopilotStore(config.autopilot_database) as store:
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE autopilot_jobs SET status='blocked', phase='blocked', "
+                    "last_error_code='repair_no_mutation', finished_at=123 WHERE id=?",
+                    (child_id,),
+                )
+            child_before = store.details(child_id)
         repeated = client.post(
             f"/api/jobs/{source.job_id}/repair-task",
             headers={"x-csrf-token": csrf},
@@ -331,10 +382,12 @@ def test_web_creates_confirmed_repair_as_a_separate_allow_write_job(
     with AutopilotStore(config.autopilot_database) as store:
         original = store.details(source.job_id)
         repair = store.details(payload["repair_job_id"])
+    for field in ("status", "phase", "finished_at", "checkpoint_revision"):
+        assert repair[field] == child_before[field]
     assert original["mode"] == "read-only"
     assert original["status"] == "blocked"
     assert repair["mode"] == "allow-write"
-    assert repair["phase"] in {"repair", "complete"}
+    assert repair["phase"] == "blocked"
 
 
 def test_web_mutations_require_csrf_and_reject_foreign_origin(tmp_path: Path) -> None:

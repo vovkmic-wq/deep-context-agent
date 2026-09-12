@@ -5,6 +5,44 @@
 
 ## [Unreleased]
 
+- Межплатформенный CI на Ubuntu/Windows с закреплёнными SHA actions,
+  read-only permissions и без provider credentials; настоящий POSIX symlink
+  acceptance для собственного Python проекта и изоляции manifest discovery.
+
+### R1 — 2026-09-12
+
+- Immutable schema-2 VerificationContext с task/job/run/attempt attribution,
+  private provenance окружения и compact receipts; legacy PASS не повышается.
+- Saved root до discovery, parent context при подтверждённом REPAIR.
+- Реальная проверка namespace/custom package origin, отказ для чужой checkout.
+- Durable root frontier/cursor, directory drift, CAS и bounded replay; сканирование
+  больше не держит SQLite writer lock и сохраняет commit при отмене.
+- Новые regression/live проверки перечислены в release-completion matrix.
+
+### Реализовано и проверено — R3–R6, 2026-09-12
+
+- Bounded SQLite renewal с корректным storage/expiry reason, queue/job heartbeat,
+  persistent reconciliation cursor и explicit legacy reconciliation_required.
+- Отмена работающего verification/preflight subprocess с authority poll 100 ms
+  и cleanup дерева; поздний PASS не принимается.
+- Escaping cancel/error из VERIFY теперь fenced-финализирует job/units; real Web
+  cancellation с остановленным PID pytest подтверждён за 0.312 s.
+- Frozen approved repair target/evidence передаются worker; повтор approval
+  не переочередяет terminal repair и не меняет исходную read-only задачу.
+- Metadata-only job DTO и общий execution view в Web/diagnostics/SSE; reload,
+  offline, две вкладки и смена чата не показывают чужой результат/не запускают job.
+- Два real LLM FAIL→REPAIR→PASS, browser verification, controlled HTTP fallback,
+  copied-DB migration и clean-wheel CLI/Web smoke. Регрессия 496/1 skipped.
+- 0.32 не выпущена: оставшиеся R1/release gates перечислены в матрице приёмки.
+
+### Документация завершения 0.32 — 2026-09-09
+
+- Добавлены ТЗ R1–R6/C01–C18 и 16-шаговый промпт: полный VerificationContext,
+  required check plan, устойчивость leases/reconciliation, scheduler end-to-end,
+  Web/API и live/clean-install/release gates.
+- Согласованы глобальные и связанные документы. Это план оставшихся работ,
+  не заявление об их реализации и не production-релиз.
+
 ### Запланировано — 0.32, 2026-09-09
 
 - Подготовлены подробный промпт, отдельное ТЗ L01–L13/A01–A34 и Web-промпт:

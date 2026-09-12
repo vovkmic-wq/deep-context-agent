@@ -98,6 +98,7 @@ class VerificationRepairStore:
         known_secrets: tuple[str, ...] = (),
     ) -> None:
         self.workspace = workspace.resolve()
+        self.database = database
         self.known_secrets = known_secrets
         self.db = sqlite3.connect(database, timeout=30)
         self.db.row_factory = sqlite3.Row
@@ -328,7 +329,8 @@ class VerificationRepairStore:
 
     def relation_for_repair(self, repair_job_id: str) -> dict[str, object] | None:
         row = self.db.execute(
-            "SELECT r.*,p.project_root,p.allowed_paths_json,p.plan_json "
+            "SELECT r.*,p.project_root,p.allowed_paths_json,"
+            "p.plan_json,p.evidence_json "
             "FROM verification_repair_relations r JOIN verification_repair_proposals p "
             "ON p.id=r.proposal_id WHERE r.repair_job_id=?",
             (repair_job_id,),
@@ -338,7 +340,42 @@ class VerificationRepairStore:
         value = dict(row)
         value["allowed_paths"] = json.loads(str(value.pop("allowed_paths_json")))
         value["plan"] = json.loads(str(value.pop("plan_json")))
+        if _sha(value["plan"]) != value["plan_sha256"]:
+            raise RepairConflictError("STALE_EVIDENCE: repair plan integrity failure")
+        evidence = json.loads(str(value.pop("evidence_json")))
+        if _sha(evidence) != value["evidence_sha256"]:
+            raise RepairConflictError(
+                "STALE_EVIDENCE: repair evidence integrity failure"
+            )
+        value["verification_evidence"] = evidence
+        value["verification_context_ids"] = sorted(
+            {
+                str(item["persisted_context_id"])
+                for item in evidence
+                if isinstance(item, dict) and item.get("persisted_context_id")
+            }
+        )
         return value
+
+    def approved_operation(self, job_id: str) -> dict[str, object] | None:
+        relation = self.relation_for_repair(job_id)
+        if relation is None:
+            return None
+        proposal = self.get_proposal(str(relation["proposal_id"]))
+        if not proposal.allowed_paths:
+            raise RepairConflictError("Approved repair has no mutation target")
+        return {
+            "phase": "repair",
+            "operation": "edit_file",
+            "target": proposal.allowed_paths[0],
+            "objective": (
+                "Repair the explicitly approved failure, without weakening checks."
+            ),
+            "required_evidence_ids": [str(e["evidence_id"]) for e in proposal.evidence],
+            "expected_effect": proposal.plan["expected_effect"],
+            "verification_commands": [str(e["check"]) for e in proposal.evidence],
+            "component": Path(proposal.allowed_paths[0]).name,
+        }
 
     def record_outcome(
         self,
@@ -505,7 +542,9 @@ class VerificationRepairStore:
     def _project_root(self, blocker: Mapping[str, Any]) -> Path:
         attempted = blocker.get("attempted_operation")
         seed = attempted.get("target", "") if isinstance(attempted, Mapping) else ""
-        return resolve_project_root(self.workspace, seed_paths=(str(seed),))
+        return resolve_project_root(
+            self.workspace, seed_paths=(str(seed),), database=self.database
+        )
 
     def _proposal(
         self, source: sqlite3.Row, result: Mapping[str, Any], project_root: Path
@@ -554,6 +593,12 @@ class VerificationRepairStore:
             "paths": list(allowed_paths),
         }
         evidence = (evidence_item,)
+        context = result.get("verification_context")
+        if isinstance(context, dict) and context.get("persisted_context_id"):
+            context_id = str(context["persisted_context_id"])
+            if not _SHA256.fullmatch(context_id):
+                raise RepairConflictError("Invalid verification context reference")
+            evidence_item["persisted_context_id"] = context_id
         baseline_sha256: dict[str, str] = {}
         for path in allowed_paths:
             resolved_path = resolve_inside(self.workspace, path)

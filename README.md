@@ -1,5 +1,27 @@
 # Deep Context Agent
 
+## Дополнение к завершению 0.32 — реализация и приёмка
+
+Нормативное дополнение: [ТЗ R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)
+и [порядок реализации](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md).
+Оно уточняет сохраняемый verification context, полный check plan, устойчивое
+владение/reconciliation, сквозной REPAIR, Web/API и live/release gates.
+Исходные A01–A34 и ограничения прав остаются обязательными. На 2026-09-12
+реализованы bounded renewal/reconciliation, отмена работающих checks/preflight,
+исправлен подтверждённый REPAIR и общий Web execution status. Два реальных
+LLM FAIL→REPAIR→PASS, браузерная проверка и clean-install smoke выполнены.
+Точные доказательства и незакрытые gates: [матрица приёмки](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
+Версия пакета пока 0.31.0: частичная приёмка не означает production-релиз 0.32.
+
+Реализован контракт R1 schema 2: immutable VerificationContext хранит task/job/run/
+attempt IDs, snapshot разрешений проверяющего runner, root provenance, code/config/
+lock/dependency fingerprints, версии и origins, launch path/prefix. В публичном
+результате — только компактные ссылки; legacy schema 1 не принимается как новый
+PASS. При resume сохранённый root проверяется до discovery. Discovery использует
+общие исключения и SQLite frontier/cursor; partial не считается уникальным root.
+Scanner не держит writer lock во время обхода; отмена сохраняет последний commit.
+Фактическая Windows-приёмка и незакрытый Unix/symlink gate перечислены в матрице.
+
 CLI-агент на Python и Deep Agents с долговременным SQLite-контекстом,
 поиском и безопасным чтением публичных веб-страниц, а также ограниченной
 файловой системой. Поддерживаются LM Studio, OpenAI, YandexGPT, DeepSeek,

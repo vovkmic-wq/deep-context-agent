@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import replace
 
 import pytest
-from conftest import SequenceChatModel
+from conftest import SequenceChatModel, complete_check_results
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 
@@ -20,7 +20,6 @@ from context_agent.model_routing import (
     ResourceRouter,
     request_signals,
 )
-from context_agent.project_checks import ProjectCheckResult
 from context_agent.runtime import AgentRuntime
 from context_agent.task_state import TaskConflict, TaskStateStore
 
@@ -263,16 +262,7 @@ def test_web_project_develop_log_long_resume_preserves_job_without_audit(
         monkeypatch.setattr(
             runtime.project_check_runner,
             "run",
-            lambda *, project_root: [
-                ProjectCheckResult(
-                    check="compileall",
-                    command=("python", "-m", "compileall"),
-                    return_code=0,
-                    duration_seconds=0.01,
-                    status="passed",
-                    output="passed",
-                )
-            ],
+            lambda *, project_root: complete_check_results(project_root),
         )
         return runtime
 
@@ -433,16 +423,7 @@ def test_cli_persistent_development_advances_checkpoint_without_audit(
         monkeypatch.setattr(
             runtime.project_check_runner,
             "run",
-            lambda *, project_root: [
-                ProjectCheckResult(
-                    check="compileall",
-                    command=("python", "-m", "compileall"),
-                    return_code=0,
-                    duration_seconds=0.01,
-                    status="passed",
-                    output="passed",
-                )
-            ],
+            lambda *, project_root: complete_check_results(project_root),
         )
         runtime.run_user_job(
             "Измени код проекта: создай one.txt и two.txt", allow_write=True

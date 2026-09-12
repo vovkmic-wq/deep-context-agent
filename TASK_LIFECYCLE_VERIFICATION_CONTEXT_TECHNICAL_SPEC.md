@@ -1,5 +1,15 @@
 # ТЗ 0.32: жизненный цикл задачи и окружение верификации
 
+## Дополнение к завершению 0.32 — запланировано
+
+Нормативное дополнение: [ТЗ R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)
+и [порядок реализации](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md).
+Оно уточняет сохраняемый verification context, полный check plan, устойчивое
+владение/reconciliation, сквозной REPAIR, Web/API и live/release gates.
+Исходные A01–A34 и ограничения прав остаются обязательными. Опубликованная ветка
+и 449 passed не означают закрытие production-приёмки. В этом этапе изменены
+только документы; код новых требований ещё предстоит реализовать.
+
 Дата: 2026-09-09. Статус: **запланировано, код ещё не исправлен**.
 Текущая версия пакета: 0.31.0. Подготовка этого ТЗ не меняет версию,
 состояние пользовательских задач или результат их проверок.
@@ -228,6 +238,11 @@ Outbox не даёт exactly-once внешних операций. Retention н�
 terminal events и evidence, необходимые для незавершённого recovery.
 
 ## 7. L06 — сохранённый VerificationContext
+
+Реализация 2026-09-12: schema 2 immutable/context-addressed payload, отдельно
+compact receipts; runtime разрешения никогда не восстанавливаются из payload.
+Task/job/run/attempt и parent context обеспечивают attribution при repair/restart.
+Подробная схема и ограничения сканирования уточнены в дополнении R1.
 
 Каждая проверка получает schema-versioned immutable execution context:
 

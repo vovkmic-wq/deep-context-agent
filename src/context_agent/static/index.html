@@ -102,7 +102,9 @@
                 </div>
                 <small id="chat-model-status" class="mode-help">Модель выбирается отдельно для этой задачи и фиксируется на время запроса.</small>
                 <small id="mode-help" class="mode-help">Agent использует все настроенные инструменты в пределах workspace и доверенных разрешений.</small>
-                <div id="chat-job-status" class="operation-status" aria-live="polite" hidden></div>
+                  <small id="chat-connection" role="status"></small>
+                  <div id="chat-job-status" class="operation-status" aria-live="polite" hidden></div>
+                  <details id="chat-job-technical" hidden><summary>Технические подробности / Execution details</summary><pre></pre></details>
                 <div id="chat-output" class="conversation" aria-live="polite"><div class="empty-state"><strong>Готов к работе</strong><span>Опишите задачу, приложите путь или попросите проверить проект.</span></div></div>
                 <form id="chat-form" class="composer">
                   <textarea id="chat-query" rows="2" required aria-label="Сообщение" placeholder="Сообщение агенту…"></textarea>

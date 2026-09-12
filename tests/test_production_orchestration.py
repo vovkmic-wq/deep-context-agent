@@ -129,6 +129,15 @@ def test_project_checks_are_allowed_without_project_discovery(
         duration_seconds=0.01,
         status="passed",
         output="1 passed",
+        context={
+            "schema_version": 2,
+            "run_id": "fixture-run",
+            "project_root": "/workspace",
+            "checks": ["pytest"],
+            "context_id": "fixture",
+            "source_sha256": "source",
+            "environment_sha256": "environment",
+        },
     )
     with AgentRuntime(config, _provider("lmstudio", "local"), model=model) as runtime:
         (config.workspace / "pyproject.toml").write_text("[project]\nname='fixture'\n")

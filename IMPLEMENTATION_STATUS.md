@@ -1,5 +1,100 @@
 # Статус реализации
 
+## Межплатформенный кандидат — 2026-09-12
+
+Добавлен GitHub Actions workflow для Ubuntu 24.04 / Python 3.11 и 3.12,
+Windows 2022 / Python 3.12. A23 использует настоящий symlink venv с Unicode/space
+путём и проверяет launch, prefix, package origin, persisted context и confinement.
+Публикация рабочей ветки нужна для CI; main/tag/release не изменяются.
+До получения Linux evidence C18 остаётся незакрытым, версия остаётся 0.31.0.
+
+## R1: typed context, происхождение окружения, paging — 2026-09-12
+
+Реализована schema 2 VerificationContext: immutable/canonical hash, IDs и версии,
+snapshot полномочий runner, root provenance, конфигурация/lock, code revision,
+dependency versions/origins, venv launch/prefix. Компактные receipts ссылаются на
+единственную запись; schema 1 не повышается до нового PASS. Saved root выбирается
+до discovery при resume, REPAIR сохраняет parent context без повышения прав.
+Namespace/src/custom-layout проверены реальными отдельными venv, включая чужую
+checkout-копию. Root scan сохраняет frontier/offset/signature и валидирует дерево;
+CAS commit не блокирует heartbeat во время filesystem IO. Отмена не теряет cursor.
+Текущие evidence и оставшийся A23: [матрица](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
+Финальный pytest: 515 passed / 1 skipped; Ruff/format/mypy/compileall, frontend,
+wheel/isolated-install PASS. Расширенный real LLM context roundtrip ×2 PASS,
+повтор отмены pytest через Web — 0.313 s. Unix/symlink gate не пройден;
+релиз и публикация пока не объявляются завершёнными.
+Ниже сохранены результаты предыдущих итераций, не текущий список недоделок.
+
+## R3–R6 и отмена subprocess — 2026-09-12
+
+Реализованы bounded SQLite retry task/job, раздельные причины потери прав,
+heartbeat в очереди и между units, persistent reconciliation cursor и карантин
+legacy orphan tasks. Verification/preflight subprocess проверяет отмену/владение
+каждые 100 ms и завершается с обычным деревом процессов, не ожидая общего timeout.
+Дополнительный Web/pytest live выявил и устранил stale running job после cancel:
+fenced abort_execution финализирует controller/units, не меняя нового владельца.
+Повторы cancellation PASS: 0.343 / 0.312 s, последний с проверкой выхода PID.
+По live evidence исправлены frozen REPAIR target/evidence и повтор approval,
+переочередявший terminal job. Добавлены metadata-only execution DTO, durable SSE,
+восстановление выбранного чата/job, offline и защита от чужого result card.
+
+Два real LLM FAIL→REPAIR→PASS, browser verification, controlled HTTP fallback,
+clean-wheel CLI/Web smoke и copied-DB migration выполнены. Полная регрессия:
+496 passed, 1 skipped; Ruff/format/mypy/compileall/frontend — PASS.
+Доказательства, run IDs и остаток: [C01–C18](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
+Общий release gate BLOCKED: полная typed context/provenance R1, paging resolver
+и межплатформенная/symlink приёмка не закрыты. Package version 0.31.0 сохранена.
+Рабочий Ozon/сервер/ключи не менялись. Ниже — исторические этапы.
+
+## Реализация дополнения R1/R2 — в работе
+
+2026-09-11: единый verification_passed gate подключён к runtime и model tool.
+Он требует полный набор уникальных checks одного context/code/environment и
+успешные exit codes. Неполный зелёный набор останавливается как
+verification_evidence_incomplete без source REPAIR. Частичный tool-запрос имеет
+project_pass=false. Authority/cancel проверяются между командами; выполняющийся
+subprocess на этом историческом этапе был ограничен timeout; исправлено выше.
+Обновлены явные test doubles полного плана, не ослаблены production gates.
+Полная регрессия: **472 passed, 1 skipped in 50.90 s**. Ruff/format/mypy PASS.
+Сквозные live C11–C18 не закрыты; изменения не опубликованы.
+
+2026-09-10: transfer контекста добавлен в frozen repair evidence/relation;
+проверка hash отклоняет повреждение. VERIFY использует переданную ссылку при
+отсутствии собственных receipts. Preflight проверяет origin обычных top-level
+пакетов в root/src; реальный временный venv с .pth в чужую копию блокируется.
+Причина origin failure сохраняется в безопасном сообщении. Namespace/custom
+layouts требуют дальнейшей поддержки; полный C01/C02 пока не закрыт.
+Полная регрессия: **465 passed, 1 skipped in 51.98 s**. Ruff/format/mypy PASS.
+Live нового сквозного scheduler-сценария не выполнялся; изменения локальные.
+
+Следующий прогон: **461 passed, 1 skipped in 52.24 s**; mypy PASS.
+Добавлены тесты и исправления environment drift, uv/poetry lock и requirements
+fingerprint. Probe включает hash версий установленных distributions и повторяется
+перед принятием результата. VERIFY восстанавливает root из сохранённого receipt;
+конфликт явного root блокируется. Полный transfer новой repair-задаче и package
+origin ещё не закрыты; live/release gate не заявлен.
+
+Добавлено workspace-scoped content-addressed SQLite-хранилище verification
+metadata с проверкой целостности и подключением к runner. Это ещё не полный
+типизированный transfer-контракт R1. Default check plan включает compileall,
+а mypy определяется по pyproject.toml/mypy.ini/.mypy.ini/setup.cfg.
+Явный частичный запрос сохраняется и отмечается в metadata.
+Промежуточная регрессия: 455 passed, 1 skipped; после неё добавлен отдельный
+тест setup.cfg (целевые context/plan: 7 passed). Ruff/mypy проверяются повторно.
+Матрица остатка: [C01–C18](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
+Новый live/release gate не выполнялся, production PASS и публикация не заявлены.
+
+## Завершение production-приёмки 0.32 — документы подготовлены
+
+Добавлены [промпт из 16 шагов](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md)
+и [ТЗ R1–R6 с критериями C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md).
+Обновлены глобальные ТЗ/промпт, Web-промпт, связанные спецификации scheduler,
+continuity, orchestration, verification/repair и системные указания.
+Статус новых критериев: NOT RUN до привязки актуальных доказательств.
+Этот этап документационный: Python/TypeScript, БД и версии не изменялись.
+Последний подтверждённый полный прогон — 449 passed, 1 skipped; он не закрывает
+новые требования автоматически. Реализация и выпуск остаются отдельным этапом.
+
 ## Task lifecycle / verification context 0.32 — в работе, 2026-09-09
 
 Дополнительная приёмка по запросу пользователя: длительное ожидание с двумя

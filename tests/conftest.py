@@ -12,6 +12,32 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 
+def complete_check_results(project_root):
+    """Explicit fake runner contract; no real external checks are implied."""
+    from context_agent.project_checks import ProjectCheckResult, resolve_check_plan
+
+    return [
+        ProjectCheckResult(
+            check,
+            ("fixture-python", "-m", check),
+            0,
+            0.01,
+            "passed",
+            "fixture PASS",
+            context={
+                "schema_version": 2,
+                "run_id": "fixture-run",
+                "project_root": "/workspace",
+                "checks": list(resolve_check_plan(project_root)),
+                "context_id": "fixture-context",
+                "source_sha256": "fixture-source",
+                "environment_sha256": "fixture-env",
+            },
+        )
+        for check in resolve_check_plan(project_root)
+    ]
+
+
 class SequenceChatModel(BaseChatModel):
     """Deterministic tool-capable chat model for agent integration tests."""
 

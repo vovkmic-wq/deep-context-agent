@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import os
 import re
 import subprocess
 import tempfile
 import time
+import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
 
-from context_agent.artifact_policy import DEFAULT_ARTIFACT_POLICY
+from context_agent.checked_process import run_checked_process
 from context_agent.paths import PathSecurityError, resolve_inside
 from context_agent.verification_context import (
-    context_metadata,
+    VerificationContextStore,
+    VerificationInvocation,
+    capture_context,
     probe_environment,
     source_fingerprint,
 )
+from context_agent.workspace_scan import DurableManifestScan
 
 _SENSITIVE_ENV_MARKERS: Final[tuple[str, ...]] = (
     "ACCESS_KEY",
@@ -63,6 +69,54 @@ class AmbiguousProjectRootError(ProjectRootResolutionError):
     error_code = "verification_project_root_ambiguous"
 
 
+class ProjectRootScanPending(ProjectRootResolutionError):  # noqa: N818
+    """A partial result must be resumed, not mistaken for a unique project."""
+
+    error_code = "verification_project_root_partial"
+
+    def __init__(self, cursor: str, scanned: int) -> None:
+        self.cursor = cursor
+        self.scanned = scanned
+        super().__init__(
+            f"Project-root scan partial: scanned={scanned}, cursor={cursor}. "
+            "Resume with the same workspace/database or supply an exact project."
+        )
+
+
+class VerificationContextResolutionError(ProjectRootResolutionError):
+    """A durable context cannot be replaced by a newly guessed root."""
+
+    error_code = "verification_context_stale"
+
+
+def resolve_check_plan(project_root: Path, checks: str = "") -> tuple[str, ...]:
+    """Keep explicit scope; expand the default using project configuration."""
+    if checks.strip():
+        return _parse_checks(checks)
+    manifest = project_root / _PROJECT_MANIFEST
+    configuration: dict[str, Any] = {}
+    if manifest.is_file():
+        if manifest.stat().st_size > 1_000_000:
+            raise ValueError("Project manifest exceeds verification limit")
+        configuration = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    tool = configuration.get("tool", {})
+    mypy_required = isinstance(tool, dict) and "mypy" in tool
+    mypy_required = mypy_required or any(
+        (project_root / name).is_file() for name in ("mypy.ini", ".mypy.ini")
+    )
+    setup_config = project_root / "setup.cfg"
+    if setup_config.is_file():
+        if setup_config.stat().st_size > 1_000_000:
+            raise ValueError("Project configuration exceeds verification limit")
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read_string(setup_config.read_text(encoding="utf-8"))
+        except configparser.Error as exc:
+            raise ValueError("Invalid project verification configuration") from exc
+        mypy_required = mypy_required or parser.has_section("mypy")
+    return (*_DEFAULT_CHECKS, *(("mypy",) if mypy_required else ()), "compileall")
+
+
 def resolve_project_root(
     workspace: Path,
     *,
@@ -70,10 +124,13 @@ def resolve_project_root(
     max_manifests: int = 100,
     max_entries: int = 10_000,
     timeout_seconds: float = 5,
+    database: Path | None = None,
+    check_authority: Callable[[], None] = lambda: None,
 ) -> Path:
     """Resolve the nearest trusted project root, then a unique bounded candidate."""
 
     root = workspace.resolve()
+    check_authority()
     seeded_roots: list[Path] = []
     for raw_seed in seed_paths:
         try:
@@ -83,6 +140,7 @@ def resolve_project_root(
         current = seed if seed.is_dir() else seed.parent
         while current == root or current.is_relative_to(root):
             if (current / _PROJECT_MANIFEST).is_file():
+                resolve_inside(root, str(current / _PROJECT_MANIFEST), must_exist=True)
                 seeded_roots.append(current)
                 break
             if current == root:
@@ -97,39 +155,20 @@ def resolve_project_root(
             + ", ".join(str(path) for path in unique_seeded)
         )
 
-    manifests: list[Path] = []
-    pending = [root]
-    visited: set[Path] = set()
-    scanned = 0
-    started = time.monotonic()
-    while pending:
-        directory = pending.pop()
-        resolved = directory.resolve()
-        if not resolved.is_relative_to(root) or resolved in visited:
-            continue
-        visited.add(resolved)
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                scanned += 1
-                if (
-                    scanned > max_entries
-                    or time.monotonic() - started > timeout_seconds
-                ):
-                    raise ProjectRootResolutionError(
-                        "Project-root scan budget exceeded"
-                    )
-                if entry.is_symlink():
-                    continue
-                candidate = Path(entry.path)
-                if entry.is_dir(follow_symlinks=False):
-                    if DEFAULT_ARTIFACT_POLICY.directory_reason(entry.name) is None:
-                        pending.append(candidate)
-                elif entry.name == _PROJECT_MANIFEST and entry.is_file():
-                    manifests.append(candidate)
-                    if len(manifests) > max_manifests:
-                        raise AmbiguousProjectRootError(
-                            "Project-root scan exceeded the bounded manifest limit."
-                        )
+    try:
+        with DurableManifestScan(database) as scan:
+            page = scan.page(
+                root,
+                max_entries=max_entries,
+                timeout=timeout_seconds,
+                max_matches=max_manifests,
+                check_authority=check_authority,
+            )
+    except (OSError, ValueError) as exc:
+        raise ProjectRootResolutionError(str(exc)) from exc
+    if not page.complete:
+        raise ProjectRootScanPending(page.next_cursor or "", page.scanned)
+    manifests = page.paths
     safe_roots = tuple(
         path
         for path in dict.fromkeys(manifest.parent.resolve() for manifest in manifests)
@@ -165,6 +204,39 @@ class ProjectCheckResult:
     output_sha256: str = ""
 
 
+def verification_passed(
+    results: list[ProjectCheckResult], required_checks: tuple[str, ...]
+) -> bool:
+    """Accept only a complete, unique set from one code/environment context."""
+    if not required_checks or len(results) != len(required_checks):
+        return False
+    if {result.check for result in results} != set(required_checks):
+        return False
+    identities = set()
+    for result in results:
+        if result.status != "passed" or result.return_code != 0:
+            return False
+        virtual_root = str(result.context.get("project_root", ""))
+        if (
+            result.context.get("schema_version") != 2
+            or not result.context.get("run_id")
+            or not (
+                virtual_root == "/workspace" or virtual_root.startswith("/workspace/")
+            )
+            or any(part in {".", ".."} for part in virtual_root.split("/"))
+            or tuple(result.context.get("checks", ())) != required_checks
+        ):
+            return False
+        identity = tuple(
+            result.context.get(key)
+            for key in ("context_id", "source_sha256", "environment_sha256")
+        )
+        if not all(isinstance(value, str) and value for value in identity):
+            return False
+        identities.add(identity)
+    return len(identities) == 1
+
+
 class ProjectCheckRunner:
     """Run selected project checks without accepting arbitrary shell input."""
 
@@ -176,6 +248,9 @@ class ProjectCheckRunner:
         output_max_chars: int,
         environment_python: Path | None = None,
         environment_root: Path | None = None,
+        context_database: Path | None = None,
+        check_authority: Callable[[], None] | None = None,
+        invocation: Callable[[], VerificationInvocation] | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.timeout_seconds = timeout_seconds
@@ -186,10 +261,40 @@ class ProjectCheckRunner:
             )
         self.environment_python = environment_python
         self.environment_root = environment_root.resolve() if environment_root else None
+        self.context_database = context_database
+        self.check_authority = check_authority or (lambda: None)
+        self.invocation = invocation or VerificationInvocation
+        self._restored_context_id: str | None = None
+        self._restored_root: Path | None = None
 
     @property
     def allowed_checks(self) -> tuple[str, ...]:
         return tuple(sorted(_ALLOWED_CHECKS))
+
+    def restore_project_root(
+        self, context_id: str, *, project_root: Path | None = None
+    ) -> Path:
+        """Restore a trusted receipt's root; never infer it from a new model guess."""
+        if self.context_database is None:
+            raise ValueError("Verification context storage unavailable")
+        with VerificationContextStore(self.context_database) as store:
+            payload = store.load(self.workspace, context_id)
+        virtual_root = payload.get("project_root")
+        if not isinstance(virtual_root, str) or not (
+            virtual_root == "/workspace" or virtual_root.startswith("/workspace/")
+        ):
+            raise ValueError("Invalid persisted project root")
+        restored = resolve_inside(
+            self.workspace, virtual_root, allow_root=True, must_exist=True
+        )
+        restored = self._validated_project_root(restored)
+        if project_root is not None and project_root.resolve() != restored:
+            raise ValueError("Explicit project root conflicts with saved verification")
+        if not (restored / _PROJECT_MANIFEST).is_file():
+            raise ValueError("Saved project manifest unavailable")
+        self._restored_context_id = context_id
+        self._restored_root = restored
+        return restored
 
     def run(
         self,
@@ -199,8 +304,13 @@ class ProjectCheckRunner:
     ) -> list[ProjectCheckResult]:
         """Run comma-separated check identifiers from the immutable allowlist."""
 
+        self.check_authority()
+        invocation = self.invocation()
+        if not invocation.checks_allowed:
+            raise ValueError("Project checks are not permitted by runtime authority")
         requested = _parse_checks(checks)
         execution_root = self._validated_project_root(project_root)
+        requested = resolve_check_plan(execution_root, checks)
         try:
             python = (
                 str(self.environment_python.absolute())
@@ -215,7 +325,11 @@ class ProjectCheckRunner:
         environment, secret_values = _sanitized_environment()
         try:
             probe = probe_environment(
-                python, execution_root, environment, self.timeout_seconds
+                python,
+                execution_root,
+                environment,
+                self.timeout_seconds,
+                self.check_authority,
             )
             if self.environment_root != execution_root:
                 expected_prefix = Path(python).parent.parent.resolve()
@@ -239,12 +353,32 @@ class ProjectCheckRunner:
                     "Project environment dependencies missing: " + ", ".join(missing)
                 )
             baseline = source_fingerprint(execution_root)
-            context = context_metadata(
-                execution_root, self.workspace, python, probe, requested, baseline
+            saved = self._restored_root == execution_root
+            snapshot = capture_context(
+                execution_root,
+                self.workspace,
+                python,
+                probe,
+                requested,
+                baseline,
+                invocation=invocation,
+                root_source="saved_context"
+                if saved
+                else ("explicit" if project_root is not None else "discovery"),
+                parent_context_id=self._restored_context_id if saved else None,
+                partial=bool(checks.strip()),
             )
+            context = snapshot.receipt()
+            if self.context_database is not None:
+                with VerificationContextStore(self.context_database) as store:
+                    context["persisted_context_id"] = store.save(
+                        self.workspace, snapshot.payload()
+                    )
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) else ""
-            if not reason.startswith(("Project environment", "Verification source")):
+            if not reason.startswith(
+                ("Project environment", "Project package", "Verification source")
+            ):
                 reason = "Project environment preflight failed: " + type(exc).__name__
             return [
                 ProjectCheckResult(
@@ -267,6 +401,7 @@ class ProjectCheckRunner:
 
         with tempfile.TemporaryDirectory(prefix="deep-context-checks-") as temp_root:
             for check in requested:
+                self.check_authority()
                 command = self._command(
                     check,
                     python,
@@ -275,7 +410,7 @@ class ProjectCheckRunner:
                 )
                 started = time.monotonic()
                 try:
-                    completed = subprocess.run(
+                    completed = run_checked_process(
                         command,
                         cwd=execution_root,
                         env=environment,
@@ -286,6 +421,7 @@ class ProjectCheckRunner:
                         timeout=self.timeout_seconds,
                         check=False,
                         shell=False,
+                        check_authority=self.check_authority,
                     )
                 except subprocess.TimeoutExpired as error:
                     output = _combine_timeout_output(error)
@@ -318,6 +454,7 @@ class ProjectCheckRunner:
                     )
                     continue
 
+                self.check_authority()
                 output = "\n".join(
                     part.strip()
                     for part in (completed.stdout, completed.stderr)
@@ -338,9 +475,21 @@ class ProjectCheckRunner:
                     )
                 )
 
+        self.check_authority()
         try:
             fresh = source_fingerprint(execution_root) == baseline
-        except (ValueError, OSError):
+            fresh = (
+                fresh
+                and probe_environment(
+                    python,
+                    execution_root,
+                    environment,
+                    self.timeout_seconds,
+                    self.check_authority,
+                )
+                == probe
+            )
+        except (ValueError, OSError, subprocess.SubprocessError):
             fresh = False
         if not fresh:
             results = [
@@ -360,7 +509,11 @@ class ProjectCheckRunner:
         resolved = (
             project_root.resolve()
             if project_root is not None
-            else resolve_project_root(self.workspace)
+            else resolve_project_root(
+                self.workspace,
+                database=self.context_database,
+                check_authority=self.check_authority,
+            )
         )
         if resolved != self.workspace and not resolved.is_relative_to(self.workspace):
             raise ValueError("Project-check root escapes workspace")

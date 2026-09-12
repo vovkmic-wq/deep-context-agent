@@ -27,6 +27,7 @@ def runner_environment(tmp_path, monkeypatch):
             "prefix": sys.prefix,
             "base_prefix": sys.base_prefix,
             "tools": {"ruff": True, "pytest": True, "mypy": True},
+            "dependencies_sha256": "a" * 64,
         },
     )
     return {"environment_python": Path(sys.executable), "environment_root": tmp_path}
@@ -61,7 +62,7 @@ def test_project_check_runner_uses_no_shell_and_redacts_environment_secrets(
             stderr="",
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("context_agent.project_checks.run_checked_process", fake_run)
     runner = ProjectCheckRunner(
         workspace=tmp_path,
         timeout_seconds=30,
@@ -145,7 +146,7 @@ def test_runner_executes_from_explicit_nested_project_root(
         captured.update(kwargs)
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("context_agent.project_checks.run_checked_process", fake_run)
     runner = ProjectCheckRunner(
         environment_python=Path(sys.executable),
         environment_root=nested,
@@ -177,8 +178,7 @@ def test_runner_records_failed_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_environment
 ) -> None:
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        "context_agent.project_checks.run_checked_process",
         lambda command, **_kwargs: subprocess.CompletedProcess(
             command,
             1,
@@ -206,7 +206,7 @@ def test_runner_records_timeout(
     def timeout(command: list[str], **_kwargs: object) -> None:
         raise subprocess.TimeoutExpired(command, 30, output="partial")
 
-    monkeypatch.setattr(subprocess, "run", timeout)
+    monkeypatch.setattr("context_agent.project_checks.run_checked_process", timeout)
     runner = ProjectCheckRunner(
         **runner_environment,
         workspace=tmp_path,
@@ -227,7 +227,9 @@ def test_runner_records_os_error(
     def fail_to_start(_command: list[str], **_kwargs: object) -> None:
         raise OSError("executable unavailable")
 
-    monkeypatch.setattr(subprocess, "run", fail_to_start)
+    monkeypatch.setattr(
+        "context_agent.project_checks.run_checked_process", fail_to_start
+    )
     runner = ProjectCheckRunner(
         **runner_environment,
         workspace=tmp_path,
@@ -249,7 +251,7 @@ def test_source_drift_invalidates_pass(tmp_path, monkeypatch, runner_environment
         source.write_text("VALUE = 2\n")
         return subprocess.CompletedProcess(command, 0, stdout="passed", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", mutate)
+    monkeypatch.setattr("context_agent.project_checks.run_checked_process", mutate)
     runner = ProjectCheckRunner(
         workspace=tmp_path,
         timeout_seconds=30,
@@ -262,3 +264,69 @@ def test_source_drift_invalidates_pass(tmp_path, monkeypatch, runner_environment
     assert result.context["context_id"]
     assert str(tmp_path) not in str(result.context)
     assert result.output_sha256
+
+
+def test_environment_drift_invalidates_pass(tmp_path, monkeypatch, runner_environment):
+    probes = iter(
+        [
+            {
+                "version": "3.12",
+                "prefix": "same",
+                "base_prefix": "same",
+                "tools": {},
+                "dependencies_sha256": "a" * 64,
+            },
+            {
+                "version": "3.13",
+                "prefix": "same",
+                "base_prefix": "same",
+                "tools": {},
+                "dependencies_sha256": "b" * 64,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "context_agent.project_checks.probe_environment", lambda *_: next(probes)
+    )
+    monkeypatch.setattr(
+        "context_agent.project_checks.run_checked_process",
+        lambda command, **_: subprocess.CompletedProcess(
+            command, 0, stdout="", stderr=""
+        ),
+    )
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=30,
+        output_max_chars=2000,
+        **runner_environment,
+    )
+    assert runner.run("compileall")[0].status == "stale"
+
+
+def test_cancel_after_check_prevents_next_command(
+    tmp_path, monkeypatch, runner_environment
+):
+    cancelled = False
+    commands = []
+
+    def check_authority():
+        if cancelled:
+            raise RuntimeError("verification cancelled")
+
+    def run(command, **kwargs):
+        nonlocal cancelled
+        commands.append(command)
+        cancelled = True
+        return subprocess.CompletedProcess(command, 0, stdout="passed", stderr="")
+
+    monkeypatch.setattr("context_agent.project_checks.run_checked_process", run)
+    runner = ProjectCheckRunner(
+        workspace=tmp_path,
+        timeout_seconds=10,
+        output_max_chars=1000,
+        check_authority=check_authority,
+        **runner_environment,
+    )
+    with pytest.raises(RuntimeError, match="cancelled"):
+        runner.run("ruff_check,pytest")
+    assert len(commands) == 1

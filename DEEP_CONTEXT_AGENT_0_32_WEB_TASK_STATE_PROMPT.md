@@ -1,6 +1,36 @@
 # Web-промпт 0.32: согласованные задачи и контекст проверок
 
-Дата: 2026-09-09. Статус: запланировано; API/UI ещё не изменены.
+Дата: 2026-09-09; обновлено 2026-09-12. Браузерная приёмка execution cards,
+reload/restart/offline и двух вкладок выполнена: [evidence](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
+Общий release gate остаётся отдельным и не заявляется автоматически.
+
+## Завершение production-приёмки
+
+Применяй [дополнение R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)
+и [порядок реализации](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md).
+Для Web обязательны R5/C13–C14 и backend-контракты R1–R3:
+
+- Единый outcome/projection DTO; отдельно task/job/request/diagnostic IDs.
+- Virtual root, environment label, required checks и актуальность evidence;
+  partial/stale/unavailable не отображаются как итоговый PASS.
+- Получать из schema 2 только compact receipt/context ID, не prefix/launch host path,
+  список dependencies или private origins. root-discovery partial содержит cursor и
+  scanned count; продолжение использует серверный checkpoint, не повторный полный audit.
+- Повторное открытие страницы, SSE replay и две вкладки не создают новые
+  approvals, executions или мутации; кнопки используют revision/idempotency.
+- Offline не выглядит как живой worker; pending означает синхронизацию.
+- Выбранные thread/job сохраняются отдельно для каждой вкладки. Новый чат
+  очищает старую карточку; запоздавший fetch/SSE другого чата не меняет её.
+  Восстановление выбора выполняет только GET, не resume или approval.
+- Показать конкретную причину остановки и разрешённое действие восстановления;
+  расширенные lease/generation сведения скрыть в технических подробностях.
+- Не отдавать host paths, owner tokens, ключи и полные prompts через публичные
+  DTO/ошибки. Проверить CSRF и область доступа к диагностике.
+- Приёмка в реальном браузере: reload после BLOCKED, reconnect после restart,
+  две вкладки и отсутствие сервера; приложить проверяемый отчёт без секретов.
+
+## Исходные обязательные требования
+
 Работай по [ТЗ 0.32](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
 L01–L13, особенно L04/L05/L06/L11 и A08–A12/A18–A26/A30–A34.
 Дополняй существующий чат без новой вкладки Autopilot.

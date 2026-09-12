@@ -902,6 +902,64 @@ class DiagnosticStore:
         except sqlite3.Error as exc:
             raise DiagnosticStoreError("Cannot create persistent Web task") from exc
 
+    def _safe_execution(self, value: object) -> dict[str, object]:
+        if not isinstance(value, Mapping):
+            return {}
+        safe: dict[str, object] = {}
+        for key in (
+            "job_id",
+            "saved_task_id",
+            "outcome",
+            "task_status",
+            "projection_state",
+            "display_status",
+            "phase",
+            "error_code",
+            "environment_label",
+            "context_id",
+            "verification_status",
+        ):
+            safe[key] = _safe_name(
+                redact_sensitive_text(
+                    str(value.get(key) or "unavailable"),
+                    known_secrets=self.known_secrets,
+                )
+            )
+        root = str(value.get("project_root") or "")
+        if (
+            (root == "/workspace" or root.startswith("/workspace/"))
+            and not any(part in {".", ".."} for part in root.split("/"))
+            and not any(char in root for char in "\\:\r\n")
+        ):
+            safe["project_root"] = redact_sensitive_text(
+                root, known_secrets=self.known_secrets
+            )[:1000]
+        checks = value.get("checks")
+        for name in (
+            "saved_task_revision",
+            "task_lease_remaining_seconds",
+            "job_lease_remaining_seconds",
+            "lease_generation",
+            "last_heartbeat_at",
+            "active_time_seconds",
+        ):
+            number = value.get(name)
+            if isinstance(number, (int, float)) and 0 <= number < 1e15:
+                safe[name] = number
+        if isinstance(checks, list):
+            safe["checks"] = [
+                {
+                    "check": _safe_name(item.get("check")),
+                    "status": _safe_name(item.get("status")),
+                    "return_code": item.get("return_code")
+                    if isinstance(item.get("return_code"), int)
+                    else None,
+                }
+                for item in checks[:5]
+                if isinstance(item, Mapping)
+            ]
+        return safe
+
     def record_task_terminal(
         self,
         task_id: str,
@@ -915,7 +973,14 @@ class DiagnosticStore:
         raw_data = event.get("data", {})
         data = raw_data if isinstance(raw_data, Mapping) else {}
         safe_data: dict[str, object] = {}
-        for name in ("task_id", "request_id", "error_type", "provider", "model"):
+        for name in (
+            "task_id",
+            "request_id",
+            "error_type",
+            "provider",
+            "model",
+            "authority_reason",
+        ):
             if data.get(name) is not None:
                 safe_data[name] = _safe_name(data[name])
         for name in (
@@ -958,6 +1023,8 @@ class DiagnosticStore:
             safe_data["message"] = redact_sensitive_text(
                 str(data["message"]), known_secrets=self.known_secrets
             )[:2_000]
+        if isinstance(data.get("execution"), Mapping):
+            safe_data["execution"] = self._safe_execution(data["execution"])
         safe_event = {"event": event_name, "data": safe_data}
         try:
             with self._lock, self._connection:
@@ -983,6 +1050,8 @@ class DiagnosticStore:
         """Append one bounded, redacted SSE event and return its sequence."""
 
         safe: dict[str, object] = {}
+        if isinstance(data.get("execution"), Mapping):
+            safe["execution"] = self._safe_execution(data["execution"])
         names = {
             "task_id",
             "request_id",
@@ -996,6 +1065,7 @@ class DiagnosticStore:
             "model",
             "partial_reason",
             "renewal_reason",
+            "authority_reason",
             "last_progress_kind",
         }
         numbers = {

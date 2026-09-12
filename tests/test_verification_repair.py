@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,9 @@ from context_agent.autopilot import AutopilotStore, NextOperation
 from context_agent.repair import RepairConflictError, VerificationRepairStore
 
 
-def _failed_source(database: Path, workspace: Path) -> tuple[str, int]:
+def _failed_source(
+    database: Path, workspace: Path, context_id: str = ""
+) -> tuple[str, int]:
     project = workspace / "ozon_market_analytics"
     target = project / "src" / "app.py"
     target.parent.mkdir(parents=True)
@@ -38,6 +41,7 @@ def _failed_source(database: Path, workspace: Path) -> tuple[str, int]:
                     "status": "failed",
                     "duration_seconds": 0.2,
                     "output": "src/app.py:1:6: E225 missing whitespace",
+                    "verification_context": {"persisted_context_id": context_id},
                 }
             ],
         )
@@ -54,6 +58,40 @@ def _failed_source(database: Path, workspace: Path) -> tuple[str, int]:
             },
         )
     return progress.job_id, blocked.checkpoint_revision
+
+
+def test_approved_relation_preserves_frozen_context_reference(tmp_path):
+    database = tmp_path / "autopilot.sqlite3"
+    workspace = tmp_path / "workspace"
+    source, _ = _failed_source(database, workspace, "a" * 64)
+    with VerificationRepairStore(database, workspace=workspace) as store:
+        proposal = store.proposals(source)[0]
+        store.reserve(
+            proposal,
+            idempotency_key="context-transfer",
+            repair_task_id="1" * 32,
+            repair_job_id="2" * 32,
+            confirmed_by="operator",
+        )
+    with VerificationRepairStore(database, workspace=workspace) as store:
+        relation = store.relation_for_repair("2" * 32)
+        assert relation["verification_context_ids"] == ["a" * 64]
+        operation = store.approved_operation("2" * 32)
+        assert operation["target"] == "/workspace/ozon_market_analytics/src/app.py"
+        assert operation["required_evidence_ids"] == [f"{source}:ruff_check"]
+        assert relation["verification_evidence"][0]["output_excerpt"].startswith(
+            "src/app.py"
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE verification_repair_proposals SET evidence_json='[]'"
+        )
+    with (
+        VerificationRepairStore(database, workspace=workspace) as store,
+        pytest.raises(RepairConflictError, match="integrity"),
+    ):
+        store.relation_for_repair("2" * 32)
 
 
 def test_failed_read_only_verification_creates_bounded_proposal(tmp_path: Path) -> None:

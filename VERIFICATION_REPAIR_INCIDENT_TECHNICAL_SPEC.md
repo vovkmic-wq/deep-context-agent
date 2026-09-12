@@ -1,5 +1,15 @@
 # ТЗ 0.31: подтверждаемая repair-задача из verification evidence
 
+## Дополнение к завершению 0.32 — запланировано
+
+Нормативное дополнение: [ТЗ R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md)
+и [порядок реализации](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md).
+Оно уточняет сохраняемый verification context, полный check plan, устойчивое
+владение/reconciliation, сквозной REPAIR, Web/API и live/release gates.
+Исходные A01–A34 и ограничения прав остаются обязательными. Опубликованная ветка
+и 449 passed не означают закрытие production-приёмки. В этом этапе изменены
+только документы; код новых требований ещё предстоит реализовать.
+
 ## Запланированное уточнение 0.32
 
 [ТЗ жизненного цикла и контекста проверки](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)

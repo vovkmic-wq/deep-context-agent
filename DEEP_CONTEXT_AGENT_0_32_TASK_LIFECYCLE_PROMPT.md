@@ -1,6 +1,11 @@
 # Промпт исправления Deep Context Agent 0.32
 
-Дата: 2026-09-09. Статус: план реализации; пакет пока 0.31.0.
+Дата: 2026-09-09. Статус: частично реализован; пакет пока 0.31.0.
+Обновление 2026-09-12: R1 schema 2, paging и R3–R6 реализованы; актуальные
+проверки и незакрытая Unix/symlink-приёмка находятся в release-completion matrix.
+Оставшиеся шесть блоков выполняй по [промпту завершения](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_PROMPT.md)
+и [дополнению R1–R6/C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md).
+Проверяй существующий код перед правками; исходные A01–A34 не отменены.
 Выполняй [ТЗ жизненного цикла и верификации](TASK_LIFECYCLE_VERIFICATION_CONTEXT_TECHNICAL_SPEC.md)
 L01–L13, A01–A34 и [Web-промпт](DEEP_CONTEXT_AGENT_0_32_WEB_TASK_STATE_PROMPT.md).
 Этот файл задаёт будущую реализацию; создание документов не считается её

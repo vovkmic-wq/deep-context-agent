@@ -55,10 +55,17 @@ class SavedTask:
             "status": (
                 "finalization_pending"
                 if self.projection_state == "pending"
+                else "reconciliation_required"
+                if self.evidence.startswith("reconciliation_required:")
                 else self.status
             ),
             "projection_state": self.projection_state,
             "revision": self.revision,
+            "lease_remaining_seconds": (
+                round(max(0, self.lease_until - time.time()), 3)
+                if self.status == "running"
+                else 0
+            ),
             "workflow": self.routing["workflow"],
             "scope": self.routing["scope"],
             "allow_write": self.allow_write,
@@ -131,6 +138,16 @@ class TaskStateStore:
             (thread, str(workspace.resolve())),
         ).fetchall()
         return [self._decode(row) for row in rows]
+
+    def public_by_id(self, task_id: str, workspace: Path) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT t.*, COALESCE((SELECT e.projection FROM task_terminal_events e "
+            "WHERE e.task_id=t.id AND e.owner=t.owner AND e.revision=t.revision), "
+            "'none') AS projection_state FROM authorized_tasks t "
+            "WHERE id=? AND workspace=?",
+            (task_id, str(workspace.resolve())),
+        ).fetchone()
+        return self._decode(row).public() if row else {}
 
     def create(
         self,
@@ -382,6 +399,11 @@ class TaskStateStore:
             )
 
     def claim(self, task: SavedTask, owner: str, seconds: float) -> SavedTask:
+        if task.evidence.startswith("reconciliation_required:"):
+            raise TaskConflict(
+                "Reconciliation required: inspect receipts and create an explicit "
+                "new task; automatic replay is disabled."
+            )
         now = time.time()
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -432,6 +454,8 @@ class TaskStateStore:
             ).fetchone()
             if row is None:
                 raise TaskConflict("Saved task is unavailable for restart recovery")
+            if str(row["evidence"]).startswith("reconciliation_required:"):
+                raise TaskConflict("Legacy execution requires explicit reconciliation")
             if row["owner"] is not None and float(row["lease_until"]) >= now:
                 raise TaskConflict(
                     "Saved-task lease is still live; recovery cannot take it"
@@ -483,6 +507,21 @@ class TaskStateStore:
                 ).rowcount
                 == 1
             )
+
+    def authority_reason(self, task: SavedTask) -> str | None:
+        """Return a bounded public reason, never the current owner's identity."""
+        row = self.db.execute(
+            "SELECT owner, revision, status, lease_until FROM authorized_tasks "
+            "WHERE id=?",
+            (task.id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return "revoked"
+        if row["owner"] != task.owner or row["revision"] != task.revision:
+            return "replaced"
+        if row["lease_until"] < time.time():
+            return "expired"
+        return None if self.owns(task) else "revoked"
 
     def cancel_owner(self, owner: str) -> None:
         with self.db:
@@ -609,12 +648,30 @@ class TaskStateStore:
         """Return only generation-matched links, never infer identity from prose."""
         if not 1 <= limit <= 1000:
             raise ValueError("Invalid reconciliation limit")
-        rows = self.db.execute(
-            "SELECT t.*, l.job_id, l.job_generation FROM authorized_tasks t "
-            "JOIN task_execution_links l ON l.task_id=t.id AND l.owner=t.owner "
-            "AND l.revision=t.revision WHERE t.status='running' LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS task_reconcile_cursor "
+                "(id INTEGER PRIMARY KEY CHECK(id=1), after_id TEXT NOT NULL)"
+            )
+            cursor = self.db.execute(
+                "SELECT after_id FROM task_reconcile_cursor WHERE id=1"
+            ).fetchone()
+            after_id = str(cursor[0]) if cursor else ""
+            query = (
+                "SELECT t.*, l.job_id, l.job_generation FROM authorized_tasks t "
+                "JOIN task_execution_links l ON l.task_id=t.id AND l.owner=t.owner "
+                "AND l.revision=t.revision WHERE t.status='running' "
+                "AND t.id>? ORDER BY t.id LIMIT ?"
+            )
+            rows = self.db.execute(query, (after_id, limit)).fetchall()
+            if not rows and after_id:
+                rows = self.db.execute(query, ("", limit)).fetchall()
+            self.db.execute(
+                "INSERT INTO task_reconcile_cursor VALUES (1,?) "
+                "ON CONFLICT(id) DO UPDATE SET after_id=excluded.after_id",
+                (str(rows[-1]["id"]) if rows else "",),
+            )
         result = []
         for row in rows:
             values = dict(row)
@@ -624,6 +681,28 @@ class TaskStateStore:
             values["allow_write"] = bool(values["allow_write"])
             result.append((SavedTask(**values), str(job_id), int(generation)))
         return result
+
+    def reconcile_unlinked_expired(self, *, limit: int = 100) -> int:
+        """Quarantine orphaned executions; never invent a task/job association."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("Invalid reconciliation limit")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            return self.db.execute(
+                "UPDATE authorized_tasks SET status='blocked', owner=NULL, "
+                "lease_until=0, revision=revision+1, evidence=? WHERE id IN "
+                "(SELECT t.id FROM authorized_tasks t WHERE t.status='running' "
+                "AND t.lease_until<? AND NOT EXISTS "
+                "(SELECT 1 FROM task_execution_links l WHERE l.task_id=t.id "
+                "AND l.owner=t.owner AND l.revision=t.revision) "
+                "ORDER BY t.id LIMIT ?)",
+                (
+                    "reconciliation_required: no verified execution link; inspect "
+                    "receipts/files before creating an explicitly scoped new task",
+                    time.time(),
+                    limit,
+                ),
+            ).rowcount
 
     def project_terminal(self, event_id: str) -> str:
         """Apply durable controller evidence with fencing, even after lease expiry."""

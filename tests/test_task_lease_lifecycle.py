@@ -4,18 +4,95 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
 from context_agent.routing import route_chat_request
 from context_agent.task_lifecycle import TaskLeaseHeartbeat, reconcile_execution_states
-from context_agent.task_state import TaskStateStore
+from context_agent.task_state import TaskConflict, TaskStateStore
 
 
 def claimed(store, root):
     query = "Implement the project feature"
     task = store.create("main", root, query, route_chat_request(query), True)
     return store.claim(task, "worker-a", 10)
+
+
+def test_busy_retry_recovers_without_changing_generation(tmp_path):
+    database = tmp_path / "busy.sqlite3"
+    with TaskStateStore(database) as state:
+        task = claimed(state, tmp_path)
+    locked = threading.Event()
+
+    def lock_briefly():
+        with sqlite3.connect(database) as db:
+            db.execute("BEGIN IMMEDIATE")
+            locked.set()
+            threading.Event().wait(0.2)
+
+    thread = threading.Thread(target=lock_briefly)
+    thread.start()
+    assert locked.wait(2)
+    heartbeat = TaskLeaseHeartbeat(database, task, seconds=10, interval=1)
+    try:
+        heartbeat.start()
+        assert not heartbeat.lost
+        assert heartbeat.reason is None
+        with TaskStateStore(database) as state:
+            assert state.list("main", tmp_path)[0].revision == task.revision
+    finally:
+        heartbeat.close()
+        thread.join(2)
+
+
+def test_busy_retry_is_bounded_and_fails_closed(tmp_path):
+    database = tmp_path / "busy.sqlite3"
+    with TaskStateStore(database) as state:
+        task = claimed(state, tmp_path)
+    heartbeat = TaskLeaseHeartbeat(database, task, seconds=10, interval=1)
+    with sqlite3.connect(database) as locked:
+        locked.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        assert not heartbeat._renew()
+        assert time.monotonic() - started < 1.5
+    assert heartbeat.lost
+    assert heartbeat.reason == "storage_unavailable"
+
+
+def test_authority_reasons_are_distinct(tmp_path, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("context_agent.task_state.time.time", lambda: now[0])
+    with TaskStateStore(tmp_path / "state.sqlite3") as state:
+        task = claimed(state, tmp_path)
+        assert state.authority_reason(task) is None
+        now[0] = 111
+        assert state.authority_reason(task) == "expired"
+        replacement = state.claim(task, "other-worker", 10)
+        assert state.authority_reason(task) == "replaced"
+        state.cancel_owner(replacement.owner)
+        assert state.authority_reason(replacement) == "revoked"
+
+
+def test_orphan_migration_is_explicit_and_does_not_capture_live_owner(
+    tmp_path, monkeypatch
+):
+    now = [100.0]
+    monkeypatch.setattr("context_agent.task_state.time.time", lambda: now[0])
+    database = tmp_path / "legacy.sqlite3"
+    with TaskStateStore(database) as state:
+        task = claimed(state, tmp_path)
+        assert state.reconcile_unlinked_expired() == 0
+        now[0] = 111
+        assert state.reconcile_unlinked_expired() == 1
+    with TaskStateStore(database) as state:
+        assert state.reconcile_unlinked_expired() == 0
+        final = state.list("main", tmp_path)[0]
+        assert final.public()["status"] == "reconciliation_required"
+        assert final.owner is None
+        with pytest.raises(TaskConflict, match="Reconciliation"):
+            state.claim(final, "replacement", 10)
+        assert not state.renew(task, 10)
 
 
 def test_renew_preserves_owner_revision_and_authority(tmp_path, monkeypatch):
@@ -190,3 +267,24 @@ def test_real_silent_subprocess_outlives_initial_lease(tmp_path):
             )
     finally:
         heartbeat.close()
+
+
+def test_reconciliation_pages_survive_restart_without_starvation(tmp_path):
+    database = tmp_path / "state.sqlite3"
+    identities = set()
+    with TaskStateStore(database) as store:
+        for index in range(5):
+            query = f"Implement the project feature {index}"
+            task = store.create(
+                f"pages-{index}", tmp_path, query, route_chat_request(query), True
+            )
+            task = store.claim(task, f"owner-{index}", 30)
+            store.bind_execution(task, f"job-{index}", 1)
+            identities.add(task.id)
+    found = set()
+    for _ in range(3):
+        with TaskStateStore(database) as store:
+            batch = store.linked_running(limit=2)
+            assert len(batch) <= 2
+            found.update(task.id for task, _, _ in batch)
+    assert found == identities

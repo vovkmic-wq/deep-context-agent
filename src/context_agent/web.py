@@ -59,6 +59,7 @@ from context_agent.errors import (
     ContextStoreError,
     PathSecurityError,
 )
+from context_agent.execution_view import execution_view, public_job_details
 from context_agent.model_catalog import (
     ModelCatalog,
     enrich_release_dates,
@@ -80,7 +81,7 @@ from context_agent.structured_logging import (
     close_structured_logger,
     configure_structured_logger,
 )
-from context_agent.task_lifecycle import reconcile_execution_states
+from context_agent.task_lifecycle import TaskLeaseHeartbeat, reconcile_execution_states
 from context_agent.task_state import (
     TaskConflict,
     TaskStateStore,
@@ -586,6 +587,7 @@ class TaskRegistry:
         *,
         task_id: str | None = None,
         request_id: str | None = None,
+        lease_guard: TaskLeaseHeartbeat | None = None,
     ) -> str:
         task = _Task(
             task_id=task_id or uuid4().hex,
@@ -727,6 +729,8 @@ class TaskRegistry:
                         terminal["error_type"] = str(result["error_type"])
                     if isinstance(result.get("blocker"), Mapping):
                         terminal["blocker"] = dict(result["blocker"])
+                    if isinstance(result.get("execution"), Mapping):
+                        terminal["execution"] = dict(result["execution"])
                     terminal["partial"] = bool(result.get("partial", False))
                     terminal["cursor_available"] = bool(result.get("next_cursor"))
                     if result.get("partial_reason"):
@@ -805,6 +809,7 @@ class TaskRegistry:
                             "Задача остановлена безопасно; изучите диагностику.",
                         ),
                         "retryable": error_code in _RETRYABLE_AGENT_FAILURES,
+                        "authority_reason": getattr(exc, "reason", None),
                     },
                 )
             except Exception as exc:  # backend boundary: never expose raw details
@@ -860,9 +865,18 @@ class TaskRegistry:
                     },
                 )
             finally:
+                if lease_guard is not None:
+                    lease_guard.close()
                 task.done.set()
 
-        self._executor.submit(runner)
+        try:
+            if lease_guard is not None:
+                lease_guard.start()
+            self._executor.submit(runner)
+        except BaseException:
+            if lease_guard is not None:
+                lease_guard.close()
+            raise
         return task.task_id
 
     def get(self, task_id: str) -> _Task:
@@ -1884,6 +1898,15 @@ def create_app(
                 tasks.cancel(owner)
         return _request_payload(request, status=body.status)
 
+    def job_execution(job_id: str) -> dict[str, object]:
+        with AutopilotStore(config.autopilot_database) as store:
+            job = store.details(job_id, unit_limit=1)
+        with TaskStateStore(config.context_database) as state:
+            saved = state.public_by_id(
+                str(job.get("task_identity") or ""), config.workspace
+            )
+        return execution_view(job, saved)
+
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
         if body.mode == "multitask" and tasks.active_count() >= 4:
@@ -2226,6 +2249,7 @@ def create_app(
         def tracked_operation(emit, cancelled):
             outcome = "blocked"
             evidence = "turn_failed; inspect diagnostics"
+            result = None
             try:
                 result = operation(emit, cancelled)
                 outcome = str(result.get("task_status", "partial"))
@@ -2239,6 +2263,8 @@ def create_app(
                             "cancelled" if cancelled.is_set() else outcome,
                             evidence,
                         )
+                if isinstance(result, dict) and result.get("job_id"):
+                    result["execution"] = job_execution(str(result["job_id"]))
 
         parent_request_id = diagnostics.start_request(
             query=body.query,
@@ -2290,6 +2316,16 @@ def create_app(
             tracked_operation,
             task_id=task_id,
             request_id=parent_request_id,
+            lease_guard=(
+                TaskLeaseHeartbeat(
+                    config.context_database,
+                    saved_task,
+                    seconds=config.task_lease_seconds,
+                    interval=config.task_heartbeat_seconds,
+                )
+                if saved_task is not None
+                else None
+            ),
         )
         return _request_payload(
             request,
@@ -2666,6 +2702,7 @@ def create_app(
                         config.task_lease_seconds,
                     )
             outcome = "blocked"
+            response_payload: dict[str, object] = {}
             try:
                 with _runtime_factory(config, provider_registry.snapshot()) as runtime:
                     controls = getattr(runtime, "set_turn_controls", None)
@@ -2696,14 +2733,19 @@ def create_app(
                         and workflow != "verification-only"
                     ):
                         outcome = "partial"
-                    return {
-                        "answer": result,
-                        "job_id": progress.job_id,
-                        "task_status": outcome,
-                        "runtime": (
-                            runtime._provider_failover_middleware.runtime_metadata()
-                        ),
-                    }
+                    response_payload.update(
+                        {
+                            "answer": result,
+                            "job_id": progress.job_id,
+                            "task_status": outcome,
+                            "error_type": progress.last_error_code or None,
+                            "blocker": progress.blocker or None,
+                            "runtime": (
+                                runtime._provider_failover_middleware.runtime_metadata()
+                            ),
+                        }
+                    )
+                    return response_payload
             finally:
                 if saved_task is not None:
                     with TaskStateStore(config.context_database) as state:
@@ -2712,6 +2754,8 @@ def create_app(
                             "cancelled" if cancelled.is_set() else outcome,
                             f"recovered_request:{task_id}; outcome:{outcome}",
                         )
+                if response_payload:
+                    response_payload["execution"] = job_execution(str(details["id"]))
                 with suppress(Exception):
                     repair_job_id = str(details["id"])
                     with AutopilotStore(config.autopilot_database) as store:
@@ -2828,26 +2872,11 @@ def create_app(
                 details = store.details(job_id)
             except ValueError as exc:
                 raise HTTPException(404, "Autopilot job not found") from exc
-        physical_workspace = str(config.workspace)
-        details["workspace"] = "/workspace"
-        for key in ("objective", "last_error_message", "report"):
-            value = details.get(key)
-            if isinstance(value, str):
-                details[key] = value.replace(physical_workspace, "/workspace")
-        for collection_key in ("verification_results", "work_units"):
-            collection = details.get(collection_key)
-            if isinstance(collection, list):
-                for item in collection:
-                    if not isinstance(item, dict):
-                        continue
-                    for key in ("output", "summary"):
-                        value = item.get(key)
-                        if isinstance(value, str):
-                            item[key] = value.replace(
-                                physical_workspace,
-                                "/workspace",
-                            )
-        return _request_payload(request, job=details)
+        if details.get("workspace") != str(config.workspace.resolve()):
+            raise HTTPException(404, "Autopilot job not found")
+        return _request_payload(
+            request, job=public_job_details(details, job_execution(job_id))
+        )
 
     @app.post("/api/jobs/{job_id}/repair-proposals")
     def repair_proposals(request: Request, job_id: str):
@@ -2951,6 +2980,19 @@ def create_app(
                 already_dispatched = str(relation["status"]) != "approved"
                 repair_task_id = str(relation["repair_task_id"])
                 repair_job_id = str(relation["repair_job_id"])
+
+            if already_dispatched:
+                # An idempotency replay is read-only even for a BLOCKED job.
+                # enqueue() is a resume operation and must not be called here.
+                return _request_payload(
+                    request,
+                    source_job_id=job_id,
+                    repair_job_id=repair_job_id,
+                    repair_task_id=repair_task_id,
+                    task_id="",
+                    relation_status=str(relation["status"]),
+                    reused=True,
+                )
 
             route = RoutingDecision(
                 execution="persistent",

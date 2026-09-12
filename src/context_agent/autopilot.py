@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -358,7 +359,8 @@ class AutopilotHeartbeat:
 
     def __exit__(self, *_: object) -> None:
         self._stop.set()
-        self._thread.join(timeout=max(1.0, self._interval_seconds + 0.5))
+        if self._thread.ident is not None:
+            self._thread.join(timeout=2)
 
     def ensure_owned(self) -> None:
         """Fail closed before the caller commits work-unit state."""
@@ -899,9 +901,48 @@ class AutopilotStore:
     ) -> None:
         if not lease.token:
             return
+        deadline = time.monotonic() + 1
+        for attempt in range(8):
+            try:
+                with closing(sqlite3.connect(self.database_path, timeout=0.05)) as db:
+                    row = db.execute(
+                        "SELECT lease_until FROM autopilot_jobs WHERE id=?",
+                        (lease.job_id,),
+                    ).fetchone()
+                    remaining = float(row[0] or 0) - time.time() if row else 0
+                    deadline = min(deadline, time.monotonic() + remaining - 0.01)
+                    if remaining <= 0.01:
+                        raise AutopilotLeaseError("Autopilot job lease expired")
+                    if time.monotonic() >= deadline:
+                        raise AutopilotLeaseError("job_lease_storage_unavailable")
+                    busy_ms = max(1, int(min(0.05, remaining / 2) * 1000))
+                    db.execute(f"PRAGMA busy_timeout={busy_ms}")
+                    with db:
+                        db.execute("BEGIN IMMEDIATE")
+                        self._renew_lease_transaction(db, lease, lease_seconds, unit_id)
+                    return
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise AutopilotLeaseError("job_lease_storage_unavailable") from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.02 * (attempt + 1), remaining))
+            except (sqlite3.Error, OSError) as exc:
+                raise AutopilotLeaseError("job_lease_storage_unavailable") from exc
+        raise AutopilotLeaseError("job_lease_storage_unavailable")
+
+    @staticmethod
+    def _renew_lease_transaction(
+        db: sqlite3.Connection,
+        lease: AutopilotLease,
+        lease_seconds: int,
+        unit_id: str | None,
+    ) -> None:
         now = time.time()
-        with self._lock, self._connection:
-            cursor = self._connection.execute(
+        with db:
+            cursor = db.execute(
                 """
                 UPDATE autopilot_jobs SET lease_until = ?, last_heartbeat_at = ?,
                     updated_at = ?
@@ -921,7 +962,7 @@ class AutopilotStore:
             if cursor.rowcount == 0:
                 raise AutopilotLeaseError("Autopilot job lease was lost")
             if unit_id is not None:
-                unit_cursor = self._connection.execute(
+                unit_cursor = db.execute(
                     """
                     UPDATE autopilot_work_units SET last_heartbeat_at = ?
                     WHERE id = ? AND job_id = ? AND lease_generation = ?
@@ -1378,6 +1419,61 @@ class AutopilotStore:
         )
         return self.progress(lease.job_id)
 
+    def abort_execution(
+        self, lease: AutopilotLease, *, error_code: str, reason: str = ""
+    ) -> AutopilotProgress:
+        """Fence and terminate an escaping controller error, including VERIFY."""
+        status = "cancelled" if error_code == "task_cancelled" else "blocked"
+        now = time.time()
+        blocker = json.dumps(
+            {
+                "category": error_code,
+                "reason": reason,
+                "required_action": "Inspect preserved evidence before explicit resume.",
+                "summary": "Execution stopped before verified completion.",
+            }
+        )
+        with self._lock, self._connection:
+            self._require_lease(lease)
+            units = self._connection.execute(
+                "SELECT id, started_at FROM autopilot_work_units "
+                "WHERE job_id=? AND lease_generation=? AND status='running'",
+                (lease.job_id, lease.generation),
+            ).fetchall()
+            elapsed = 0.0
+            for unit in units:
+                started = self._unit_monotonic_starts.pop(str(unit["id"]), None)
+                elapsed += max(0, time.monotonic() - started) if started else 0
+            self._connection.execute(
+                "UPDATE autopilot_work_units SET status='interrupted', "
+                "error_code=?, finished_at=? WHERE job_id=? AND lease_generation=? "
+                "AND status='running'",
+                (error_code, now, lease.job_id, lease.generation),
+            )
+            self._connection.execute(
+                "UPDATE autopilot_jobs SET status=?, resume_phase=phase, phase=?, "
+                "verification_status=CASE WHEN phase='verify' THEN 'not_run' "
+                "ELSE verification_status END, last_error_code=?, "
+                "last_error_message='Execution stopped before verified completion.', "
+                "blocker_json=?, lease_token=NULL, lease_until=NULL, "
+                "control_requested=NULL, active_time_seconds=active_time_seconds+?, "
+                "updated_at=?, finished_at=? WHERE id=? AND lease_token=? "
+                "AND lease_generation=?",
+                (
+                    status,
+                    status,
+                    error_code,
+                    blocker,
+                    elapsed,
+                    now,
+                    now,
+                    lease.job_id,
+                    lease.token,
+                    lease.generation,
+                ),
+            )
+        return self.progress(lease.job_id)
+
     def mark_blocked(
         self,
         lease: AutopilotLease,
@@ -1807,7 +1903,12 @@ class AutopilotStore:
             ]
         details = dict(row)
         details.pop("lease_token", None)
-        details.pop("lease_until", None)
+        lease_until = details.pop("lease_until", None)
+        details["job_lease_remaining_seconds"] = (
+            round(max(0, float(lease_until or 0) - time.time()), 3)
+            if details["status"] == "running"
+            else 0
+        )
         try:
             details["verification_results"] = json.loads(
                 str(details.get("verification_results") or "[]")

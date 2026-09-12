@@ -17,7 +17,8 @@ const pageTitles: Record<string, string> = {
 let csrfToken = "";
 const activeChatTasks = new Set<string>();
 let activeChatJob = "";
-let currentThread = "web";
+let threadLoadGeneration = 0;
+let currentThread = window.sessionStorage.getItem("dca_thread") || "web";
 let archivedContextTokens = 0;
 let contextTokenLimit = 80_000;
 let currentFilePath = "";
@@ -102,7 +103,14 @@ async function api<T extends Payload>(
   if (options.method && options.method !== "GET") {
     headers.set("x-csrf-token", csrfToken);
   }
-  const response = await fetch(path, { ...options, headers });
+  let response: Response;
+  try {
+    response = await fetch(path, { ...options, headers });
+  } catch (error) {
+    const connection = document.getElementById("chat-connection");
+    if (connection) connection.textContent = "Нет связи / Offline. Состояние выполнения неизвестно.";
+    throw error;
+  }
   const body = (await response.json().catch(() => ({}))) as T & {
     error?: { message?: string };
   };
@@ -115,11 +123,24 @@ async function api<T extends Payload>(
 function streamTask(
   taskId: string,
   handler: (name: string, data: Payload) => void,
+  streamThread: string = currentThread,
 ): EventSource {
   const stream = new EventSource(`/api/events/${encodeURIComponent(taskId)}`);
   const terminal = new Set(["completed", "partial", "blocked", "cancelled", "failed"]);
   let terminalSeen = false;
   let recoveryPending = false;
+  const deliver = (name: string, data: Payload): void => {
+    const execution = data.execution && typeof data.execution === "object"
+      ? data.execution as Payload : null;
+    const jobId = text(execution?.job_id) || text(data.job_id);
+    if (jobId) window.sessionStorage.setItem(`dca_job_${streamThread}`, jobId);
+    if (execution && currentThread === streamThread) showExecutionSummary(execution);
+    handler(name, data);
+  };
+  stream.onopen = () => {
+    const connection = document.getElementById("chat-connection");
+    if (connection) connection.textContent = "Связь восстановлена / Connected";
+  };
   for (const name of [
     "started",
     "execution",
@@ -141,7 +162,7 @@ function streamTask(
     stream.addEventListener(name, (rawEvent) => {
       const event = rawEvent as MessageEvent<string>;
       const data = JSON.parse(event.data) as Payload;
-      handler(name, data);
+      deliver(name, data);
       if (terminal.has(name)) {
         terminalSeen = true;
         stream.close();
@@ -160,14 +181,16 @@ function streamTask(
               ? (status.terminal as Payload)
               : {};
           terminalSeen = true;
-          handler(statusName, terminalData);
+          deliver(statusName, terminalData);
           stream.close();
           return;
         }
         showToast("Поток прерван; выполняется автоматическое переподключение");
       })
       .catch(() => {
-        showToast("Не удалось проверить состояние задачи; поток переподключается");
+        const connection = document.getElementById("chat-connection");
+        if (connection) connection.textContent = "Нет связи / Offline. Состояние выполнения неизвестно.";
+        showToast("Сервер недоступен. Состояние задачи неизвестно; переподключение не запускает её заново.");
       })
       .finally(() => {
         recoveryPending = false;
@@ -234,7 +257,11 @@ function visibleArchivedMessage(role: string, content: string): string {
 }
 
 async function loadThread(threadId: string): Promise<void> {
+  const generation = ++threadLoadGeneration;
   currentThread = threadId;
+  activeChatJob = "";
+  for (const id of ["chat-job-status", "chat-job-technical"]) element(id).hidden = true;
+  window.sessionStorage.setItem("dca_thread", threadId);
   element("current-thread-label").textContent = threadId;
   const output = element("chat-output");
   output.replaceChildren();
@@ -245,6 +272,7 @@ async function loadThread(threadId: string): Promise<void> {
   }>(
     `/api/threads/${encodeURIComponent(threadId)}/messages?limit=200`,
   );
+  if (generation !== threadLoadGeneration) return;
   applyContextUsage(result.context_usage);
   for (const item of result.items) {
     const role = text(item.role);
@@ -268,6 +296,11 @@ async function loadThread(threadId: string): Promise<void> {
     refreshChatJobs(),
     loadThreadModelPreference(threadId),
   ]);
+  const savedJob = window.sessionStorage.getItem(`dca_job_${threadId}`);
+  if (savedJob && generation === threadLoadGeneration) {
+    const details = await api<Payload>(`/api/jobs/${encodeURIComponent(savedJob)}`);
+    if (generation === threadLoadGeneration) showJobSummary(details);
+  }
 }
 
 async function refreshThreads(): Promise<void> {
@@ -312,12 +345,13 @@ async function sendChatMessage(): Promise<void> {
   element<HTMLTextAreaElement>("chat-query").value = "";
   updateContextMeter();
   let taskId = "";
+  const submittedThread = currentThread;
   try {
     const result = await api<Payload>("/api/chat", {
       method: "POST",
       body: JSON.stringify({
         query,
-        thread_id: currentThread,
+        thread_id: submittedThread,
         auto_context: checked("auto-context"),
         mode: workMode,
         allow_write: checked("chat-write"),
@@ -344,6 +378,13 @@ async function sendChatMessage(): Promise<void> {
       setOperationStatus("chat-job-status", summary);
     }
     streamTask(taskId, (name, data) => {
+      if (currentThread !== submittedThread) {
+        if (["completed", "partial", "blocked", "cancelled", "failed"].includes(name)) {
+          activeChatTasks.delete(taskId);
+          updateCancelButton();
+        }
+        return;
+      }
       if (name === "execution") {
         const routing =
           data.routing && typeof data.routing === "object"
@@ -410,7 +451,7 @@ async function sendChatMessage(): Promise<void> {
           .then((usage) => applyContextUsage(usage.context_usage))
           .catch(() => undefined);
       }
-    });
+    }, submittedThread);
   } catch (error) {
     pending.textContent = error instanceof Error ? error.message : "Ошибка чата";
     pending.parentElement?.classList.remove("pending");
@@ -503,10 +544,33 @@ function formatJobProgress(data: Payload, eventName: string): string {
   return `${prefix}: ${workflowLabels[workflow] || workflow}, фаза ${text(data.phase)}, generation ${text(data.lease_generation)}, последняя активность в ${heartbeat}${fileProgress}, units завершено ${text(data.completed_units)}, передано ${text(data.yielded_units)}, ошибок ${text(data.failed_units)}, прервано ${text(data.interrupted_units)}, replans ${text(data.replans)}, файлов изменено ${text(data.changed_files)}, проверок ${text(data.checks_run)}${operationStatus}${discovery}${budgets}.${nextStep}${blockerStatus}`;
 }
 
+function showExecutionSummary(view: Payload): void {
+  const checks = Array.isArray(view.checks) ? view.checks as Payload[] : [];
+  const labels: Record<string, string> = {
+    blocked: "Остановлена / Blocked", complete: "Этап завершён / Complete",
+    partial: "Частичный результат / Partial", running: "Выполняется / Running",
+    cancelled: "Отменена / Cancelled", finalization_pending: "Синхронизация результата / Finalizing",
+  };
+  setOperationStatus("chat-job-status",
+    `${labels[text(view.display_status)] || text(view.display_status)} · Проект / Project: ${text(view.project_root)} · Окружение / Environment: ${text(view.environment_label)} · Проверки / Checks: ${checks.map(c => `${text(c.check)} ${text(c.status)}`).join(", ") || "не запускались / not run"}${view.error_code ? ` · Причина / Reason: ${text(view.error_code)}` : ""}`,
+    view.display_status === "complete" && view.verification_status === "passed" ? "success" : "normal",
+  );
+  element("chat-job-status").hidden = false;
+  const details = element("chat-job-technical");
+  details.hidden = false;
+  const output = details.querySelector("pre");
+  if (output) output.textContent = JSON.stringify(view, null, 2);
+}
+
 function showJobSummary(data: Payload): void {
   const job =
     data.job && typeof data.job === "object" ? (data.job as Payload) : data;
   activeChatJob = text(job.id) || activeChatJob;
+  window.sessionStorage.setItem(`dca_job_${currentThread}`, activeChatJob);
+  if (job.execution && typeof job.execution === "object") {
+    showExecutionSummary(job.execution as Payload);
+    return;
+  }
   const progress =
     job.progress && typeof job.progress === "object"
       ? (job.progress as Payload)
@@ -542,10 +606,10 @@ async function refreshChatJobs(): Promise<void> {
   const selector = element<HTMLSelectElement>("chat-task");
   selector.replaceChildren(new Option("Автоматически / Auto", ""));
   for (const task of objectives.items) {
-    if (["partial", "blocked", "interrupted", "running", "finalization_pending"].includes(text(task.status))) {
-      const pending = task.status === "finalization_pending";
+    if (["partial", "blocked", "interrupted", "running", "finalization_pending", "reconciliation_required"].includes(text(task.status))) {
+      const pending = ["finalization_pending", "reconciliation_required"].includes(text(task.status));
       const option = new Option(
-        `${text(task.task_id).slice(0, 8)} · ${text(task.workflow)} · ${pending ? "Синхронизация результата / Finalizing" : text(task.status)} · r${text(task.revision)}`,
+        `${text(task.task_id).slice(0, 8)} · ${text(task.workflow)} · ${task.status === "reconciliation_required" ? "Требуется сверка / Reconciliation required" : pending ? "Синхронизация результата / Finalizing" : text(task.status)} · r${text(task.revision)}`,
         text(task.task_id),
       );
       option.disabled = pending;
@@ -580,8 +644,9 @@ async function refreshChatJobs(): Promise<void> {
     button.title = text(item.objective);
     button.addEventListener("click", () => {
       const jobId = text(item.id);
+      const selectedThread = currentThread;
       void api<Payload>(`/api/jobs/${encodeURIComponent(jobId)}`)
-        .then(showJobSummary)
+        .then((details) => { if (currentThread === selectedThread) showJobSummary(details); })
         .catch((error: Error) => showToast(error.message));
     });
     row.append(button);
@@ -1464,6 +1529,8 @@ async function saveAdaptiveRouting(): Promise<void> {
 }
 
 async function bootstrap(): Promise<void> {
+  const requestedPanel = window.location.hash.slice(1);
+  if (pageTitles[requestedPanel]) navigate(requestedPanel);
   await refreshRuntimeStatus(true);
   const health = await api<Payload>("/api/health");
   element("health").textContent = JSON.stringify(health, null, 2);
@@ -1476,8 +1543,7 @@ async function bootstrap(): Promise<void> {
     loadDirectory("/workspace", false),
     loadThreadModelPreference(currentThread),
   ]);
-  const requestedPanel = window.location.hash.slice(1);
-  if (pageTitles[requestedPanel]) navigate(requestedPanel);
+  await loadThread(currentThread);
 }
 
 const modeHelp: Record<string, string> = {

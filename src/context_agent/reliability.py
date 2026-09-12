@@ -20,9 +20,10 @@ from context_agent.errors import AgentError
 class ExecutionStopped(AgentError):  # noqa: N818 -- internal control-flow signal
     """A deterministic stop that must not trigger model or graph replay."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, reason: str | None = None):
         super().__init__(code)
         self.code = code
+        self.reason = reason
 
 
 def repeated_prose(text: str) -> bool:

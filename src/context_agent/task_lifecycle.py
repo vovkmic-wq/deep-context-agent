@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 from context_agent.task_state import SavedTask, TaskConflict, TaskStateStore
@@ -29,6 +30,8 @@ class TaskLeaseHeartbeat:
         self.task = task
         self.seconds = seconds
         self.interval = interval
+        self.reason: str | None = None
+        self._lease_deadline = time.monotonic() + max(0, task.lease_until - time.time())
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread = threading.Thread(
@@ -50,14 +53,42 @@ class TaskLeaseHeartbeat:
             self._thread.join(timeout=2)
 
     def _renew(self) -> bool:
-        try:
-            with TaskStateStore(self.database, timeout_seconds=0.25) as store:
-                renewed = store.renew(self.task, self.seconds)
-        except (sqlite3.Error, OSError):
-            renewed = False
-        if not renewed:
-            self._lost.set()
-        return renewed
+        # Retry only transient contention. A successful renewal never revives an
+        # expired/replaced owner, and does not reset any model/work-unit budget.
+        safety = min(0.1, self.seconds / 10)
+        deadline = min(time.monotonic() + 1, self._lease_deadline - safety)
+        for attempt in range(8):
+            started = time.monotonic()
+            if started >= deadline:
+                break
+            try:
+                with TaskStateStore(
+                    self.database, timeout_seconds=min(0.05, deadline - started)
+                ) as store:
+                    if store.renew(self.task, self.seconds):
+                        self.reason = None
+                        self._lease_deadline = max(
+                            self._lease_deadline, started + self.seconds
+                        )
+                        return True
+                    self.reason = store.authority_reason(self.task) or "revoked"
+                    break
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    self.reason = "storage_unavailable"
+                    break
+                self.reason = "storage_unavailable"
+                if self._stop.wait(
+                    min(0.02 * (attempt + 1), max(0, deadline - time.monotonic()))
+                ):
+                    return False
+            except (sqlite3.Error, OSError):
+                self.reason = "storage_unavailable"
+                break
+        self.reason = self.reason or "expired"
+        self._lost.set()
+        return False
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
@@ -69,6 +100,7 @@ def reconcile_execution_states(database: Path, jobs_database: Path) -> int:
     """Recover task projections from fenced job evidence, without restarting jobs."""
     with TaskStateStore(database, timeout_seconds=0.25) as state:
         count = state.reconcile_terminals()
+        count += state.reconcile_unlinked_expired()
         if not jobs_database.is_file():
             return count
         jobs = sqlite3.connect(

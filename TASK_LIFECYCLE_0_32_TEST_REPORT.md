@@ -1,5 +1,22 @@
 # Проверки lifecycle 0.32 — 2026-09-09
 
+Продолжение R1 от 2026-09-12: schema 2/provenance и saved-root-before-discovery,
+namespace/custom origins на реальных venv, persistent root scan с CAS и отменой.
+Последние два live проверяют context parent/task/job IDs и пять checks PASS;
+повтор Web subprocess cancellation — 0.313 s. Артефакты и актуальные счётчики
+в [release matrix](RELEASE_COMPLETION_0_32_ACCEPTANCE.md). A23 Unix/symlink не закрыт.
+
+Актуальное дополнение 2026-09-12: [матрица и live-артефакты](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
+Добавлены реальные process cancellation/preflight/descendant tests, SQLite busy
+task/job, queue wait, fair cursor, copied legacy DB, terminal approval replay,
+safe execution DTO и HTTP fallback tests. Два real LLM end-to-end и браузерные
+verification/reload/restart/offline выполнены. Исторические результаты ниже
+сохранены для трассировки; они не заменяют новые release gates.
+
+Этот отчёт сохраняет факты проведённых тестов. Новая матрица
+[C01–C18](DEEP_CONTEXT_AGENT_0_32_RELEASE_COMPLETION_SPEC.md) требует отдельного
+сопоставления доказательств; существующие PASS не закрывают её автоматически.
+
 Изолированные сценарии находятся в `tests/test_task_lifecycle_acceptance.py`.
 Каждый из пяти сценариев выполняется дважды на чистых временных SQLite.
 Пользовательские workspace, задачи, сервер и базы не изменяются.

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import SequenceChatModel
+from conftest import SequenceChatModel, complete_check_results
 from langchain_core.messages import AIMessage
 
 from context_agent.autopilot import (
@@ -22,7 +22,75 @@ from context_agent.autopilot import (
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.errors import AgentError, ConfigurationError
 from context_agent.project_checks import ProjectCheckResult
+from context_agent.reliability import ExecutionStopped
 from context_agent.runtime import AgentRuntime
+
+
+def test_cancel_during_verify_does_not_leave_running_job(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.prepare_directories()
+    (config.workspace / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    with AgentRuntime(
+        config, _provider(), model=SequenceChatModel(responses=[])
+    ) as runtime:
+
+        def cancelled(**kwargs):
+            raise ExecutionStopped("task_cancelled")
+
+        monkeypatch.setattr(runtime.project_check_runner, "run", cancelled)
+        with pytest.raises(ExecutionStopped, match="task_cancelled"):
+            runtime.run_autopilot_job(
+                "Run verification only for /workspace",
+                workflow="verification-only",
+                thread_id="cancel-verifier",
+                allow_write=False,
+            )
+        job = runtime.autopilot_store.list_jobs(workspace=config.workspace)[0]
+        details = runtime.autopilot_store.details(str(job["id"]))
+        assert job["status"] == "cancelled"
+        assert job["last_error_code"] == "task_cancelled"
+        assert all(unit["status"] != "running" for unit in details["work_units"])
+        assert job["verification_status"] != "passed"
+
+
+def test_abort_execution_cannot_overwrite_replacement(tmp_path, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("context_agent.autopilot.time.time", lambda: now[0])
+    with AutopilotStore(tmp_path / "jobs.sqlite3") as store:
+        arguments = dict(
+            thread_id="abort-fence",
+            objective="Verify project",
+            workspace=tmp_path,
+            allow_write=False,
+            batch_size=1,
+            lease_seconds=10,
+        )
+        _, old = store.start_or_resume(**arguments)
+        now[0] = 111
+        current, replacement = store.start_or_resume(**arguments)
+        with pytest.raises(AutopilotLeaseError):
+            store.abort_execution(old, error_code="task_cancelled")
+        store.assert_lease(replacement)
+        assert store.progress(current.job_id).status == "running"
+
+
+def test_initial_heartbeat_failure_is_not_masked_by_unstarted_thread(
+    tmp_path, monkeypatch
+):
+    with AgentRuntime(
+        _config(tmp_path), _provider(), model=SequenceChatModel(responses=[])
+    ) as runtime:
+
+        def failed_renewal(*args, **kwargs):
+            raise AutopilotLeaseError("synthetic first renewal failure")
+
+        monkeypatch.setattr(runtime.autopilot_store, "renew_lease", failed_renewal)
+        with pytest.raises(ExecutionStopped, match="task_authority_lost") as error:
+            runtime.run_autopilot_job(
+                "Verify fixture project", thread_id="failed-start"
+            )
+        assert error.value.reason == "job_lease_lost"
+        assert "synthetic first renewal failure" in str(error.value.__cause__)
 
 
 def _mock_verified_project(runtime, monkeypatch, passed):
@@ -31,7 +99,7 @@ def _mock_verified_project(runtime, monkeypatch, passed):
 
     def run(*, project_root):
         assert project_root == root.resolve()
-        return [passed]
+        return complete_check_results(project_root)
 
     monkeypatch.setattr(runtime.project_check_runner, "run", run)
 
@@ -905,7 +973,12 @@ def test_allow_write_job_requires_current_verification_pass(
         details = store.details(str(job["id"]))
     assert details["status"] == "complete"
     assert details["verification_status"] == "passed"
-    assert details["verification_results"][0]["check"] == "pytest"
+    assert [item["check"] for item in details["verification_results"]] == [
+        "ruff_check",
+        "ruff_format_check",
+        "pytest",
+        "compileall",
+    ]
 
 
 def test_persistent_log_analysis_does_not_create_project_audit(
@@ -1309,14 +1382,6 @@ def test_verification_only_starts_at_verify_and_never_calls_model(
     nested.mkdir()
     (nested / "pyproject.toml").write_text("[project]\nname='ozon'\n")
     model = SequenceChatModel(responses=[AIMessage(content="must not be called")])
-    passed = ProjectCheckResult(
-        check="pytest",
-        command=("python", "-m", "pytest"),
-        return_code=0,
-        duration_seconds=0.01,
-        status="passed",
-        output="1 passed",
-    )
     roots: list[Path | None] = []
 
     def run_checks(
@@ -1325,7 +1390,7 @@ def test_verification_only_starts_at_verify_and_never_calls_model(
         project_root: Path | None = None,
     ) -> list[ProjectCheckResult]:
         roots.append(project_root)
-        return [passed]
+        return complete_check_results(project_root)
 
     with AgentRuntime(config, _provider(), model=model) as runtime:
         monkeypatch.setattr(runtime.project_check_runner, "run", run_checks)
