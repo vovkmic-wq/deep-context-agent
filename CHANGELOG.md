@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- CI/Linux выявил Windows-only ctypes/subprocess API в неподходящих ветках
+  статического анализа: добавлены явные sys.platform guards, без type-ignore.
+
 - По stack trace чистого CI: явный sync checkpoint commit на каждом model/tool
   шаге, regression на малом executor. Устранение ожидания фоновых checkpoint/delta
   futures проверяется на новых dependencies, без увеличения timeout/прав.

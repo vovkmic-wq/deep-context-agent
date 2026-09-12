@@ -51,7 +51,7 @@ jobs:
         run: python -m pytest tests/test_unix_verification_acceptance.py -v -ra
       - name: Pytest including real subprocess and POSIX acceptance
         timeout-minutes: 8
-        run: python -m pytest -v -ra --durations=15 -o faulthandler_timeout=60 --junitxml=pytest-results.xml
+        run: python -m pytest -vv -ra --durations=15 -o faulthandler_timeout=60 --junitxml=pytest-results.xml
       - name: Mypy
         run: python -m mypy src/context_agent --ignore-missing-imports
       - name: Compile

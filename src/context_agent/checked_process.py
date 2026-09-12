@@ -6,6 +6,7 @@ import ctypes
 import os
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -15,7 +16,7 @@ from pathlib import Path
 def _stop_tree(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
-    if os.name == "nt":
+    if sys.platform == "win32":
         directory = ctypes.create_unicode_buffer(32768)
         if ctypes.windll.kernel32.GetSystemDirectoryW(directory, len(directory)):
             subprocess.run(
@@ -57,6 +58,9 @@ def run_checked_process(
     if shell or check or not capture_output or not text:
         raise ValueError("Unsupported verification process options")
     check_authority()
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
     with subprocess.Popen(
         command,
         cwd=cwd,
@@ -68,7 +72,7 @@ def run_checked_process(
         errors=errors,
         shell=False,
         start_new_session=os.name != "nt",
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        creationflags=creation_flags,
     ) as process:
         deadline = time.monotonic() + timeout
         try:

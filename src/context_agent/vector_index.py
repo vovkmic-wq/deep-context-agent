@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,7 +79,7 @@ def automatic_batch_size() -> int:
 
 
 def _available_memory_bytes() -> int | None:
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             import ctypes
 

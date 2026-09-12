@@ -23,6 +23,12 @@ Runtime теперь явно выбирает durability="sync"; тест пр�
 после — PASS в обоих локальных наборах dependencies. Полный CI/live повторяется;
 отменённые прогоны не учитываются как полная успешная регрессия.
 
+Candidate 53ac647 / run 34676102181: после sync оба Ubuntu pytest завершились
+(Python 3.11: 518 passed, A23 отдельно 2 passed). Windows job полностью PASS.
+Linux mypy выявил четыре Windows-only attribute references в checked_process и
+vector_index: исправлены sys.platform guards, без отключения type checks.
+Локальный mypy --platform linux на правке PASS; CI повторяется для native evidence.
+
 | ID | Статус | Доказательство / границы |
 | --- | --- | --- |
 | C01 | PASS | Typed schema 2: test_verification_provenance.py, context store, frozen repair transfer; два расширенных live проверяют task/job attribution и parent context после restart |
