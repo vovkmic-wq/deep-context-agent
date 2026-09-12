@@ -46,8 +46,12 @@ jobs:
         run: python -m ruff check --no-cache .
       - name: Ruff format
         run: python -m ruff format --check --no-cache .
+      - name: Required real POSIX symlink acceptance
+        if: runner.os == 'Linux'
+        run: python -m pytest tests/test_unix_verification_acceptance.py -v -ra
       - name: Pytest including real subprocess and POSIX acceptance
-        run: python -m pytest -ra --junitxml=pytest-results.xml
+        timeout-minutes: 8
+        run: python -m pytest -v -ra --durations=15 -o faulthandler_timeout=60 --junitxml=pytest-results.xml
       - name: Mypy
         run: python -m mypy src/context_agent --ignore-missing-imports
       - name: Compile
