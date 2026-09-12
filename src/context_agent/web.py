@@ -81,6 +81,7 @@ from context_agent.structured_logging import (
     close_structured_logger,
     configure_structured_logger,
 )
+from context_agent.task_actions import TaskActionStore, task_action_view
 from context_agent.task_lifecycle import TaskLeaseHeartbeat, reconcile_execution_states
 from context_agent.task_state import (
     TaskConflict,
@@ -282,11 +283,34 @@ class ChatRequest(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=200)
     model_policy: Literal["auto", "manual"] | None = None
     continuation_task_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    explicit_action: Literal["continue", "continue_verification"] | None = None
+    expected_revision: int | None = Field(default=None, ge=1)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class TaskStateControlRequest(BaseModel):
     status: Literal["completed", "cancelled"]
     revision: int = Field(ge=1)
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str = Field(default="web", min_length=1, max_length=100)
+    expected_revision: int = Field(ge=1)
+    action: Literal["continue", "continue_verification"] = "continue"
+    allow_write: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class ReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    thread_id: str = Field(default="web", min_length=1, max_length=100)
+    expected_revision: int = Field(ge=1)
+
+
+class LinkedVerificationRequest(ReconcileRequest):
+    confirmed: Literal[True]
+    project_root: str = Field(min_length=1, max_length=1000)
+    idempotency_key: str = Field(min_length=8, max_length=128)
 
 
 class AuditRequest(BaseModel):
@@ -1871,7 +1895,10 @@ def create_app(
     @app.get("/api/threads/{thread_id}/active-tasks")
     def active_objectives(request: Request, thread_id: str):
         with TaskStateStore(config.context_database) as state:
-            items = [task.public() for task in state.list(thread_id, config.workspace)]
+            items = [
+                task_action_view(task)
+                for task in state.list(thread_id, config.workspace)
+            ]
         return _request_payload(request, items=items)
 
     @app.patch("/api/threads/{thread_id}/active-tasks/{objective_id}")
@@ -1907,14 +1934,299 @@ def create_app(
             )
         return execution_view(job, saved)
 
+    @app.post("/api/tasks/{objective_id}/resume", status_code=202)
+    def resume_objective(request: Request, objective_id: str, body: ResumeRequest):
+        return dispatch_task_action(
+            request,
+            objective_id,
+            body.thread_id,
+            body.expected_revision,
+            body.action,
+            body.idempotency_key,
+            allow_write=body.allow_write,
+        )
+
+    @app.post("/api/tasks/{objective_id}/reconcile")
+    def reconcile_objective(
+        request: Request, objective_id: str, body: ReconcileRequest
+    ):
+        return dispatch_task_action(
+            request,
+            objective_id,
+            body.thread_id,
+            body.expected_revision,
+            "reconcile",
+            None,
+        )
+
+    @app.post("/api/tasks/{objective_id}/verification", status_code=202)
+    def linked_verification(
+        request: Request, objective_id: str, body: LinkedVerificationRequest
+    ):
+        return dispatch_task_action(
+            request,
+            objective_id,
+            body.thread_id,
+            body.expected_revision,
+            "create_verification",
+            body.idempotency_key,
+            project_root=body.project_root,
+        )
+
+    def dispatch_task_action(
+        request: Request,
+        objective_id: str,
+        thread: str,
+        revision: int,
+        action: str,
+        idempotency_key: str | None,
+        *,
+        allow_write: bool = False,
+        project_root: str | None = None,
+        mode: WorkMode = "agent",
+    ) -> dict[str, object] | JSONResponse:
+        started = time.monotonic()
+        evidence = {
+            "action": action,
+            "task_id": objective_id,
+            "expected_revision": revision,
+            "allow_write": allow_write,
+            "project_root": project_root,
+            "mode": mode,
+        }
+        diagnostic_id = diagnostics.start_request(
+            query=json.dumps(evidence),
+            thread_id=thread,
+            operation_kind="task_action",
+            source="web",
+            app_version=__version__,
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            task_id=objective_id,
+        )
+        reservation = None
+        try:
+            if action == "continue_verification" and mode in {"ask", "plan"}:
+                raise TaskConflict("ACTION_NOT_AVAILABLE_IN_MODE")
+            with TaskActionStore(
+                config.context_database,
+                workspace=config.workspace,
+                autopilot_database=config.autopilot_database,
+            ) as actions:
+                if action == "reconcile":
+                    item = actions.reconcile(
+                        task_id=objective_id, thread=thread, expected_revision=revision
+                    )
+                    result = _request_payload(
+                        request, item=item, diagnostic_id=diagnostic_id
+                    )
+                else:
+                    key = (
+                        idempotency_key
+                        or hashlib.sha256(
+                            json.dumps(evidence, sort_keys=True).encode()
+                        ).hexdigest()
+                    )
+                    reservation = actions.reserve(
+                        task_id=objective_id,
+                        thread=thread,
+                        action=action,
+                        expected_revision=revision,
+                        idempotency_key=key,
+                        project_root=project_root,
+                        allow_write=allow_write,
+                    )
+                    if not reservation.created:
+                        recovered = diagnostics.task(reservation.execution_id)
+                        replay = dict(reservation.result)
+                        if recovered is not None:
+                            replay.update(
+                                task_id=reservation.execution_id,
+                                active_task_id=reservation.linked_task_id
+                                or objective_id,
+                                status=recovered["status"],
+                            )
+                        elif not replay.get("task_id"):
+                            replay.update(
+                                reason_code=replay.get("reason_code")
+                                or "ACTION_DISPATCH_UNCONFIRMED",
+                                available_actions=["reconcile"],
+                                recovery_message=(
+                                    "Сверьте состояние. Повторная отправка запрещена. "
+                                    "Новую проверку создайте отдельной задачей "
+                                    "с явным корнем проекта."
+                                ),
+                            )
+                            if reservation.linked_task_id:
+                                with TaskStateStore(config.context_database) as state:
+                                    child_view = state.public_by_id(
+                                        reservation.linked_task_id, config.workspace
+                                    )
+                                if child_view:
+                                    replay.update(
+                                        active_task_id=reservation.linked_task_id,
+                                        recovery_message=(
+                                            "Связанная проверка сохранена, но отправка "
+                                            "не подтверждена. Выберите её и нажмите "
+                                            "«Продолжить проверки»."
+                                        ),
+                                    )
+                        result = _request_payload(
+                            request,
+                            **{
+                                **replay,
+                                "reused": True,
+                                "action_status": reservation.status,
+                                "diagnostic_id": diagnostic_id,
+                            },
+                        )
+                    else:
+                        if action == "create_verification":
+                            child = actions.create_linked_verification(reservation)
+                            target_id, target_revision = child.id, child.revision
+                        else:
+                            target_id, target_revision = objective_id, revision
+                        result = submit_chat(
+                            request,
+                            ChatRequest(
+                                query="Continue using current runtime evidence.",
+                                mode=mode,
+                                thread_id=thread,
+                                continuation_task_id=target_id,
+                                explicit_action=cast(
+                                    Literal["continue", "continue_verification"],
+                                    "continue_verification"
+                                    if action == "create_verification"
+                                    else action,
+                                ),
+                                expected_revision=target_revision,
+                                allow_write=allow_write
+                                if action != "create_verification"
+                                else False,
+                                auto_context=False,
+                            ),
+                            execution_id=reservation.execution_id,
+                        )
+                        result.update(active_task_id=target_id, reused=False)
+                        actions.mark_dispatched(reservation, result)
+        except Exception as exc:
+            expected = isinstance(exc, (TaskConflict, ValueError, HTTPException))
+            detail = (
+                str(exc.detail)
+                if isinstance(exc, HTTPException)
+                else str(exc)
+                if expected
+                else "ACTION_DISPATCH_UNCONFIRMED"
+            )
+            code = getattr(exc, "code", re.split(r"[:;]", detail, maxsplit=1)[0])
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,80}", code):
+                code = "TASK_ACTION_REJECTED"
+            messages = {
+                "EXECUTION_LINK_UNVERIFIED": (
+                    "Связь с прежним выполнением не подтверждена. "
+                    "Выполните сверку или создайте новую связанную проверку."
+                ),
+                "CREATE_LINKED_VERIFICATION_REQUIRED": (
+                    "Создайте связанную проверку с явным корнем проекта."
+                ),
+                "STALE_TASK_REVISION": "Состояние изменилось. Обновите список.",
+                "TASK_NOT_FOUND": "Задача не найдена в текущем диалоге/workspace.",
+                "TASK_BUSY": "Задача уже выполняется. Второй запуск не создан.",
+                "RECONCILIATION_REQUIRED": "Выполнение требует сверки состояния.",
+                "IDEMPOTENCY_CONFLICT": "Запрос отличается от принятого действия.",
+                "PROJECT_ROOT_INVALID": (
+                    "Укажите корень внутри /workspace с pyproject.toml."
+                ),
+                "TASK_CANCELLED": "Отменённая задача не возобновляется.",
+                "TASK_COMPLETED": "Задача завершена. Создайте новую проверку.",
+                "ACTION_NOT_AVAILABLE_IN_MODE": (
+                    "Режим Ask/Plan не запускает проверки. Выберите Agent "
+                    "и подтвердите отдельное действие проверки."
+                ),
+                "FINALIZATION_PENDING": "Результат синхронизируется. Обновите статус.",
+                "ACTION_DISPATCH_UNCONFIRMED": (
+                    "Отправка не подтверждена. Выполните сверку состояния; "
+                    "повторное выполнение автоматически не запускается."
+                ),
+            }
+            next_actions = (
+                ["reconcile", "create_verification"]
+                if code
+                in {"EXECUTION_LINK_UNVERIFIED", "CREATE_LINKED_VERIFICATION_REQUIRED"}
+                else ["reconcile"]
+                if code in {"RECONCILIATION_REQUIRED", "ACTION_DISPATCH_UNCONFIRMED"}
+                else []
+            )
+            if reservation is not None and reservation.created:
+                # A partial dispatch may already own a worker. Do not revoke it
+                # or replay it; the durable execution ID is recovered on retry.
+                with (
+                    suppress(Exception),
+                    TaskActionStore(
+                        config.context_database, workspace=config.workspace
+                    ) as actions,
+                ):
+                    actions.mark_failed(reservation, code)
+            diagnostics.fail_request(
+                diagnostic_id,
+                exc=exc,
+                provider_attempts=[],
+                tool_audit=[{**evidence, "reason_code": code}],
+                duration_ms=int((time.monotonic() - started) * 1000),
+                rollback_attempted=False,
+                rollback_success=False,
+                rollback_checkpoint_rows=0,
+                rollback_write_rows=0,
+                filesystem_side_effects=not expected and reservation is not None,
+                error_code=code.lower(),
+            )
+            return JSONResponse(
+                status_code=409 if expected else 503,
+                content=_request_payload(
+                    request,
+                    error={
+                        "code": code,
+                        "message": messages.get(code, detail),
+                        "diagnostic_id": diagnostic_id,
+                        "available_actions": next_actions,
+                    },
+                    diagnostic_id=diagnostic_id,
+                ),
+            )
+        diagnostics.complete_request(
+            diagnostic_id,
+            provider_attempts=[],
+            tool_audit=[evidence],
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return result
+
     @app.post("/api/chat", status_code=202)
     def chat(request: Request, body: ChatRequest):
+        if body.explicit_action:
+            if not body.continuation_task_id or body.expected_revision is None:
+                raise HTTPException(422, "TASK_AND_REVISION_REQUIRED")
+            return dispatch_task_action(
+                request,
+                body.continuation_task_id,
+                body.thread_id,
+                body.expected_revision,
+                body.explicit_action,
+                body.idempotency_key,
+                allow_write=body.allow_write and body.mode not in {"ask", "plan"},
+                mode=body.mode,
+            )
+        return submit_chat(request, body)
+
+    def submit_chat(
+        request: Request, body: ChatRequest, *, execution_id: str | None = None
+    ):
         if body.mode == "multitask" and tasks.active_count() >= 4:
             raise HTTPException(
                 429,
                 "Достигнут предел четырёх одновременных фоновых задач.",
             )
-        task_id = uuid4().hex
+        task_id = execution_id or uuid4().hex
         with ContextStore(config.context_database) as store:
             saved_preference = store.thread_model_preference(body.thread_id)
         preferred_provider = body.provider
@@ -1952,6 +2264,17 @@ def create_app(
             if body.mode == "multitask"
             else body.thread_id
         )
+        routing_request_id = diagnostics.start_request(
+            query=body.query,
+            thread_id=task_thread,
+            operation_kind="task_routing",
+            source="web",
+            app_version=__version__,
+            provider_priority=[],
+            baseline_checkpoint_id=None,
+            task_id=body.continuation_task_id,
+        )
+        routing_started = time.monotonic()
         try:
             with TaskStateStore(config.context_database) as state:
                 saved_task, routing = state.prepare_turn(
@@ -1964,13 +2287,46 @@ def create_app(
                     owner=task_id,
                     lease_seconds=config.task_lease_seconds,
                     task_id=body.continuation_task_id,
+                    explicit_action=body.explicit_action,
+                    expected_revision=body.expected_revision,
                     known_secrets=tuple(p.api_key for p in task_providers),
-                    semantic=semantic_classifier(
-                        config, task_providers, thread=task_thread
+                    semantic=(
+                        None
+                        if body.explicit_action
+                        else semantic_classifier(
+                            config, task_providers, thread=task_thread
+                        )
                     ),
                 )
         except TaskConflict as exc:
-            raise HTTPException(409, str(exc)) from exc
+            diagnostics.fail_request(
+                routing_request_id,
+                exc=exc,
+                provider_attempts=[],
+                tool_audit=[],
+                duration_ms=int((time.monotonic() - routing_started) * 1000),
+                rollback_attempted=False,
+                rollback_success=False,
+                rollback_checkpoint_rows=0,
+                rollback_write_rows=0,
+                filesystem_side_effects=False,
+                error_code="continuation_rejected",
+            )
+            raise HTTPException(
+                409, f"{exc}; diagnostic_id={routing_request_id}"
+            ) from exc
+        diagnostics.complete_request(
+            routing_request_id,
+            provider_attempts=[],
+            tool_audit=[
+                {
+                    "action": body.explicit_action or "text",
+                    "revision": body.expected_revision,
+                    "intent": routing.intent,
+                }
+            ],
+            duration_ms=int((time.monotonic() - routing_started) * 1000),
+        )
         effective_allow_write = (
             body.allow_write
             and routing.mutation_requested
@@ -3138,6 +3494,12 @@ def create_app(
                 details = store.details(job_id)
             except ValueError as exc:
                 raise HTTPException(404, "Autopilot job not found") from exc
+            if details.get("task_identity"):
+                raise HTTPException(
+                    409,
+                    "Используйте явное продолжение выбранной задачи / "
+                    "Explicit task action required",
+                )
             if (
                 body is not None
                 and body.revision is not None

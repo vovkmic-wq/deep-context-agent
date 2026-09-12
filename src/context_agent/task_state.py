@@ -16,7 +16,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from context_agent.diagnostics import redact_sensitive_text
-from context_agent.intent import SemanticClassifier, resolve_intent
+from context_agent.intent import IntentDecision, SemanticClassifier, resolve_intent
 from context_agent.routing import (
     RoutingDecision,
     Workflow,
@@ -281,6 +281,8 @@ class TaskStateStore:
         task_id: str | None = None,
         known_secrets: tuple[str, ...] = (),
         semantic: SemanticClassifier | None = None,
+        explicit_action: str | None = None,
+        expected_revision: int | None = None,
     ) -> tuple[SavedTask | None, RoutingDecision]:
         """Shared Web/CLI authority resolution; quoted data never selects a task."""
         route = route_chat_request(query, work_mode=mode, requested_execution=execution)
@@ -291,9 +293,28 @@ class TaskStateStore:
             for item in self.list(thread, workspace)
             if item.status in {*_RESUMABLE, "running"}
         ]
-        intent = resolve_intent(
-            query, candidates, selected_task_id=task_id, semantic=semantic
-        )
+        if explicit_action is not None:
+            if explicit_action not in {"continue", "continue_verification"}:
+                raise TaskConflict("INVALID_ACTION")
+            if task_id is None or expected_revision is None:
+                raise TaskConflict("TASK_AND_REVISION_REQUIRED")
+            selected = self.resolve(thread, workspace, task_id)
+            if selected.revision != expected_revision:
+                raise TaskConflict("STALE_TASK_REVISION")
+            if selected.evidence.startswith("reconciliation_required:"):
+                raise TaskConflict("EXECUTION_LINK_UNVERIFIED: reconciliation required")
+            if (
+                explicit_action == "continue_verification"
+                and selected.routing["workflow"] != "verification-only"
+            ):
+                raise TaskConflict("CREATE_LINKED_VERIFICATION_REQUIRED")
+            if explicit_action == "continue_verification" and mode in {"ask", "plan"}:
+                raise TaskConflict("ACTION_NOT_AVAILABLE_IN_MODE")
+            intent = IntentDecision("resume_task", task_id, reason="EXPLICIT_ACTION")
+        else:
+            intent = resolve_intent(
+                query, candidates, selected_task_id=task_id, semantic=semantic
+            )
         if intent.action == "clarify":
             raise TaskConflict(
                 "Не удалось однозначно определить продолжение. Выберите задачу "
@@ -302,6 +323,18 @@ class TaskStateStore:
         if intent.action == "resume_task":
             task = self.resolve(thread, workspace, intent.task_id)
             route = resume_route(task, query, mode, execution)
+            if explicit_action == "continue_verification":
+                # A typed operator action authorizes fixed checks, never a broad
+                # audit or code changes. Old derived routing flags are not policy.
+                route = replace(
+                    route,
+                    workflow="verification-only",
+                    execution="persistent",
+                    allow_project_checks=True,
+                    allow_project_scan=False,
+                    mutation_requested=False,
+                    reason_codes=(*route.reason_codes, "EXPLICIT_VERIFY_ONLY"),
+                )
         elif intent.action == "side_question":
             route = replace(
                 route,

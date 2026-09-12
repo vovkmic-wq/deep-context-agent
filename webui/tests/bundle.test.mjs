@@ -46,6 +46,11 @@ for (const required of [
   "/repair-proposals",
   "/repair-task",
   "Create repair task",
+  "chat-reconcile-explicit",
+  "chat-create-verification",
+  "chat-task-state",
+  "available_actions",
+  "dca_explicit_action_keys_v1",
 ]) {
   if (!source.includes(required)) {
     throw new Error(`Production bundle is missing feature: ${required}`);
@@ -89,7 +94,28 @@ for (const legacyMode of [
 if (!htmlSource.includes('id="context-meter"')) {
   throw new Error("Context usage meter is missing");
 }
+const headerSection = htmlSource.split('<div class="chat-header">')[1].split('<small id="chat-model-status"')[0];
+for (const id of ["chat-mode", "chat-provider", "chat-model"]) {
+  if (!headerSection.includes(`id="${id}"`)) throw new Error(`Pinned model header control missing: ${id}`);
+}
+for (const id of ["chat-resume-explicit", "chat-verify-explicit", "chat-reconcile-explicit", "chat-refresh-tasks"]) {
+  if (headerSection.includes(`id="${id}"`)) throw new Error(`Task action expands model header: ${id}`);
+}
+if (!htmlSource.includes('<details id="chat-task-actions" class="chat-task-state-panel">')) {
+  throw new Error("Compact task actions must be collapsed by default");
+}
 const cssSource = await readFile(css, "utf8");
+const mobileCss = cssSource.split("@media (max-width: 680px)")[1]?.split("@media (max-width: 420px)")[0] || "";
+for (const [selector, declaration] of [
+  ["composer-bar", "flex-wrap: wrap"],
+  ["composer-options", "flex-wrap: wrap"],
+  ["composer-actions", "margin-left: auto"],
+]) {
+  const rule = mobileCss.match(new RegExp(`\\.${selector}\\s*\\{([^}]+)\\}`))?.[1] || "";
+  if (!rule.includes(declaration)) {
+    throw new Error(`Mobile composer controls may be clipped: ${selector} needs ${declaration}`);
+  }
+}
 for (const requiredStyle of [
   ".chat-panel.active",
   ".workspace-shell",
@@ -99,6 +125,8 @@ for (const requiredStyle of [
   "overflow:hidden",
   ".conversation",
   "overflow-y:auto",
+  ".chat-status-area",
+  "max-height:min(30vh,18rem)",
 ]) {
   if (!cssSource.replaceAll(" ", "").includes(requiredStyle.replaceAll(" ", ""))) {
     throw new Error(`Sticky chat layout is missing: ${requiredStyle}`);

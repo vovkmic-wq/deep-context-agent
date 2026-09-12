@@ -1,6 +1,10 @@
 "use strict";
 
 import { fillModelChoices } from "./model_choices";
+import {
+  availableTaskActions, isTerminalTaskStatus, taskActionEndpoint,
+  TaskActionRequests, type TaskAction,
+} from "./task_actions";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Payload = Record<string, Json>;
@@ -31,6 +35,11 @@ let modelCatalogRequest = 0;
 let providerRenderGeneration = 0;
 let indexCursor = "";
 let indexedPath = "";
+let savedChatTasks = new Map<string, Payload>();
+const pendingTaskActions = new Set<string>();
+const taskActionRequests = new TaskActionRequests(window.sessionStorage, () =>
+  typeof crypto.randomUUID === "function" ? crypto.randomUUID()
+    : `action-${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
 function element<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -72,6 +81,7 @@ function setOperationStatus(
 
 function updateCancelButton(): void {
   element<HTMLButtonElement>("cancel-chat").disabled = activeChatTasks.size === 0;
+  updateTaskActionControls();
 }
 
 function updateContextMeter(extraCharacters = 0): void {
@@ -112,10 +122,12 @@ async function api<T extends Payload>(
     throw error;
   }
   const body = (await response.json().catch(() => ({}))) as T & {
-    error?: { message?: string };
+    error?: { message?: string; code?: string; request_id?: string; diagnostic_id?: string };
   };
   if (!response.ok) {
-    throw new Error(body.error?.message || `HTTP ${response.status}`);
+    const diagnosticId = text(body.diagnostic_id) || body.error?.diagnostic_id
+      || text(body.request_id) || body.error?.request_id;
+    throw new Error(`${body.error?.message || `HTTP ${response.status}`}${body.error?.code ? ` (${body.error.code})` : ""}${diagnosticId ? ` · Диагностика: ${diagnosticId}` : ""}`);
   }
   return body;
 }
@@ -259,6 +271,9 @@ function visibleArchivedMessage(role: string, content: string): string {
 async function loadThread(threadId: string): Promise<void> {
   const generation = ++threadLoadGeneration;
   currentThread = threadId;
+  savedChatTasks.clear();
+  element<HTMLSelectElement>("chat-task").replaceChildren(new Option("Автоматически / Auto", ""));
+  updateTaskActionControls();
   activeChatJob = "";
   for (const id of ["chat-job-status", "chat-job-technical"]) element(id).hidden = true;
   window.sessionStorage.setItem("dca_thread", threadId);
@@ -598,21 +613,186 @@ function showJobSummary(data: Payload): void {
   );
 }
 
-async function refreshChatJobs(): Promise<void> {
-  const selected = value("chat-task");
+const taskActionButtonIds: Record<TaskAction, string> = {
+  continue: "chat-resume-explicit",
+  continue_verification: "chat-verify-explicit",
+  reconcile: "chat-reconcile-explicit",
+  create_verification: "chat-create-verification",
+};
+
+const taskActionLabels: Record<TaskAction, string> = {
+  continue: "Продолжить выполнение / Resume",
+  continue_verification: "Продолжить проверки / Resume verification",
+  reconcile: "Сверить сохранённое состояние / Reconcile",
+  create_verification: "Создать связанную проверку / New verification",
+};
+
+function updateTaskActionControls(): void {
+  const selected = savedChatTasks.get(value("chat-task"));
+  const actions = availableTaskActions(selected?.available_actions);
+  const pending = pendingTaskActions.has(JSON.stringify([currentThread, value("chat-task")]));
+  for (const action of Object.keys(taskActionButtonIds) as TaskAction[]) {
+    const button = element<HTMLButtonElement>(taskActionButtonIds[action]);
+    button.disabled = pending || !actions.includes(action)
+      || (action !== "reconcile" && activeChatTasks.size > 0 && value("chat-mode") !== "multitask");
+    button.title = actions.includes(action) ? taskActionLabels[action]
+      : "Это действие сейчас не разрешено runtime / Action unavailable";
+  }
+  const summary = element("chat-task-state");
+  summary.textContent = selected
+    ? `Сохранённая задача / Saved task: ${text(selected.task_id)} · ${text(selected.status)} · r${text(selected.revision)}${selected.reason_code ? ` · Причина / Reason: ${text(selected.reason_code)}` : ""}. Действия / Actions: ${actions.map(action => taskActionLabels[action]).join("; ") || "нет / none"}`
+    : "Выберите сохранённую задачу для явного продолжения. Доступные действия определяет сервер, а не переписка.";
+  element("chat-task-summary").textContent = selected
+    ? `${text(selected.task_id).slice(0, 8)} · ${text(selected.status)}`
+    : "Выберите сохранённую задачу";
+  element("chat-verification-options").hidden = !actions.includes("create_verification");
+}
+
+function selectSavedTask(): void {
+  const selected = savedChatTasks.get(value("chat-task"));
+  element<HTMLInputElement>("chat-verification-root").value = text(selected?.project_root);
+  window.sessionStorage.setItem(`dca_saved_task_${currentThread}`, value("chat-task"));
+  updateTaskActionControls();
+}
+
+function watchExplicitExecution(result: Payload, pending: HTMLElement, submittedThread: string): void {
+  const executionId = text(result.task_id);
+  activeChatTasks.add(executionId);
+  updateCancelButton();
+  streamTask(executionId, (name, data) => {
+    if (isTerminalTaskStatus(name)) {
+      activeChatTasks.delete(executionId);
+      updateCancelButton();
+    }
+    if (currentThread !== submittedThread) return;
+    if (name === "message" || name === "result") {
+      pending.textContent = text(data.text) || text(data.message) || pending.textContent;
+    } else if (["job_progress", "job_replanned", "job_verification", "job_heartbeat", "job_deadline"].includes(name)) {
+      pending.textContent = formatJobProgress(data, name);
+    }
+    if (isTerminalTaskStatus(name)) {
+      pending.parentElement?.classList.remove("pending");
+      pending.textContent += `\nСостояние / Status: ${name}. ${text(data.message)}${data.request_id ? ` Диагностика: ${text(data.request_id)}.` : ""}`;
+      void refreshChatJobs().catch((error: Error) => showToast(error.message));
+    }
+  }, submittedThread);
+}
+
+async function runExplicitTaskAction(action: TaskAction): Promise<void> {
+  const savedTaskId = value("chat-task");
+  const selected = savedChatTasks.get(savedTaskId);
+  if (!selected || !availableTaskActions(selected.available_actions).includes(action)) {
+    showToast("Выберите задачу и доступное действие. При необходимости обновите её состояние.");
+    return;
+  }
+  const submittedThread = currentThread;
+  const operationKey = JSON.stringify([submittedThread, savedTaskId]);
+  if (pendingTaskActions.has(operationKey)) return;
+  if (action !== "reconcile" && activeChatTasks.size && value("chat-mode") !== "multitask") {
+    showToast("Дождитесь завершения текущего выполнения.");
+    return;
+  }
+  const projectRoot = value("chat-verification-root").trim();
+  if (action === "create_verification") {
+    if (!/^\/workspace(?:\/[^\\]*)?$/.test(projectRoot) || projectRoot.split("/").includes("..")) {
+      showToast("Укажите точный корень проекта внутри /workspace, например /workspace/ozon_market_analytics.");
+      return;
+    }
+    if (!window.confirm(`Создать и запустить новую связанную read-only задачу проверки?\n\nИсходная задача: ${savedTaskId}\nПроект: ${projectRoot}\n\nИсходная задача и её результаты останутся неизменными. Будут запущены реальные проверки проекта; исправление исходного кода не разрешается.`)) return;
+  }
+  const body: Payload = {
+    thread_id: submittedThread,
+    expected_revision: Number(selected.revision),
+  };
+  if (action === "create_verification") {
+    body.project_root = projectRoot;
+    body.confirmed = true;
+  } else if (action !== "reconcile") {
+    body.action = action;
+    body.allow_write = action === "continue" && checked("chat-write") && !["ask", "plan"].includes(value("chat-mode"));
+  }
+  const signature = JSON.stringify([savedTaskId, action, body]);
+  const key = taskActionRequests.begin(signature);
+  if (!key) return;
+  if (action !== "reconcile") body.idempotency_key = key;
+  pendingTaskActions.add(operationKey);
+  updateTaskActionControls();
+  const pending = appendMessage("agent", `${taskActionLabels[action]}…`, true);
+  try {
+    const result = await api<Payload>(taskActionEndpoint(savedTaskId, action), {
+      method: "POST", body: JSON.stringify(body),
+    });
+    if (action === "reconcile") {
+      pending.parentElement?.classList.remove("pending");
+      const item = result.item && typeof result.item === "object" ? result.item as Payload : null;
+      pending.textContent = `Сверка завершена. ${text(item?.reason_code) || text(result.reason_code)} Исходная задача не изменена; неизвестные операции записи не повторялись.`;
+      if (currentThread === submittedThread && item) {
+        savedChatTasks.set(savedTaskId, item);
+        selectSavedTask();
+      }
+      return;
+    }
+    const executionId = text(result.task_id);
+    const newSavedId = text(result.active_task_id) || savedTaskId;
+    if (currentThread === submittedThread) {
+      await refreshChatJobs(newSavedId);
+      activeChatJob = text(result.job_id) || activeChatJob;
+    }
+    if (!executionId) {
+      pending.parentElement?.classList.remove("pending");
+      pending.textContent = `Выполнение не подтверждено / Dispatch unconfirmed. Состояние: ${text(result.action_status) || "unknown"}. Причина: ${text(result.reason_code) || "ACTION_DISPATCH_UNCONFIRMED"}. ${text(result.recovery_message) || "Сверьте сохранённое состояние. Не повторяйте неизвестные операции записи."}${result.diagnostic_id ? ` Диагностика: ${text(result.diagnostic_id)}.` : ""}`;
+      if (currentThread === submittedThread && newSavedId === savedTaskId) {
+        const current = savedChatTasks.get(newSavedId);
+        if (current) {
+          savedChatTasks.set(newSavedId, {
+            ...current,
+            reason_code: text(result.reason_code) || "ACTION_DISPATCH_UNCONFIRMED",
+            available_actions: availableTaskActions(result.available_actions),
+          });
+          updateTaskActionControls();
+        }
+      }
+      return;
+    }
+    if (result.reused) {
+      const snapshot = await api<Payload>(`/api/tasks/${encodeURIComponent(executionId)}`);
+      if (isTerminalTaskStatus(snapshot.status)) {
+        pending.parentElement?.classList.remove("pending");
+        pending.textContent = `Повторная команда: выполнение уже завершено (${text(snapshot.status)}). Новое выполнение не создано.`;
+        const terminal = snapshot.terminal && typeof snapshot.terminal === "object" ? snapshot.terminal as Payload : {};
+        const execution = terminal.execution;
+        if (currentThread === submittedThread && execution && typeof execution === "object") showExecutionSummary(execution as Payload);
+        return;
+      }
+    }
+    watchExplicitExecution(result, pending, submittedThread);
+  } catch (error) {
+    pending.parentElement?.classList.remove("pending");
+    pending.textContent = `${error instanceof Error ? error.message : "Ошибка действия"}\nПри обрыве связи повторите то же действие: сохранённый ключ защищает от двойного запуска.`;
+  } finally {
+    taskActionRequests.finish(signature);
+    pendingTaskActions.delete(operationKey);
+    updateTaskActionControls();
+  }
+}
+
+async function refreshChatJobs(preferredTask?: string): Promise<void> {
+  const selectedThread = currentThread;
+  const selected = preferredTask ?? (value("chat-task") || window.sessionStorage.getItem(`dca_saved_task_${selectedThread}`) || "");
   const objectives = await api<{items: Payload[]}>(
-    `/api/threads/${encodeURIComponent(currentThread)}/active-tasks`,
+    `/api/threads/${encodeURIComponent(selectedThread)}/active-tasks`,
   );
+  if (currentThread !== selectedThread) return;
+  savedChatTasks = new Map(objectives.items.map(task => [text(task.task_id), task]));
   const selector = element<HTMLSelectElement>("chat-task");
   selector.replaceChildren(new Option("Автоматически / Auto", ""));
   for (const task of objectives.items) {
-    if (["partial", "blocked", "interrupted", "running", "finalization_pending", "reconciliation_required"].includes(text(task.status))) {
+    {
       const pending = ["finalization_pending", "reconciliation_required"].includes(text(task.status));
       const option = new Option(
         `${text(task.task_id).slice(0, 8)} · ${text(task.workflow)} · ${task.status === "reconciliation_required" ? "Требуется сверка / Reconciliation required" : pending ? "Синхронизация результата / Finalizing" : text(task.status)} · r${text(task.revision)}`,
         text(task.task_id),
       );
-      option.disabled = pending;
       option.dataset.revision = text(task.revision);
       selector.add(option);
     }
@@ -620,11 +800,13 @@ async function refreshChatJobs(): Promise<void> {
   if (Array.from(selector.options).some((option) => option.value === selected)) {
     selector.value = selected;
   }
+  selectSavedTask();
   const output = element("chat-job-list");
   output.replaceChildren();
   const result = await api<{ items: Payload[]; request_id: string }>(
     "/api/jobs",
   );
+  if (currentThread !== selectedThread) return;
   const jobs = result.items
     .filter((item) => text(item.thread_id) === currentThread)
     .slice(0, 20);
@@ -654,9 +836,6 @@ async function refreshChatJobs(): Promise<void> {
     const revision = Number(item.checkpoint_revision || 0);
     const controls: Array<[string, string]> = [];
     if (status === "running") controls.push(["Пауза", "pause"]);
-    if (["paused", "partial", "blocked"].includes(status)) {
-      controls.push(["Продолжить", "resume"]);
-    }
     if (!["complete", "cancelled"].includes(status)) {
       controls.push(["Отмена", "cancel"]);
     }
@@ -1601,6 +1780,15 @@ element<HTMLFormElement>("chat-form").addEventListener("submit", (event) => {
 });
 
 const chatQuery = element<HTMLTextAreaElement>("chat-query");
+for (const action of Object.keys(taskActionButtonIds) as TaskAction[]) {
+  element(taskActionButtonIds[action]).addEventListener("click", () => {
+    void runExplicitTaskAction(action);
+  });
+}
+element("chat-task").addEventListener("change", selectSavedTask);
+element("chat-refresh-tasks").addEventListener("click", () => {
+  void refreshChatJobs().catch((error: Error) => showToast(error.message));
+});
 chatQuery.addEventListener("input", () => {
   chatQuery.style.height = "auto";
   chatQuery.style.height = `${Math.min(chatQuery.scrollHeight, 220)}px`;

@@ -1,5 +1,16 @@
 # Статус реализации
 
+## Явное продолжение — 0.33.0
+EXPLICIT_RESUME_IMPLEMENTATION_PROMPT.md / EXPLICIT_RESUME_TECHNICAL_SPEC.md.
+R1–R6 реализованы: typed resume, linked verification, read-only reconciliation,
+durable dispatch/recovery, отказ до model turn, компактные действия в чате.
+582 passed / 3 platform skips, Ruff/format/mypy/compileall/frontend PASS.
+Повторные реальные HTTP/GLM FAIL→REPAIR→PASS подтверждают правильный root/venv,
+источник unchanged, отсутствие повторного worker после restart и журнал отказа.
+Точные доказательства, границы UI QA и публикация: EXPLICIT_RESUME_ACCEPTANCE.md.
+Старые задачи и пользовательский сервер не изменялись. Ниже — история 0.32,
+а не актуальные блокеры. Для применения 0.33 запущенный Web server надо перезапустить.
+
 ## Runtime gate 0.32 — PASS, 2026-09-12
 
 Все R1–R6 реализованы. C01–C18 закрыты для заявленных границ локального агента.

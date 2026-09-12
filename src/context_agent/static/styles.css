@@ -114,15 +114,32 @@ th { color: var(--muted); font-size: .82rem; }
 .chat-header { position: sticky; top: 0; z-index: 8; display: flex; gap: 1rem; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding: 1rem 1.25rem; background: #111419f2; backdrop-filter: blur(12px); }
 .chat-header h2 { margin-bottom: 0; }
 .chat-header small { color: var(--muted); }
-.chat-identity { display: grid; align-content: start; min-width: 12rem; }
+.chat-identity { display: grid; align-content: start; min-width: 10rem; }
 .memory-badge { display: inline-flex; width: fit-content; margin-top: .45rem; border: 1px solid #4d5a2a; border-radius: 999px; padding: .2rem .55rem; color: var(--accent); background: var(--accent-soft); font-size: .72rem; font-weight: 750; }
 .memory-badge.degraded { border-color: #755428; color: var(--warning); background: #302514; }
-.chat-controls { display: flex; flex-wrap: wrap; gap: .65rem; align-items: end; justify-content: end; }
+.chat-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .65rem; align-items: end; flex: 1; min-width: 0; }
+.chat-controls .compact-label { min-width: 0; }
+.chat-controls select { min-width: 0; text-overflow: ellipsis; padding: .5rem; }
 .chat-header { grid-row: 1; }
 .mode-help { display: block; padding: .45rem 1.25rem; color: var(--muted); border-bottom: 1px solid var(--border); }
 #chat-model-status { grid-row: 2; }
 #mode-help { grid-row: 3; }
-#chat-job-status { grid-row: 4; }
+.chat-status-area { grid-row: 4; min-height: 0; max-height: min(30vh, 18rem); overflow-y: auto; border-bottom: 1px solid var(--border); }
+.chat-task-state-panel { margin: 0; padding: .35rem 1.25rem; background: var(--surface); }
+.chat-task-state-panel summary { cursor: pointer; padding: .3rem 0; font-size: .8rem; }
+#chat-task-summary { margin-left: .6rem; color: var(--muted); overflow-wrap: anywhere; }
+.chat-task-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; padding: .5rem 0; }
+.chat-task-settings .compact-label { min-width: 0; }
+.chat-task-settings select { min-width: 0; padding: .45rem .6rem; }
+.chat-task-buttons { display: flex; flex-wrap: wrap; gap: .4rem; padding-bottom: .5rem; }
+.chat-task-state-panel button { padding: .4rem .6rem; font-size: .76rem; font-weight: 600; }
+.chat-task-state-panel .operation-status { margin: .4rem 0; padding: .55rem; font-size: .78rem; overflow-wrap: anywhere; }
+#chat-verification-options { margin: .3rem 0; padding: .65rem; }
+#chat-verification-options small { display: block; color: var(--muted); margin: .45rem 0; }
+#chat-job-status { margin: .35rem 1.25rem; padding: .5rem .65rem; font-size: .78rem; overflow-wrap: anywhere; }
+#chat-connection:not(:empty) { display: block; padding: .2rem 1.25rem; color: var(--muted); font-size: .75rem; }
+#chat-job-technical { padding: .3rem 1.25rem; font-size: .75rem; }
+#chat-job-technical pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .compact-label { min-width: 160px; font-size: .8rem; }
 .conversation { display: flex; grid-row: 5; flex-direction: column; gap: 1rem; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 1.5rem clamp(1rem, 6vw, 5rem); }
 .empty-state { display: grid; place-content: center; min-height: 260px; color: var(--muted); text-align: center; }
@@ -228,11 +245,17 @@ th { color: var(--muted); font-size: .82rem; }
   .job-row { flex: 0 0 auto; grid-template-columns: 9rem auto; }
   .thread-item { width: 9rem; }
   .chat-main { min-height: 0; height: calc(100% - 58px); }
-  .chat-header { align-items: start; padding: .8rem; }
+  .chat-header { align-items: start; padding: .8rem; flex-direction: column; gap: .5rem; }
+  .chat-controls { width: 100%; }
+  .chat-controls .compact-label { font-size: .7rem; }
+  .chat-task-state-panel { padding-left: .8rem; padding-right: .8rem; }
+  .chat-task-settings { grid-template-columns: minmax(0, 1fr); }
   .compact-label { min-width: 130px; }
   .conversation { padding: 1rem; }
   .composer { margin: 0 .7rem .7rem; }
-  .composer-options { gap: .45rem; }
+  .composer-bar { flex-wrap: wrap; gap: .4rem; }
+  .composer-options { flex-wrap: wrap; gap: .45rem; }
+  .composer-actions { margin-left: auto; }
   .composer-options .toggle { font-size: .72rem; }
   .form-grid, .search-row, .path-bar, .index-box, .provider-add { grid-template-columns: 1fr; }
   .form-grid .full, .index-box .help, .index-box .operation-status { grid-column: auto; }

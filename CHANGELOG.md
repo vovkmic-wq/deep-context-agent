@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-12
+
+- Typed task actions: продолжение без semantic classifier при сохранении
+  task/thread/workspace/revision/lease и независимых разрешений.
+- Новая связанная read-only verification task с явным manifest root; исходная
+  задача неизменна. Unknown execution link не снимает quarantine и не повторяет записи.
+- Durable SQLite action reservation, stable execution ID, идемпотентность после
+  restart и консервативное восстановление незавершённого dispatch.
+- Терминальная диагностика pre-model отказов и runtime-owned доступные действия.
+- Панель Task actions в чате, сохранение черновика/ключа повтора, закреплённые
+  header/composer и перенос мобильных controls.
+- Нормализация legacy VERIFY flags, запрет explicit checks в Ask/Plan и
+  корректные quoted Unicode paths с пробелами.
+- 582 локальных теста PASS / 3 platform skips, повторные real HTTP/GLM
+  FAIL→approved REPAIR→пять checks PASS. Подробные границы и артефакты:
+  [приёмка 0.33](EXPLICIT_RESUME_ACCEPTANCE.md).
+
 ## [0.32.0] - 2026-09-12
 
 R1–R6/C01–C18: runtime gate пройден на candidate 559198c, включая полный

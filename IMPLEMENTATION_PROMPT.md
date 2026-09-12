@@ -1,5 +1,10 @@
 # Управляющий промпт реализации
 
+Нормативный блок 0.33: EXPLICIT_RESUME_IMPLEMENTATION_PROMPT.md по
+EXPLICIT_RESUME_TECHNICAL_SPEC.md. Сохраняй typed actions, неизменность источника,
+долговечную идемпотентность и отдельное подтверждение REPAIR. Фактическая приёмка
+публикуется в EXPLICIT_RESUME_ACCEPTANCE.md; история чата не заменяет evidence.
+
 ## Checkpoint regression из чистого CI — 2026-09-12
 
 Сохраняй явный durability="sync" на runtime graph invoke. Подтверди его тестом

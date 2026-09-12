@@ -1,5 +1,12 @@
 # Техническое задание: Deep Context Agent
 
+## Дополнение 0.33: явное продолжение
+Обязательны R1–R6 из EXPLICIT_RESUME_TECHNICAL_SPEC.md. Продолжение по
+структурированному действию не зависит от classifier, но сохраняет CAS и права.
+Связанная read-only проверка не изменяет исходную задачу и не разрешает REPAIR.
+Reservation, execution ID и результат сохраняются до/после dispatch; неизвестный
+исход не повторяется автоматически. Актуальная приёмка: EXPLICIT_RESUME_ACCEPTANCE.md.
+
 ## R6: порядок checkpoint commit — 2026-09-12
 
 Runtime обязан явно вызывать граф с durability="sync": завершить checkpoint

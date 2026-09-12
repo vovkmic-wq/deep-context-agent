@@ -69,29 +69,6 @@
                         <option value="agent">Agent — выполнить до результата</option><option value="ask">Ask — только чтение</option><option value="plan">Plan — вопросы и план</option><option value="debug">Debug — гипотезы и воспроизведение</option><option value="multitask">Multitask — параллельные задачи</option>
                       </select>
                     </label>
-                    <label class="compact-label">Выполнение / Execution
-                      <select id="chat-execution">
-                        <option value="auto">Авто — большие задачи в Autopilot</option><option value="autopilot">Autopilot — выполнить до результата</option><option value="single-turn">Обычный ответ — один ход</option>
-                      </select>
-                    </label>
-                    <label class="compact-label">Продолжить задачу / Resume task
-                      <select id="chat-task" title="Выбор применяется только к команде «продолжи»">
-                        <option value="">Автоматически / Auto</option>
-                      </select>
-                    </label>
-                    <label class="compact-label">Профиль / Preset
-                      <select id="chat-model-preset">
-                        <option value="auto">Авто / Auto</option><option value="quality">Качество / Quality</option><option value="balanced">Баланс / Balanced</option><option value="economy">Экономия / Economy</option><option value="local">Локально / Local</option>
-                      </select>
-                    </label>
-                    <label class="compact-label">Выбор ресурса / Model routing
-                      <select id="chat-model-policy" title="Авто использует настроенные fast/standard/reasoning профили; без профилей — текущую цепочку">
-                        <option value="auto">Авто по задаче / Adaptive</option>
-                        <option value="manual">Выбранная модель / Manual</option>
-                      </select>
-                    </label>
-                    <button type="button" id="finish-saved-task" title="Отметить выбранную сохранённую задачу завершённой">Завершить задачу / Close</button>
-                    <button type="button" id="cancel-saved-task" title="Отменить выбранную сохранённую задачу">Отменить задачу / Cancel</button>
                     <label class="compact-label">Провайдер / Provider
                       <select id="chat-provider" aria-describedby="chat-model-status"></select>
                     </label>
@@ -102,9 +79,42 @@
                 </div>
                 <small id="chat-model-status" class="mode-help">Модель выбирается отдельно для этой задачи и фиксируется на время запроса.</small>
                 <small id="mode-help" class="mode-help">Agent использует все настроенные инструменты в пределах workspace и доверенных разрешений.</small>
+                <div class="chat-status-area">
+                  <details id="chat-task-actions" class="chat-task-state-panel">
+                    <summary>Действия задачи / Task actions <small id="chat-task-summary">Выберите сохранённую задачу</small></summary>
+                    <div class="chat-task-settings">
+                      <label class="compact-label">Сохранённая задача / Saved task
+                        <select id="chat-task" aria-describedby="chat-task-state" title="Выберите задачу для явного действия без классификатора"><option value="">Автоматически / Auto</option></select>
+                      </label>
+                      <label class="compact-label">Выполнение / Execution
+                        <select id="chat-execution"><option value="auto">Авто — большие задачи в Autopilot</option><option value="autopilot">Autopilot — выполнить до результата</option><option value="single-turn">Обычный ответ — один ход</option></select>
+                      </label>
+                      <label class="compact-label">Профиль / Preset
+                        <select id="chat-model-preset"><option value="auto">Авто / Auto</option><option value="quality">Качество / Quality</option><option value="balanced">Баланс / Balanced</option><option value="economy">Экономия / Economy</option><option value="local">Локально / Local</option></select>
+                      </label>
+                      <label class="compact-label">Выбор ресурса / Model routing
+                        <select id="chat-model-policy" title="Авто использует настроенные fast/standard/reasoning профили; без профилей — текущую цепочку"><option value="auto">Авто по задаче / Adaptive</option><option value="manual">Выбранная модель / Manual</option></select>
+                      </label>
+                    </div>
+                    <div id="chat-task-state" class="operation-status" role="status">Выберите сохранённую задачу для явного продолжения. Статус и доступные действия определяет сервер.</div>
+                    <div class="chat-task-buttons">
+                      <button id="chat-resume-explicit" class="secondary" type="button" disabled>Продолжить / Resume</button>
+                      <button id="chat-verify-explicit" class="secondary" type="button" disabled>Продолжить проверки / Resume verification</button>
+                      <button id="chat-reconcile-explicit" class="secondary" type="button" disabled>Сверить состояние / Reconcile</button>
+                      <button id="chat-refresh-tasks" class="secondary" type="button">Обновить / Refresh</button>
+                      <button type="button" class="secondary" id="finish-saved-task" title="Отметить выбранную сохранённую задачу завершённой">Завершить / Close</button>
+                      <button type="button" class="secondary" id="cancel-saved-task" title="Отменить выбранную сохранённую задачу">Отменить / Cancel</button>
+                    </div>
+                    <div id="chat-verification-options" class="surface" hidden>
+                      <label>Корень проекта новой проверки / Verification project root<input id="chat-verification-root" placeholder="/workspace/ozon_market_analytics" aria-describedby="chat-verification-help"></label>
+                      <small id="chat-verification-help">Новая связанная задача запускает проверки без изменения исходного кода. Источник и его результаты сохраняются. Укажите точный корень проекта внутри workspace.</small>
+                      <button id="chat-create-verification" class="secondary" type="button" disabled>Создать связанную проверку / New verification</button>
+                    </div>
+                  </details>
                   <small id="chat-connection" role="status"></small>
                   <div id="chat-job-status" class="operation-status" aria-live="polite" hidden></div>
                   <details id="chat-job-technical" hidden><summary>Технические подробности / Execution details</summary><pre></pre></details>
+                </div>
                 <div id="chat-output" class="conversation" aria-live="polite"><div class="empty-state"><strong>Готов к работе</strong><span>Опишите задачу, приложите путь или попросите проверить проект.</span></div></div>
                 <form id="chat-form" class="composer">
                   <textarea id="chat-query" rows="2" required aria-label="Сообщение" placeholder="Сообщение агенту…"></textarea>

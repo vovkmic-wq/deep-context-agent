@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from context_agent.config import AppConfig, ProviderConfig
 from context_agent.context_store import SearchHit
 from context_agent.errors import AgentError
+from context_agent.project_checks import resolve_project_root
 from context_agent.runtime import (
     AcceptanceManifest,
     AgentRuntime,
@@ -72,6 +73,25 @@ def _provider_config() -> ProviderConfig:
         base_url="http://127.0.0.1:1234/v1",
         api_key="test",
     )
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_quoted_verification_seed_does_not_add_parent_root(tmp_path, quote):
+    runtime = object.__new__(AgentRuntime)
+    runtime.app_config = _app_config(tmp_path)
+    workspace = runtime.app_config.workspace
+    project = workspace / "вложенный проект"
+    project.mkdir(parents=True)
+    for directory in (workspace, project):
+        (directory / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    seed = "/workspace/вложенный проект/pyproject.toml"
+    seeds = runtime._verification_seed_paths(f"Verify {quote}{seed}{quote}.")
+    assert seeds == (seed,)
+    assert resolve_project_root(workspace, seed_paths=seeds) == project
+    mixed = runtime._verification_seed_paths(
+        f"Verify {quote}{seed}{quote} and /workspace/other/pyproject.toml."
+    )
+    assert mixed == (seed, "/workspace/other/pyproject.toml")
 
 
 def _fallback_provider_config() -> ProviderConfig:

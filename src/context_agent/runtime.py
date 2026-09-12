@@ -5752,8 +5752,12 @@ class AgentRuntime:
 
         seeds: list[str] = []
         normalized = objective.replace("\\", "/")
-        quoted = re.findall(r"[\"'](/workspace/[^\"']+)[\"']", normalized)
-        unquoted = re.findall(r"/workspace/[^\s\"'<>|]+", normalized)
+        quoted_pattern = re.compile(r"([\"'])(/workspace/[^\"']+)\1")
+        quoted = [match.group(2) for match in quoted_pattern.finditer(normalized)]
+        # A quoted path with spaces is one seed, not an additional truncated
+        # unquoted seed that can resolve to the parent project's manifest.
+        remaining = quoted_pattern.sub(" ", normalized)
+        unquoted = re.findall(r"/workspace/[^\s\"'<>|]+", remaining)
         for match in (*quoted, *unquoted):
             candidate = match.rstrip(".,;:!?)]}")
             try:

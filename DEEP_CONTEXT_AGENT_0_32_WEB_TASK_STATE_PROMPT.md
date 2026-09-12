@@ -1,5 +1,16 @@
 # Web-промпт 0.32: согласованные задачи и контекст проверок
 
+## Актуальное дополнение 0.33
+
+Применяй [блочный промпт](EXPLICIT_RESUME_IMPLEMENTATION_PROMPT.md) и
+[ТЗ R1–R6/A01–A12](EXPLICIT_RESUME_TECHNICAL_SPEC.md). Сохранённые задачи
+продолжаются typed действиями с task/revision/idempotency, не классификацией
+текста. При quarantine — read-only сверка и явная новая связанная проверка.
+Не снимай quarantine, не повышай права и не повторяй неизвестные записи из UI.
+Действия находятся в сворачиваемой панели чата; заголовок и composer закреплены.
+Сохраняй черновик и показывай recovery при неподтверждённой отправке worker.
+Итоги тестов: [приёмка 0.33](EXPLICIT_RESUME_ACCEPTANCE.md).
+
 Дата: 2026-09-09; обновлено 2026-09-12. Браузерная приёмка execution cards,
 reload/restart/offline и двух вкладок выполнена: [evidence](RELEASE_COMPLETION_0_32_ACCEPTANCE.md).
 Общий release gate остаётся отдельным и не заявляется автоматически.
